@@ -5105,6 +5105,42 @@ mod tests {
     }
 
     #[test]
+    fn site_check_lane_requires_explicit_manage_support() {
+        // A Manage that does not know `site_check_v1` rejects the whole
+        // report, so Nest sends the capability and lane only when it may.
+        let older: AgentNestConfigResponse = serde_json::from_value(json!({})).unwrap();
+        let newer: AgentNestConfigResponse = serde_json::from_value(json!({
+            "site_check_supported": true,
+            "site_check": {"requested_at": "2026-11-14T10:00:00Z", "directories": []}
+        }))
+        .unwrap();
+        assert!(!older.site_check_supported && older.site_check.is_none());
+        assert!(newer.site_check_supported && newer.site_check.is_some());
+        let config = AppConfig::default();
+        let support = |site_check| PeerReportSupport {
+            uploads: false,
+            usb_installer: false,
+            when_idle: false,
+            site_check,
+        };
+        assert!(
+            !nest_capabilities(&config, false, support(false))
+                .contains(&crate::site_check::CAPABILITY)
+        );
+        assert!(
+            nest_capabilities(&config, false, support(true))
+                .contains(&crate::site_check::CAPABILITY)
+        );
+        // A stored contract from before the lane existed keeps it off.
+        let stored: PeerContract = serde_json::from_value(json!({
+            "supports_scheduling": true, "accepts_uploads": true, "accepts_usb_installer": true,
+            "runtime_epoch": true, "report_protocol": 1
+        }))
+        .unwrap();
+        assert!(!stored.accepts_site_check);
+    }
+
+    #[test]
     fn usb_installer_capability_requires_manage_support_and_an_image() {
         // A Manage that does not know `usb_installer_v1` rejects the whole
         // report; a Nest without the stick image has nothing to download.
