@@ -34,6 +34,10 @@ rand = "0.8"
 # AEAD and HKDF for state backups (already in the graph through rustls).
 ring = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+# The site check's TLS probe keeps the certificate an intercepting proxy
+# presents (already in the graph through reqwest).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
 semver = "1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

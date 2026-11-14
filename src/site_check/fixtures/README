@@ -1,0 +1,4 @@
+Test-only TLS material for the site check unit tests: a private CA
+("Example Inspection CA", standing in for an HTTPS-inspecting firewall)
+and a localhost certificate it signed. Valid until 2126; never used
+outside the tests.
