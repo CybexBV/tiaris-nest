@@ -24,7 +24,6 @@ import json
 import os
 from pathlib import Path
 import socket
-import struct
 import subprocess
 import sys
 import tempfile
@@ -63,7 +62,9 @@ def ns(name, *command, **kwargs):
 # --- roles, each run inside one namespace -----------------------------------
 
 def role_pxe_client(mac, tries):
-    """UEFI firmware: DISCOVER until a proxy offer arrives, then ask port 4011."""
+    """UEFI firmware: repeat one DISCOVER until a boot answer arrives. With one
+    boot entry the Nest's answer names the boot file, so firmware goes on to
+    TFTP; it never asks port 4011."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -71,7 +72,7 @@ def role_pxe_client(mac, tries):
     sock.bind(('0.0.0.0', 68))
     xid = int.from_bytes(os.urandom(4), 'big') or 1
     packet = site_probe.discover_packet(mac, xid)
-    result = {'sent': 0, 'site_offer': False, 'proxy_offer': False, 'ack': False}
+    result = {'sent': 0, 'site_offer': False, 'proxy_offer': False}
     proxy = None
     for _ in range(tries):
         sock.sendto(packet, ('255.255.255.255', 67))
@@ -93,45 +94,9 @@ def role_pxe_client(mac, tries):
                 proxy = data
         if proxy:
             break
-    if proxy:
-        boot_type = menu_type(proxy)
-        request = bytearray(packet)
-        request[242] = 3  # DHCPREQUEST (option 53 is the first option)
-        request[12:16] = socket.inet_aton(CLIENT)  # ciaddr: the address DHCP gave it
-        request = bytes(request[:-1]) + bytes([43, 7, 71, 4]) + struct.pack('!HH', boot_type, 0) + b'\xff' + b'\xff'
-        sock.sendto(request, (NEST, 4011))
-        deadline = time.monotonic() + 2
-        while (remaining := deadline - time.monotonic()) > 0:
-            sock.settimeout(remaining)
-            try:
-                data, _ = sock.recvfrom(4096)
-            except (socket.timeout, TimeoutError):
-                break
-            if len(data) > 240 and struct.unpack_from('!I', data, 4)[0] == xid and bytes([53, 1, 5]) in data[240:]:
-                result['ack'] = True
-                break
+    # The boot file and server travel in the answer's header.
+    result['boot_file'] = proxy[108:236].split(b'\0')[0].decode('ascii', 'replace') if proxy else None
     print(json.dumps(result))
-
-
-def menu_type(offer):
-    """The boot server type of the first PXE menu item (option 43/9)."""
-    index = 240
-    while index < len(offer) and offer[index] != 255:
-        tag = offer[index]
-        if tag == 0:
-            index += 1
-            continue
-        length = offer[index + 1]
-        value = offer[index + 2:index + 2 + length]
-        if tag == 43:
-            sub = 0
-            while sub + 2 <= len(value):
-                code, size = value[sub], value[sub + 1]
-                if code == 9 and size >= 3:
-                    return struct.unpack('!H', value[sub + 2:sub + 4])[0]
-                sub += 2 + size
-        index += 2 + length
-    return 0
 
 
 def role_ntp_client(server):
@@ -258,6 +223,7 @@ class Lab:
         for line in self.nest.stdout:
             if line.startswith('RESULT '):
                 return json.loads(line[7:])
+            print('nest: ' + line.rstrip(), flush=True)
         raise RuntimeError('the Nest role stopped')
 
     def boot_probe(self):
@@ -315,9 +281,18 @@ def orchestrate(args):
             probe, check = lab.boot_probe()
             case('network boot works', 'pass boot_answer_served',
                  {'computer': client, 'probe': probe, 'check': check},
-                 client['site_offer'] and client['proxy_offer'] and probe['own_answer']
+                 client['site_offer'] and client['proxy_offer'] and client['boot_file'] == 'snponly.efi'
+                 and probe['own_answer']
                  and probe['dhcp_servers'] == [HUB] and check['status'] == 'pass'
                  and check['reason'] == 'boot_answer_served')
+            # Quick restarts of a computer that receives every answer: new
+            # transactions, each answered once, are not a dropped answer.
+            restarts = [lab.pxe_client('02:00:00:00:20:07', 4) for _ in range(3)]
+            probe, check = lab.boot_probe()
+            case('healthy restarts are not mistaken', 'pass boot_answer_served',
+                 {'computer': restarts, 'probe': probe, 'check': check},
+                 all(r['proxy_offer'] and r['sent'] == 1 for r in restarts)
+                 and probe['dropped_clients'] == 0 and check['reason'] == 'boot_answer_served')
             served = lab.ntp_client(NEST)
             case('the Nest serves time to computers', 'NTP answer from 192.0.2.2 while synchronized',
                  {'answer': served, 'nest_clock_synchronized': ready['synchronized']},

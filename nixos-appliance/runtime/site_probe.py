@@ -12,10 +12,12 @@ Two kinds of evidence:
   another Nest of the organization, or another server that hands out boot
   information (options 60/66/67 or a boot file) pointing elsewhere.
 - A dropped-answer monitor: dnsmasq logs each proxy answer it sends
-  (`log-dhcp`). A computer that the Nest answers again and again within a
-  couple of minutes, and that never asks the Nest's boot service (port 4011)
-  for its boot file, did not receive the answers. A switch DHCP guard
-  ("DHCP snooping") that does not trust the Nest's port does exactly this.
+  (`log-dhcp`). Network boot firmware repeats the same DHCPDISCOVER (same
+  transaction ID) only while no boot answer reached it; one that received the
+  answer goes on to TFTP. So a transaction the Nest answered three times
+  within two minutes did not get through. A switch DHCP guard ("DHCP
+  snooping") that does not trust the Nest's port does exactly this. The Nest
+  service drops a computer from the list once it boots from the Nest.
 """
 from __future__ import annotations
 
@@ -163,7 +165,7 @@ class AnswerMonitor:
     def __init__(self, ignore=()):
         self.ignore = set(ignore)
         self.pending = collections.OrderedDict()  # xid -> (mac, kind)
-        self.offers = collections.OrderedDict()   # mac -> deque of times
+        self.offers = collections.OrderedDict()   # (mac, xid) -> deque of times
         self.dropped = collections.OrderedDict()  # mac -> last time
         self.booted = collections.OrderedDict()   # mac -> last time
 
@@ -186,21 +188,23 @@ class AnswerMonitor:
         match = TYPE_LINE.search(line)
         if not match or match.group(1) not in self.pending:
             return
-        mac, kind = self.pending.pop(match.group(1))
+        xid = match.group(1)
+        mac, kind = self.pending.pop(xid)
         message = int(match.group(2))
         if message == 5 or kind == 'boot':
             # The computer asked the boot service: it received the answer.
             self._remember(self.booted, mac, now)
-            self.offers.pop(mac, None)
+            for key in [key for key in self.offers if key[0] == mac]:
+                del self.offers[key]
             self.dropped.pop(mac, None)
             return
         if message != 2:
             return
-        times = self.offers.get(mac) or collections.deque(maxlen=DROP_OFFERS)
+        times = self.offers.get((mac, xid)) or collections.deque(maxlen=DROP_OFFERS)
         while times and now - times[0] > DROP_WINDOW:
             times.popleft()
         times.append(now)
-        self._remember(self.offers, mac, times)
+        self._remember(self.offers, (mac, xid), times)
         if len(times) >= DROP_OFFERS:
             self._remember(self.dropped, mac, now)
 
@@ -209,7 +213,9 @@ class AnswerMonitor:
         for table in (self.dropped, self.booted):
             for mac in [mac for mac, at in table.items() if now - at > EVIDENCE_SECONDS]:
                 del table[mac]
+        recent = sorted(self.dropped.items(), key=lambda item: item[1], reverse=True)[:MAX_LISTED]
         return {
+            'dropped': [{'mac': mac, 'at': int(at)} for mac, at in recent],
             'dropped_clients': len(self.dropped),
             'dropped_last_at': int(max(self.dropped.values())) if self.dropped else None,
             'booted_clients': len(self.booted),

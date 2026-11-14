@@ -562,8 +562,32 @@ async fn network_boot(state: &AppState) -> Check {
         sleep(Duration::from_secs(1)).await;
         probe = read_json::<BootProbe>(Path::new(BOOT_PROBE_PATH));
     }
+    if let Some(probe) = probe.as_mut() {
+        let mut booted = std::collections::HashMap::new();
+        for client in &probe.dropped {
+            if let Some(at) = latest_boot(&state.db, &client.mac).await {
+                booted.insert(client.mac.clone(), at);
+            }
+        }
+        probe.dropped_clients = evaluate::still_dropped(probe, |mac| booted.get(mac).copied());
+    }
     let pxe = read_json::<PxeStatus>(Path::new(PXE_STATUS_PATH));
     evaluate::network_boot(true, pxe.as_ref(), probe.as_ref(), now())
+}
+
+/// When the computer with `mac` last fetched its boot script from the Nest.
+async fn latest_boot(pool: &sqlx::SqlitePool, mac: &str) -> Option<i64> {
+    let created: Option<String> = sqlx::query_scalar(
+        "SELECT created_at FROM boot_events WHERE lower(mac) = lower(?) ORDER BY id DESC LIMIT 1",
+    )
+    .bind(mac)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    created
+        .and_then(|at| timestamp(&at))
+        .map(|at| at.timestamp())
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {

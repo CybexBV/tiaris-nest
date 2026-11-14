@@ -51,6 +51,28 @@ pub(crate) struct BootProbe {
     pub(crate) other_boot_servers: Vec<String>,
     #[serde(default)]
     pub(crate) dropped_clients: u32,
+    /// The most recent of them (at most eight).
+    #[serde(default)]
+    pub(crate) dropped: Vec<DroppedClient>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub(crate) struct DroppedClient {
+    pub(crate) mac: String,
+    pub(crate) at: i64,
+}
+
+/// The dropped count without the computers that booted from the Nest after
+/// their answers were dropped (`booted_at`: their latest boot, Unix seconds).
+pub(crate) fn still_dropped(probe: &BootProbe, booted_at: impl Fn(&str) -> Option<i64>) -> u32 {
+    let listed = probe.dropped.len() as u32;
+    let unlisted = probe.dropped_clients.saturating_sub(listed);
+    let blocked = probe
+        .dropped
+        .iter()
+        .filter(|client| booted_at(&client.mac).is_none_or(|booted| booted < client.at))
+        .count() as u32;
+    unlisted + blocked
 }
 
 pub(crate) fn network_boot(

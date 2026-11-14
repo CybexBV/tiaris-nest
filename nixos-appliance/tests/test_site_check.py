@@ -119,12 +119,19 @@ class DroppedAnswers(unittest.TestCase):
         self.assertEqual(summary['dropped_clients'], 0)
         self.assertEqual(summary['booted_clients'], 1)
 
-    def test_one_offer_per_boot_is_normal(self):
+    def test_one_offer_per_transaction_is_normal(self):
+        # Firmware, then iPXE, then a quick restart: new transactions, each
+        # answered once, as when every answer arrives.
         monitor = probe.AnswerMonitor()
-        self.feed(monitor, proxy_lines(1, self.MAC), 1000)
-        self.feed(monitor, proxy_lines(2, self.MAC), 1300)
-        self.feed(monitor, proxy_lines(3, self.MAC), 1600)
-        self.assertEqual(monitor.summary(1600)['dropped_clients'], 0)
+        for xid, second in ((1, 0), (2, 8), (3, 40), (4, 48), (5, 80)):
+            self.feed(monitor, proxy_lines(xid, self.MAC), 1000 + second)
+        self.assertEqual(monitor.summary(1100)['dropped_clients'], 0)
+
+    def test_the_summary_lists_recent_dropped_computers(self):
+        monitor = probe.AnswerMonitor()
+        for second in (0, 4, 12):
+            self.feed(monitor, proxy_lines(9, self.MAC), 1000 + second)
+        self.assertEqual(monitor.summary(1020)['dropped'], [{'mac': self.MAC, 'at': 1012}])
 
     def test_the_nests_own_probe_is_ignored(self):
         mac = probe.probe_mac('nest-1')
@@ -143,7 +150,7 @@ class DroppedAnswers(unittest.TestCase):
         monitor = probe.AnswerMonitor()
         for line in ('dnsmasq[1]: started, version 2.93 DNS disabled', 'garbage', '1 sent size: 1 option: 53 message-type 2'):
             monitor.feed(line, 1)
-        self.assertEqual(monitor.summary(1), {'dropped_clients': 0, 'dropped_last_at': None,
+        self.assertEqual(monitor.summary(1), {'dropped': [], 'dropped_clients': 0, 'dropped_last_at': None,
                                               'booted_clients': 0, 'booted_last_at': None})
 
 

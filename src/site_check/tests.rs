@@ -126,6 +126,22 @@ fn network_boot_without_evidence_is_not_a_pass() {
 }
 
 #[test]
+fn computers_that_booted_later_are_not_dropped() {
+    let probe = probe(json!({"dropped_clients": 3, "dropped": [
+        {"mac": "02:00:00:00:00:01", "at": NOW - 100},
+        {"mac": "02:00:00:00:00:02", "at": NOW - 100},
+    ]}));
+    let booted = |mac: &str| match mac {
+        "02:00:00:00:00:01" => Some(NOW - 50),
+        "02:00:00:00:00:02" => Some(NOW - 200),
+        _ => None,
+    };
+    // One unlisted, one booted before the drop: two still blocked.
+    assert_eq!(evaluate::still_dropped(&probe, booted), 2);
+    assert_eq!(evaluate::still_dropped(&probe, |_| None), 3);
+}
+
+#[test]
 fn dns_names_the_hosts_that_do_not_resolve() {
     let resolved = Resolution::Resolved(vec!["192.0.2.10".parse().unwrap()]);
     assert_eq!(
