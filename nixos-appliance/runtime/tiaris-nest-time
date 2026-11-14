@@ -1,0 +1,152 @@
+#!/usr/bin/python3
+"""Serves the Nest's clock to computers on its network (NTP, UDP 123).
+
+systemd-timesyncd keeps the Nest's clock, including the time servers a
+school's DHCP hands out. This answers NTP client requests with that clock so
+computers on a network that blocks public NTP still find the time on the
+Nest. It answers:
+
+- only while the kernel reports the clock synchronized with an error bound
+  under one second (an unsynchronized Nest serves no time at all);
+- only NTP client requests (mode 3) from private IPv4 addresses;
+- at most a small burst per address, so it cannot be used to flood anyone.
+
+It holds only CAP_NET_BIND_SERVICE and runs as a dynamic user.
+"""
+from __future__ import annotations
+
+import collections
+import ctypes
+import ctypes.util
+import ipaddress
+import socket
+import struct
+import time
+
+NTP_EPOCH_OFFSET = 2208988800
+TIME_ERROR = 5
+STA_UNSYNC = 0x0040
+MAX_ERROR_MICROSECONDS = 1_000_000
+STRATUM = 3
+REFERENCE_ID = b'TNST'
+BURST = 8
+REFILL_PER_SECOND = 1.0
+MAX_TRACKED = 4096
+CGNAT = ipaddress.IPv4Network('100.64.0.0/10')
+
+
+class Timeval(ctypes.Structure):
+    _fields_ = [('tv_sec', ctypes.c_long), ('tv_usec', ctypes.c_long)]
+
+
+class Timex(ctypes.Structure):
+    _fields_ = [('modes', ctypes.c_uint), ('offset', ctypes.c_long), ('freq', ctypes.c_long),
+                ('maxerror', ctypes.c_long), ('esterror', ctypes.c_long), ('status', ctypes.c_int),
+                ('constant', ctypes.c_long), ('precision', ctypes.c_long), ('tolerance', ctypes.c_long),
+                ('time', Timeval), ('tick', ctypes.c_long), ('ppsfreq', ctypes.c_long),
+                ('jitter', ctypes.c_long), ('shift', ctypes.c_int), ('stabil', ctypes.c_long),
+                ('jitcnt', ctypes.c_long), ('calcnt', ctypes.c_long), ('errcnt', ctypes.c_long),
+                ('stbcnt', ctypes.c_long), ('tai', ctypes.c_int), ('_padding', ctypes.c_int * 11)]
+
+
+def kernel_clock():
+    """(synchronized, max error in microseconds) from adjtimex, read-only."""
+    libc = ctypes.CDLL(ctypes.util.find_library('c') or 'libc.so.6', use_errno=True)
+    value = Timex()
+    value.modes = 0
+    state = libc.adjtimex(ctypes.byref(value))
+    if state < 0:
+        return False, None
+    synchronized = state != TIME_ERROR and not value.status & STA_UNSYNC
+    return synchronized, int(value.maxerror)
+
+
+def serving(synchronized, max_error):
+    return bool(synchronized) and max_error is not None and 0 <= max_error < MAX_ERROR_MICROSECONDS
+
+
+def private_source(address):
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    return ip.version == 4 and not ip.is_loopback and not ip.is_unspecified and (
+        ip.is_private or ip in CGNAT) and not ip.is_link_local and not ip.is_multicast
+
+
+def ntp_timestamp(seconds):
+    seconds += NTP_EPOCH_OFFSET
+    whole = int(seconds)
+    fraction = int((seconds - whole) * 2 ** 32) & 0xFFFFFFFF
+    return struct.pack('!II', whole & 0xFFFFFFFF, fraction)
+
+
+def short_format(microseconds):
+    value = max(0, microseconds) / 1_000_000
+    return struct.pack('!HH', min(int(value), 0xFFFF), int((value - int(value)) * 65536) & 0xFFFF)
+
+
+def reply(request, received, sent, max_error):
+    """The server answer to an NTP client request, or None to stay silent."""
+    if len(request) < 48:
+        return None
+    version = (request[0] >> 3) & 0x7
+    mode = request[0] & 0x7
+    if mode != 3 or not 1 <= version <= 4:
+        return None
+    poll = request[2]
+    header = bytes([(0 << 6) | (version << 3) | 4, STRATUM, poll, 0xEC])  # precision 2^-20
+    return (header + short_format(0) + short_format(max_error) + REFERENCE_ID
+            + ntp_timestamp(received - 16) + request[40:48] + ntp_timestamp(received) + ntp_timestamp(sent))
+
+
+class Limiter:
+    def __init__(self):
+        self.tokens = collections.OrderedDict()
+
+    def allow(self, address, now):
+        tokens, at = self.tokens.pop(address, (BURST, now))
+        tokens = min(BURST, tokens + (now - at) * REFILL_PER_SECOND)
+        self.tokens[address] = (tokens - 1, now) if tokens >= 1 else (tokens, now)
+        while len(self.tokens) > MAX_TRACKED:
+            self.tokens.popitem(last=False)
+        return tokens >= 1
+
+
+def serve(sock, clock=kernel_clock, now=time.time, monotonic=time.monotonic, once=False):
+    limiter = Limiter()
+    checked, answer, max_error = -1e9, False, None
+    while True:
+        try:
+            request, (address, port) = sock.recvfrom(512)
+        except (socket.timeout, TimeoutError):
+            if once:
+                return
+            continue
+        received = now()
+        if not private_source(address) or not limiter.allow(address, monotonic()):
+            if once:
+                return
+            continue
+        if monotonic() - checked > 1:
+            synchronized, max_error = clock()
+            answer, checked = serving(synchronized, max_error), monotonic()
+        packet = reply(request, received, now(), max_error or 0) if answer else None
+        if packet is not None:
+            try:
+                sock.sendto(packet, (address, port))
+            except OSError:
+                pass
+        if once:
+            return
+
+
+def main():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(('0.0.0.0', 123))
+    print('Nest time service: answering NTP requests from private addresses', flush=True)
+    serve(sock)
+
+
+if __name__ == '__main__':
+    main()

@@ -135,6 +135,9 @@ struct PeerContract {
     /// Manage accepts chunked state backup uploads (`state_backup::upload`).
     #[serde(default)]
     accepts_state_backup_chunks: bool,
+    /// Manage accepts the site check lane (`site_check`).
+    #[serde(default)]
+    accepts_site_check: bool,
     runtime_epoch: bool,
     report_protocol: u32,
 }
@@ -224,6 +227,14 @@ struct AgentNestConfigResponse {
     software_update_channel: Option<Value>,
     #[serde(default)]
     software_update_check_requested_at: Option<Value>,
+    /// Manage accepts `site_check_v1` and the report's `site_check` lane;
+    /// until it says so, Nest sends neither (an older Manage rejects the
+    /// report).
+    #[serde(default)]
+    site_check_supported: bool,
+    /// What the site check also tests and "Check again" (`site_check`).
+    #[serde(default)]
+    site_check: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -538,6 +549,9 @@ struct NestAgentReportRequest {
     /// its App List packages at the candidate's commit.
     #[serde(skip_serializing_if = "Option::is_none")]
     software_update_findings: Option<Vec<crate::software_updates::findings::FindingReport>>,
+    /// To a Manage that accepts `site_check_v1`: the latest site check.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    site_check: Option<crate::site_check::Report>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1038,6 +1052,7 @@ async fn sync_nest_foundation(
                 accepts_usb_installer: desired.usb_installer_supported,
                 accepts_when_idle: desired.update_when_idle_supported,
                 accepts_state_backup_chunks: desired.state_backup_chunked_upload_supported,
+                accepts_site_check: desired.site_check_supported,
                 runtime_epoch: desired
                     .compatibility
                     .as_ref()
@@ -1072,6 +1087,7 @@ async fn sync_nest_foundation(
             uploads: peer.accepts_uploads,
             usb_installer: peer.accepts_usb_installer,
             when_idle: peer.accepts_when_idle,
+            site_check: peer.accepts_site_check,
         },
         peer.report_protocol,
     )
@@ -1104,6 +1120,7 @@ fn peer_contract_after_failed_fetch(
         accepts_usb_installer: false,
         accepts_when_idle: false,
         accepts_state_backup_chunks: false,
+        accepts_site_check: false,
         runtime_epoch: false,
         report_protocol: TIARIS_COMPONENT_PROTOCOL_VERSION,
     })
@@ -1165,6 +1182,18 @@ async fn apply_nest_desired(
         .filter(|_| desired.software_cache_upload_supported);
     if let Err(error) = crate::software_cache_upload::apply(state, upload).await {
         retain_sync_failure(first_failure, "software cache upload access", error);
+    }
+    // Its own lane: unusable site check targets only stop "Check again".
+    if let Err(error) = crate::site_check::apply_managed(
+        &state.config.paths.data_dir,
+        desired
+            .site_check
+            .as_ref()
+            .filter(|_| desired.site_check_supported),
+    )
+    .await
+    {
+        retain_sync_failure(first_failure, "site check settings", error);
     }
     // Its own lane: an unusable channel or request only stops update checks.
     if let Err(error) = crate::software_updates::apply_managed(
@@ -1661,6 +1690,10 @@ async fn report_nest_state(
         detected_nixpkgs_commits,
         software_update_checked_at,
         software_update_findings,
+        site_check: peer_support
+            .site_check
+            .then(|| crate::site_check::report(&state.config.paths.data_dir))
+            .flatten(),
     };
     let (body, body_bytes) =
         fit_nest_report_body(body, MAX_NEST_REPORT_BODY_BYTES, report_priority)?;
@@ -2834,6 +2867,7 @@ struct PeerReportSupport {
     uploads: bool,
     usb_installer: bool,
     when_idle: bool,
+    site_check: bool,
 }
 
 fn nest_capabilities(
@@ -2854,6 +2888,9 @@ fn nest_capabilities(
     // this Nest also has a stick image to download.
     let usb_image = peer_support.usb_installer && crate::usb_installer::image_available();
     push_peer_capabilities(&mut capabilities, peer_support.uploads, usb_image);
+    if peer_support.site_check {
+        capabilities.push(crate::site_check::CAPABILITY);
+    }
     capabilities
 }
 
@@ -3749,6 +3786,7 @@ mod tests {
             accepts_usb_installer: true,
             accepts_when_idle: true,
             accepts_state_backup_chunks: true,
+            accepts_site_check: true,
             runtime_epoch: true,
             report_protocol: TIARIS_DETECTED_COMMITS_PROTOCOL_VERSION,
         };
@@ -5057,12 +5095,49 @@ mod tests {
             uploads: desired.software_cache_upload_supported,
             usb_installer: desired.usb_installer_supported,
             when_idle: false,
+            site_check: false,
         };
         let legacy = nest_capabilities(&config, false, support(&older));
         let modern = nest_capabilities(&config, false, support(&newer));
         assert!(!legacy.contains(&crate::software_cache_upload::CAPABILITY));
         assert!(modern.contains(&crate::software_cache_upload::CAPABILITY));
         assert_eq!(modern.len(), legacy.len() + 1);
+    }
+
+    #[test]
+    fn site_check_lane_requires_explicit_manage_support() {
+        // A Manage that does not know `site_check_v1` rejects the whole
+        // report, so Nest sends the capability and lane only when it may.
+        let older: AgentNestConfigResponse = serde_json::from_value(json!({})).unwrap();
+        let newer: AgentNestConfigResponse = serde_json::from_value(json!({
+            "site_check_supported": true,
+            "site_check": {"requested_at": "2026-11-14T10:00:00Z", "directories": []}
+        }))
+        .unwrap();
+        assert!(!older.site_check_supported && older.site_check.is_none());
+        assert!(newer.site_check_supported && newer.site_check.is_some());
+        let config = AppConfig::default();
+        let support = |site_check| PeerReportSupport {
+            uploads: false,
+            usb_installer: false,
+            when_idle: false,
+            site_check,
+        };
+        assert!(
+            !nest_capabilities(&config, false, support(false))
+                .contains(&crate::site_check::CAPABILITY)
+        );
+        assert!(
+            nest_capabilities(&config, false, support(true))
+                .contains(&crate::site_check::CAPABILITY)
+        );
+        // A stored contract from before the lane existed keeps it off.
+        let stored: PeerContract = serde_json::from_value(json!({
+            "supports_scheduling": true, "accepts_uploads": true, "accepts_usb_installer": true,
+            "runtime_epoch": true, "report_protocol": 1
+        }))
+        .unwrap();
+        assert!(!stored.accepts_site_check);
     }
 
     #[test]
@@ -5100,6 +5175,7 @@ mod tests {
                 uploads: false,
                 usb_installer: true,
                 when_idle: false,
+                site_check: false,
             },
         );
         assert!(!reported.contains(&crate::usb_installer::CAPABILITY));
@@ -6515,6 +6591,7 @@ mod tests {
             detected_nixpkgs_commits: None,
             software_update_checked_at: None,
             software_update_findings: None,
+            site_check: None,
         }
     }
 

@@ -228,6 +228,14 @@ in {
       wantedBy = [ "multi-user.target" ]; after = [ "tiaris-nest.service" ]; wants = [ "tiaris-nest.service" ];
       serviceConfig = { ExecStart = command "pxe"; Restart = "always"; RestartSec = "5s"; RuntimeDirectory = "tiaris-nest-pxe"; RuntimeDirectoryMode = "0755"; User = "root"; UMask = "0022"; NoNewPrivileges = true; ProtectSystem = "strict"; ProtectHome = true; PrivateTmp = true; ReadWritePaths = [ "/run/tiaris-nest-pxe" ]; CapabilityBoundingSet = [ "CAP_NET_BIND_SERVICE" "CAP_NET_RAW" "CAP_NET_ADMIN" "CAP_SETUID" "CAP_SETGID" "CAP_DAC_READ_SEARCH" "CAP_KILL" ]; AmbientCapabilities = [ "CAP_SETUID" ]; };
     };
+    # Computers on a network that blocks public NTP take the time from the
+    # Nest (runtime/tiaris-nest-time): the clock timesyncd keeps, answered
+    # only while synchronized and only to private addresses.
+    systemd.services.tiaris-nest-time = {
+      description = "Tiaris Nest time for computers on its network";
+      wantedBy = [ "multi-user.target" ]; after = [ "network.target" ];
+      serviceConfig = { ExecStart = command "time"; Restart = "always"; RestartSec = "5s"; DynamicUser = true; AmbientCapabilities = [ "CAP_NET_BIND_SERVICE" ]; CapabilityBoundingSet = [ "CAP_NET_BIND_SERVICE" ]; NoNewPrivileges = true; ProtectSystem = "strict"; ProtectHome = true; PrivateTmp = true; PrivateDevices = true; RestrictAddressFamilies = [ "AF_INET" "AF_UNIX" ]; MemoryMax = "64M"; };
+    };
     systemd.services.tiaris-nest-network-runtime = (rootService "network-runtime") // { after = [ "tiaris-nest-first-boot.service" "network-online.target" ]; wants = [ "network-online.target" ]; before = [ "tiaris-nest.service" ]; serviceConfig = { Type = "oneshot"; ExecStart = command "network-runtime"; TimeoutStartSec = "30s"; }; };
     systemd.timers.tiaris-nest-network-runtime = { wantedBy = [ "timers.target" ]; timerConfig = { OnBootSec = "1min"; OnUnitActiveSec = "1min"; }; };
     systemd.services.tiaris-nest-network-change = (rootService "network-change") // { after = [ "tiaris-nest.service" ]; serviceConfig = { Type = "oneshot"; ExecStart = command "network-change"; TimeoutStartSec = "5min"; }; };
