@@ -37,12 +37,17 @@ def require_legacy_origin(compiled, expected_origin):
         raise ValueError('compiled bootstrap legacy Tiaris origin differs from the production rename')
 
 
-def repository_names(repository):
-    """Every GitHub name of `repository` (old and new, after a rename)."""
+def github_repositories():
+    """tools/github_repositories.py: the current and former names of each repository."""
     spec = importlib.util.spec_from_file_location('github_repositories', REPO / 'tools/github_repositories.py')
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.names(repository)
+    return module
+
+
+def repository_names(repository):
+    """Every GitHub name of `repository` (old and new, after a rename)."""
+    return github_repositories().names(repository)
 
 
 def clean_checkout(directory, revision, repository):
@@ -136,8 +141,9 @@ def require_workstation_custom_cache(cache, outputs):
 
 def build(args):
     manage = Path(args.manage_source_dir).absolute()
-    clean_checkout(REPO, args.source_revision, 'CybexHQ/james')
-    clean_checkout(manage, args.manage_source_revision, 'CybexHQ/development')
+    repositories = github_repositories()
+    clean_checkout(REPO, args.source_revision, repositories.NEST)
+    clean_checkout(manage, args.manage_source_revision, repositories.TIARIS)
     run(sys.executable, REPO / 'tools/nest-release.py', 'validate-manage-origin',
         '--expected-manage-origin', args.expected_manage_origin)
     public_key(args.release_public_key)

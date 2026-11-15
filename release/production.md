@@ -5,9 +5,9 @@ authority configured in `production-release`. Repository public keys must match
 the installed fleet. The protected secrets keep their historical storage names
 (`CYBEX_FORGE_RELEASE_PRIVATE_KEY_B64`, `CYBEX_FORGE_RELEASE_POLICY_TOKEN`); the
 workflow uses those exact names. Runtime source is pinned to an exact commit in
-`CybexHQ/development` on the release tag, read with the read-only deployment key
-`CYBEX_DEVELOPMENT_SOURCE_SSH_KEY`. Tiaris application deployment is a separate
-operation.
+`CybexHQ/tiaris` (formerly `CybexHQ/development`) on the release tag, read with
+the read-only deployment key `CYBEX_DEVELOPMENT_SOURCE_SSH_KEY`. Tiaris
+application deployment is a separate operation.
 
 The one-time `recovery-adoption.json` authorization binds the historical GitHub
 dev.4 publication and recovered production dev.29 manifests, compatibility

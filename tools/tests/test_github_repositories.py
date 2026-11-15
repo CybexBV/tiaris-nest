@@ -49,10 +49,10 @@ class NamesTests(unittest.TestCase):
         self.assertTrue(R.same_repository('other/nest', 'other/nest'))
         self.assertFalse(R.same_repository('other/nest', 'other/nest2'))
 
-    def test_current_names_are_unchanged_until_the_rename(self):
-        # Built URLs and records keep the current names; nothing may require
-        # the new repositories to exist yet.
-        self.assertEqual((R.NEST, R.TIARIS), (OLD, OLD_TIARIS))
+    def test_current_names_are_the_new_names_and_the_old_names_stay(self):
+        # Both renames are done: built URLs and records spell the new names, and
+        # the old names remain, because signed releases keep them.
+        self.assertEqual((R.NEST, R.TIARIS), (NEW, NEW_TIARIS))
         data = json.loads((ROOT / 'release/github-repositories.json').read_text())
         for role in ('nest', 'tiaris'):
             self.assertIn(data[role]['current'], data[role]['names'])
@@ -240,6 +240,14 @@ class ReleaseToolTests(unittest.TestCase):
 
     def test_coordinated_pin_admits_either_tiaris_name_and_writes_the_current_one(self):
         module = runpy.run_path(str(ROOT / 'tools/coordinated-release.py'))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'release').mkdir()
+            (root / 'Cargo.toml').write_text('[package]\nname="tiaris-nest"\nversion = "0.2.5"\n')
+            (root / 'Cargo.lock').write_text('[[package]]\nname = "tiaris-nest"\nversion = "0.2.5"\n')
+            module['pin'](root, 'a' * 40, '1.0.1', '0.2.6')
+            pinned = json.loads((root / 'release/workstation-netboot-source.json').read_text())
+            self.assertEqual(pinned['repository'], NEW_TIARIS)
         for name, admitted in ((OLD_TIARIS, True), (NEW_TIARIS, True), ('CybexHQ/manage', False), (NEW, False)):
             with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
@@ -258,7 +266,7 @@ class ReleaseToolTests(unittest.TestCase):
     def test_local_candidate_receipt_sealed_under_the_old_name_is_the_same_repository(self):
         candidate = load('rename_local_candidate', ROOT / 'tools/local-candidate.py')
         expected = candidate.identity('42', 'a' * 40, 'v0.2.2')
-        self.assertEqual(expected['repository'], OLD)
+        self.assertEqual(expected['repository'], NEW)
         files = {'a': {'size': 1, 'sha256': '0' * 64}, 'b': {'size': 1, 'sha256': '1' * 64}}
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / 'candidate.json'
@@ -275,12 +283,12 @@ class ReleaseToolTests(unittest.TestCase):
         config = load('rename_isolated_manage_config', ROOT / 'nixos-appliance/qualification/isolated_manage_config.py')
         resources = load('rename_isolated_manage_resources',
                          ROOT / 'nixos-appliance/qualification/isolated_manage_resources.py')
-        self.assertEqual(config.SOURCE, 'https://github.com/' + OLD_TIARIS)
+        self.assertEqual(config.SOURCE, 'https://github.com/' + NEW_TIARIS)
         for remote in (f'https://github.com/{NEW_TIARIS}', f'git@github.com:{NEW_TIARIS}.git',
                        f'https://github.com/{OLD_TIARIS}.git'):
             self.assertIn(remote, config.SOURCE_REMOTES)
         self.assertNotIn('https://github.com/CybexHQ/manage', config.SOURCE_REMOTES)
-        for source, admitted in ((f'https://github.com/{NEW_TIARIS}', True), (config.SOURCE, True),
+        for source, admitted in ((f'https://github.com/{OLD_TIARIS}', True), (config.SOURCE, True),
                                  ('https://github.com/CybexHQ/manage', False), (f'https://github.com/{NEW}', False)):
             image = {'Id': 'sha256:' + 'a' * 64, 'Config': {'Labels': {
                 'org.opencontainers.image.revision': 'a' * 40, 'org.opencontainers.image.source': source,
@@ -297,8 +305,12 @@ class ReleaseToolTests(unittest.TestCase):
 class BuildCheckoutTests(unittest.TestCase):
     def test_release_build_admits_its_checkout_under_either_name_only(self):
         build = runpy.run_path(str(ROOT / 'nixos-appliance/build.py'))
+        # A checkout cloned before the rename keeps its old-name origin; the build
+        # expects the current name (R.NEST, R.TIARIS) and must still admit it.
         cases = [(OLD, OLD, True), (OLD, NEW, True), (OLD_TIARIS, OLD_TIARIS, True), (OLD_TIARIS, NEW_TIARIS, True),
-                 (OLD, OLD_TIARIS, False), (OLD_TIARIS, NEW, False), (OLD, 'other/james', False), (OLD, 'CybexHQ/manage', False)]
+                 (R.NEST, OLD, True), (R.NEST, NEW, True), (R.TIARIS, OLD_TIARIS, True), (R.TIARIS, NEW_TIARIS, True),
+                 (OLD, OLD_TIARIS, False), (OLD_TIARIS, NEW, False), (OLD, 'other/james', False), (OLD, 'CybexHQ/manage', False),
+                 (R.NEST, R.TIARIS, False), (R.TIARIS, 'CybexHQ/manage', False)]
         for expected, origin_name, admitted in cases:
             with self.subTest(expected=expected, origin=origin_name), tempfile.TemporaryDirectory() as temporary:
                 checkout = Path(temporary).resolve()

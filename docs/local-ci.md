@@ -4,9 +4,10 @@ Buildbot on The Beast runs ordinary main and PR checks in disposable Incus VMs.
 GitHub remains the source/PR host and displays the real `CI` commit status.
 
 Use `tiaris-ci run james --revision FULL_SHA` to retry main, or add
-`--ref refs/pull/NUMBER/head` for a PR head. The dashboard is
-<http://100.80.13.18:18090/> on Tailscale. The controller and runbook live in
-`CybexHQ/development` under `deploy/ci/` and `docs/local-ci.md`.
+`--ref refs/pull/NUMBER/head` for a PR head. The dashboard is at The Beast's
+CI address on the private network. That address, the controller and the runbook
+live in the private Tiaris repository, `CybexHQ/tiaris`, under `deploy/ci/` and
+`docs/local-ci.md`.
 
 The suite retains Rust formatting/tests/clippy, the ignored Python-packer/Rust
 integration, shell/Python/Nix contracts, and the networked dependency audit. The

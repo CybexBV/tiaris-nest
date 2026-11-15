@@ -376,9 +376,9 @@ Qualification retries use evidence directories unique to the workflow run and at
 Failed or canceled runs return directory ownership to the runner for cleanup; old
 acceptance evidence is never overwritten or reused by a retry.
 
-The Tiaris release controller on The Beast (`tiaris-release`, implemented in CybexHQ/development
+The Tiaris release controller on The Beast (`tiaris-release`, implemented in CybexHQ/tiaris
 `deploy/manage/beast_release_workflow.py`) creates a candidate tag with `release/coordinated.json` and
-an immutable workstation source pin to `CybexHQ/development`. The normal release workflow still signs,
+an immutable workstation source pin to `CybexHQ/tiaris`. The normal release workflow still signs,
 builds once, publishes an immutable prerelease and verifies its public closure; under release policy
 fast-v1 VM qualification is on demand (`Tiaris-VM-Qualification: nightly`). These tags skip
 automatic stable promotion. `approve-coordinated-release.yml` promotes only explicitly approved
