@@ -176,15 +176,17 @@ published version is refused with the changed input named: advance
 
 ### Repository names
 
-`CybexHQ/james` is being renamed `CybexHQ/tiaris-nest`, and `CybexHQ/development`
-`CybexHQ/tiaris`. GitHub redirects the old names, but after a rename its API and
+`CybexHQ/james` was renamed `CybexHQ/tiaris-nest`, and `CybexHQ/development`
+`CybexHQ/tiaris` (2026-11-15). GitHub redirects the old names, but its API and
 `GITHUB_REPOSITORY` give the new name, while signed releases keep the URLs they
 were published with. Every check of a repository name or GitHub URL treats both
 names as the same repository: `release/github-repositories.json` lists them, and
 `tools/github_repositories.py` (Python and workflow shell) and
 `release/workstation-netboot.nix` read it. Never remove a name from that file. Its
-`current` names are still the old ones; they are what new records spell, and can
-move to the new names once the renames are done.
+`current` names are the new ones; new records, URLs and pins spell them. Signed
+records and old-release fixtures keep the old names. `main`'s copy of
+`release/workstation-netboot-source.json` keeps `CybexHQ/development` until the
+next `tools/coordinated-release.py pin` rewrites it.
 
 Never create a new repository under an old name. GitHub then stops redirecting
 it, so the old-name URLs in signed releases stop working on installed Nests, and
@@ -223,8 +225,8 @@ because the protected `production-release-qualification` environment admits only
 `v*` tag refs and GitHub checks the run's own ref:
 
 ```sh
-tag=$(gh release view --repo CybexHQ/james --json tagName --jq .tagName)   # GitHub Latest
-gh workflow run nest-vm-qualification.yml --repo CybexHQ/james --ref "$tag" -f tag="$tag"
+tag=$(gh release view --repo CybexHQ/tiaris-nest --json tagName --jq .tagName)   # GitHub Latest
+gh workflow run nest-vm-qualification.yml --repo CybexHQ/tiaris-nest --ref "$tag" -f tag="$tag"
 ```
 
 Any other ref fails in the first job with that command. A `workflow_call` caller must

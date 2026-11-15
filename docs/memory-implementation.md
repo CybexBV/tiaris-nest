@@ -136,7 +136,7 @@ remove only the resources created for that run.
 
 ## Production rollout on 30 September 2026
 
-Signed release [v0.2.45](https://github.com/CybexHQ/james/releases/tag/v0.2.45),
+Signed release [v0.2.45](https://github.com/CybexHQ/tiaris-nest/releases/tag/v0.2.45),
 source `fa173c3f830df6d5c40fe6b9f9129fe081a4f4c2`, was installed on
 `demo-arnold-james-01` and `james-greenfield-install`. Both committed generation 2
 and reported healthy local services and working PXE/cache endpoints. The offline

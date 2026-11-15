@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.85"
 description = "UEFI-only PXE/iPXE boot control service for Tiaris-managed infrastructure"
 license = "Apache-2.0"
-repository = "https://github.com/CybexHQ/james"
+repository = "https://github.com/CybexHQ/tiaris-nest"
 readme = "README.md"
 publish = false
 
