@@ -20,5 +20,5 @@ in pkgs.rustPlatform.buildRustPackage {
   postInstall = ''
     install -Dm0444 ${source}/assets/pxe-menu.png $out/share/tiaris-nest/assets/pxe-menu.png
   '';
-  meta = { license = pkgs.lib.licenses.gpl3Only; platforms = [ "x86_64-linux" ]; };
+  meta = { license = pkgs.lib.licenses.asl20; platforms = [ "x86_64-linux" ]; };
 }
