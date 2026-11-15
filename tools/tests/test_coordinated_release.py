@@ -319,7 +319,10 @@ class CoordinatedReleaseTests(unittest.TestCase):
 
     def test_workstation_expression_accepts_only_the_development_source(self):
         expression = (ROOT / 'release/workstation-netboot.nix').read_text()
-        self.assertIn('assert sourcePin.repository == "CybexHQ/development";', expression)
+        # Either name of the Tiaris repository (release/github-repositories.json).
+        self.assertIn('assert builtins.elem sourcePin.repository tiarisNames;', expression)
+        names = json.loads((ROOT / 'release/github-repositories.json').read_text())['tiaris']['names']
+        self.assertEqual(set(names), {'CybexHQ/development', 'CybexHQ/tiaris'})
         self.assertNotIn('CybexHQ/manage', expression)
 
     def test_pins_development_and_requires_explicit_promotion(self):
@@ -364,5 +367,5 @@ class CoordinatedReleaseTests(unittest.TestCase):
         self.assertNotIn(revision, workflow)
         self.assertIn('--source-revision "$(git rev-parse HEAD)"', workflow)
         self.assertIn('--manage-source-revision "$BUILD_MANAGE_REVISION"', workflow)
-        self.assertIn('[[ "$repository" = "CybexHQ/development" ]]', workflow)
+        self.assertIn('python3 -B tools/github_repositories.py same tiaris "$repository"', workflow)
         self.assertNotIn('TIARIS_NEST_UBUNTU_SNAPSHOT_ID', workflow)
