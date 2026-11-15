@@ -11,10 +11,16 @@ changes a release, and its result grants no publication or promotion.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 from pathlib import Path
 import re
 import subprocess
+
+_repositories_spec = importlib.util.spec_from_file_location(
+    'tiaris_github_repositories', Path(__file__).resolve().with_name('github_repositories.py'))
+repositories = importlib.util.module_from_spec(_repositories_spec)
+_repositories_spec.loader.exec_module(repositories)
 
 RELEASE_WORKFLOW = '.github/workflows/release.yml'
 BUNDLE = re.compile(r'tiaris-workstation-netboot-[0-9A-Za-z.+-]+-x86_64-linux\.tar\.zst')
@@ -63,7 +69,9 @@ def resolve(repository, tag, api, ref):
         raise ValueError('The release tag moved or lacks its exact source commit')
     lines = (release.get('body') or '').splitlines()
     owner = marker(lines, 'Tiaris-Release-Workflow')
-    match = re.fullmatch(rf'https://github\.com/{re.escape(repository)}/actions/runs/([1-9][0-9]*)', owner)
+    # A release published before a repository rename names its run under the old name.
+    names = '|'.join(re.escape(name) for name in repositories.names(repository))
+    match = re.fullmatch(rf'https://github\.com/(?:{names})/actions/runs/([1-9][0-9]*)', owner)
     if not match:
         raise ValueError('The release does not name its exact release workflow run')
     run_id = match.group(1)

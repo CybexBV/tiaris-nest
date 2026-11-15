@@ -6,6 +6,7 @@ directories cross this boundary. Signing and publication happen afterwards.
 """
 import fcntl
 import hashlib
+import importlib.util
 import os
 from pathlib import Path
 import shutil
@@ -13,6 +14,11 @@ import signal
 import subprocess
 import sys
 import tempfile
+
+_repositories_spec = importlib.util.spec_from_file_location(
+    'tiaris_github_repositories', Path(__file__).resolve().with_name('github_repositories.py'))
+repositories = importlib.util.module_from_spec(_repositories_spec)
+_repositories_spec.loader.exec_module(repositories)
 
 ROOT = Path(__file__).resolve().parents[1]
 # Dedicated cache is an existing host resource, independent of product naming.
@@ -31,10 +37,11 @@ def run(*args, **kwargs):
 def canonical_origin(origin):
     # actions/checkout uses SSH for the private Manage deploy key. Copy only the
     # canonical public repository identity, never its SSH configuration or key.
-    for repository in ('james', 'development'):
-        canonical = 'https://github.com/CybexHQ/' + repository
-        if origin.removesuffix('.git') in (canonical, 'git@github.com:CybexHQ/' + repository,
-                                          'ssh://git@github.com/CybexHQ/' + repository):
+    # Either name of a renamed repository is admitted, and copied as it is.
+    for repository in (*repositories.NEST_NAMES, *repositories.TIARIS_NAMES):
+        canonical = repositories.GITHUB + repository
+        if origin.removesuffix('.git') in (canonical, 'git@github.com:' + repository,
+                                          'ssh://git@github.com/' + repository):
             return canonical
     raise ValueError('The isolated NixOS build requires Nest and development source origins')
 

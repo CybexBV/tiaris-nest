@@ -5,6 +5,8 @@
 
 let
   sourcePin = builtins.fromJSON (builtins.readFile ./workstation-netboot-source.json);
+  # Every name of the Tiaris repository; see tools/github_repositories.py.
+  tiarisNames = (builtins.fromJSON (builtins.readFile ./github-repositories.json)).tiaris.names;
   nixpkgsPin = import ./nixpkgs.nix;
   nixpkgs = builtins.fetchTarball {
     inherit (nixpkgsPin) url sha256;
@@ -14,7 +16,7 @@ let
   sourceRevisionMatches = builtins.match "[0-9a-f]{40}" sourcePin.revision != null;
   nixpkgsRevisionMatches = builtins.match "[0-9a-f]{40}" nixpkgsPin.revision != null;
 in
-assert sourcePin.repository == "CybexHQ/development";
+assert builtins.elem sourcePin.repository tiarisNames;
 assert sourceRevisionMatches;
 assert nixpkgsRevisionMatches;
 assert runtimeVersion == sourcePin.runtime_version;

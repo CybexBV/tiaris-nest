@@ -5,10 +5,16 @@ Production tags use a stable X.Y.Z Nest version. Development-signed candidates u
 X.Y.Z-dev.N on a release/dev-nest-* branch, which is never tagged here.
 """
 import argparse
+import importlib.util
 import json
 from pathlib import Path
 import re
 import tomllib
+
+_repositories_spec = importlib.util.spec_from_file_location(
+    'tiaris_github_repositories', Path(__file__).resolve().with_name('github_repositories.py'))
+repositories = importlib.util.module_from_spec(_repositories_spec)
+_repositories_spec.loader.exec_module(repositories)
 
 STABLE = r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
 DEVELOPMENT = STABLE + r'-dev\.[1-9][0-9]*'
@@ -44,7 +50,7 @@ def validate(root):
             or value.get('manage_revision') != pin['revision']
             # main's copy carries an `informational` note; only `pin` output builds.
             or set(pin) != {'repository', 'revision', 'runtime_version'}
-            or pin['repository'] != 'CybexHQ/development'
+            or not repositories.same_repository(repositories.TIARIS, pin['repository'])
             or not re.fullmatch('[0-9a-f]{40}', pin['revision'])):
         raise ValueError('Invalid coordinated release source; automatic promotion is forbidden')
     return True
@@ -68,7 +74,7 @@ def pin(root, revision, runtime, version):
         raise ValueError('The Nest lockfile package identity is ambiguous')
     lock.write_text(lock.read_text().replace(before, f'name = "tiaris-nest"\nversion = "{version}"'))
     (root / 'release/workstation-netboot-source.json').write_text(json.dumps({
-        'repository': 'CybexHQ/development', 'revision': revision, 'runtime_version': runtime,
+        'repository': repositories.TIARIS, 'revision': revision, 'runtime_version': runtime,
     }, indent=2) + '\n')
     (root / 'release/coordinated.json').write_text(json.dumps({
         'schema': 'tiaris.coordinated-release.v2', 'manage_revision': revision,

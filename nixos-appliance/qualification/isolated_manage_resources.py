@@ -1,6 +1,7 @@
 """Exact-label Docker resources and explicit environment for the isolated fixture."""
 from __future__ import annotations
 
+import importlib.util
 import ipaddress
 import json
 import os
@@ -10,6 +11,11 @@ import shlex
 LABEL = 'net.tiaris.nest.qualification.owner'
 ROLE = 'net.tiaris.nest.qualification.role'
 DOCKER = ['docker', '--host', 'unix:///var/run/docker.sock']
+_repositories_spec = importlib.util.spec_from_file_location(
+    'tiaris_github_repositories', Path(__file__).resolve().parents[2] / 'tools/github_repositories.py')
+repositories = importlib.util.module_from_spec(_repositories_spec)
+_repositories_spec.loader.exec_module(repositories)
+TIARIS_SOURCE = repositories.GITHUB + repositories.TIARIS
 
 
 def write(path, body, *, uid=0, mode=0o400):
@@ -124,7 +130,7 @@ class Docker:
             raise ValueError('fixture image declares unowned persistent volumes')
         labels = config.get('Labels') or {}
         if role == 'app' and (labels.get('org.opencontainers.image.revision') != revision
-                             or labels.get('org.opencontainers.image.source') != 'https://github.com/CybexHQ/development'
+                             or not repositories.same_url(labels.get('org.opencontainers.image.source'), TIARIS_SOURCE)
                              or labels.get('net.tiaris.manage.nest-compatibility-projection-sha256') != projection):
             raise ValueError('Tiaris fixture image lacks exact reviewed development source labels')
         return value['Id']
