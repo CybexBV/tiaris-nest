@@ -4,6 +4,7 @@ import argparse
 from contextlib import contextmanager
 import fcntl
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -13,6 +14,11 @@ import shutil
 import subprocess
 import tempfile
 import zipfile
+
+_repositories_spec = importlib.util.spec_from_file_location(
+    'tiaris_github_repositories', Path(__file__).resolve().with_name('github_repositories.py'))
+repositories = importlib.util.module_from_spec(_repositories_spec)
+_repositories_spec.loader.exec_module(repositories)
 
 SCHEMA = 'tiaris.nest.local-candidate.v1'
 RECEIPT = 'candidate.json'
@@ -29,7 +35,7 @@ def identity(run, source, tag):
             or not re.fullmatch(r'[0-9a-f]{40}', source)
             or not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', tag)):
         raise ValueError('Invalid candidate identity')
-    return dict(schema=SCHEMA, repository='CybexHQ/james', run=run, source=source, tag=tag)
+    return dict(schema=SCHEMA, repository=repositories.NEST, run=run, source=source, tag=tag)
 
 
 def inventory(directory):
@@ -50,7 +56,10 @@ def receipt(path, expected):
     if path.is_symlink() or path.stat().st_size > 65536:
         raise ValueError('Invalid candidate receipt file')
     value = json.loads(path.read_text())
-    if set(value) != {*expected, 'files'} or any(value[k] != v for k, v in expected.items()):
+    # A receipt sealed under another name of the Nest repository is the same repository's.
+    if (set(value) != {*expected, 'files'}
+            or not repositories.same_repository(expected['repository'], value['repository'])
+            or any(value[k] != v for k, v in expected.items() if k != 'repository')):
         raise ValueError('Candidate receipt belongs to a different run, source or tag')
     files = value['files']
     if not isinstance(files, dict) or not 2 <= len(files) <= 32:

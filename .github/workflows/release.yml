@@ -181,7 +181,8 @@ jobs:
           revision="$(jq -er '.revision' release/workstation-netboot-source.json)"
           runtime_version="$(jq -er '.runtime_version' release/workstation-netboot-source.json)"
           nixpkgs_revision="$(sed -n 's/^[[:space:]]*revision = "\([0-9a-f]*\)";.*/\1/p' release/nixpkgs.nix)"
-          [[ "$repository" = "CybexHQ/development" ]]
+          # Any name of the Tiaris repository (release/github-repositories.json).
+          python3 -B tools/github_repositories.py same tiaris "$repository"
           [[ "$revision" =~ ^[0-9a-f]{40}$ ]]
           # release/nixpkgs.nix is the only source of the reviewed revision.
           [[ "$nixpkgs_revision" =~ ^[0-9a-f]{40}$ ]]
@@ -381,7 +382,10 @@ jobs:
           sha256="$(sed -n 's/^sha256=//p' <<<"$plan")"
           size="$(sed -n 's/^size_bytes=//p' <<<"$plan")"
           test "$(sed -n 's/^bundle_name=//p' <<<"$plan")" = "$RUNTIME_BUNDLE"
-          [[ "$url" == "https://github.com/$GITHUB_REPOSITORY/releases/download/v"*"/$RUNTIME_BUNDLE" ]]
+          # The reused runtime keeps the URL it was signed with, perhaps under
+          # this repository's former name.
+          [[ "$(python3 -B tools/github_repositories.py url "$GITHUB_REPOSITORY" "$url")" == \
+            "https://github.com/$GITHUB_REPOSITORY/releases/download/v"*"/$RUNTIME_BUNDLE" ]]
           install -d -m 0755 dist
           part="dist/.$RUNTIME_BUNDLE.download"
           curl -4 --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
@@ -882,7 +886,13 @@ jobs:
             test "$(jq -r '.draft' "$existing")" = "true"
             test "$(jq -r '.immutable' "$existing")" = "false"
             test "$(jq -r '.name // ""' "$existing")" = "Tiaris Nest $GITHUB_REF_NAME"
-            test "$(jq -r '.body // ""' "$existing")" = "$expected_body"
+            # A draft left before a repository rename names its run under the
+            # old name; every other marker must match exactly.
+            existing_body="$(jq -r '.body // ""' "$existing")"
+            existing_run="${existing_body%%$'\n'*}"
+            existing_run="${existing_run#Tiaris-Release-Workflow: }"
+            test "$(python3 -B tools/github_repositories.py url "$GITHUB_REPOSITORY" "$existing_run")" = "$owner_run"
+            test "${existing_body/#Tiaris-Release-Workflow: $existing_run/$owner_run_marker}" = "$expected_body"
             stale_id="$(jq -r '.id' "$existing")"
             [[ "$stale_id" =~ ^[1-9][0-9]*$ ]]
             stale_assets="$RUNNER_TEMP/tiaris-nest-existing-release-assets.json"

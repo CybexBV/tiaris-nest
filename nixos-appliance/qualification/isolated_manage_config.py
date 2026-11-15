@@ -20,9 +20,15 @@ _origins_spec = importlib.util.spec_from_file_location(
     'tiaris_production_origins', Path(__file__).resolve().parents[2] / 'tools/production_origins.py')
 production_origins = importlib.util.module_from_spec(_origins_spec)
 _origins_spec.loader.exec_module(production_origins)
+_repositories_spec = importlib.util.spec_from_file_location(
+    'tiaris_github_repositories', Path(__file__).resolve().parents[2] / 'tools/github_repositories.py')
+repositories = importlib.util.module_from_spec(_repositories_spec)
+_repositories_spec.loader.exec_module(repositories)
 
 SCHEMA = 'tiaris.nest.isolated-manage-config.v2'
-SOURCE = 'https://github.com/CybexHQ/development'
+SOURCE = repositories.GITHUB + repositories.TIARIS
+# A checkout's origin may use any name of the Tiaris repository.
+SOURCE_REMOTES = repositories.git_remotes(repositories.TIARIS)
 PRODUCTION = Path('/home/john/Code/Cybex/manage')
 FIELDS = {'schema', 'manage_origin', 'manage_checkout', 'manage_revision', 'app_images',
           'postgres_image', 'tls_image', 'backend_subnet', 'tls_certificate', 'tls_private_key',
@@ -167,7 +173,7 @@ def check_source(config, run=command):
         raise ValueError('production checkout is not an isolated fixture source')
     git = ['git', '-c', 'safe.directory=' + str(path), '-C', path]
     remote = run(git + ['remote', 'get-url', 'origin']).decode().strip()
-    if remote not in {SOURCE, SOURCE + '.git', 'git@github.com:CybexHQ/development.git'}:
+    if remote not in SOURCE_REMOTES:
         raise ValueError('fixture source must belong to the development repository')
     if (run(git + ['rev-parse', 'HEAD']).decode().strip() != config['manage_revision']
             or run(git + ['status', '--porcelain']).strip()):

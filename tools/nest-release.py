@@ -49,6 +49,13 @@ assert _origins_spec is not None and _origins_spec.loader is not None
 production_origins = importlib.util.module_from_spec(_origins_spec)
 _origins_spec.loader.exec_module(production_origins)
 
+_repositories_spec = importlib.util.spec_from_file_location(
+    "tiaris_github_repositories", Path(__file__).with_name("github_repositories.py")
+)
+assert _repositories_spec is not None and _repositories_spec.loader is not None
+github_repositories = importlib.util.module_from_spec(_repositories_spec)
+_repositories_spec.loader.exec_module(github_repositories)
+
 PRODUCTION_ORIGIN_TRANSITION_SCHEMA = "tiaris.nest.production-origin-transition.v1"
 PRODUCTION_ORIGIN_TRANSITION_FIELDS = {
     "schema", "repository", "operation", "from_manage_origin", "to_manage_origin",
@@ -3474,7 +3481,7 @@ def _production_origin_transition_binds(
         and previous_payload.get("nest_release_version") == predecessor["nest_release_version"]
         and hashlib.sha256(previous_body).hexdigest() == predecessor["compatibility_sha256"]
         and manifest.get("sha256") == predecessor["manifest_sha256"]
-        and manifest.get("url") == expected_url
+        and github_repositories.same_url(manifest.get("url"), expected_url)
     )
 
 
@@ -3522,7 +3529,7 @@ def _authorized_previous_key(path, current_key, current_version, authorization_p
     if (published.get("public_key") != previous.get("public_key")
             or published.get("compatibility_sha256") != hashlib.sha256(body).hexdigest()
             or published.get("manifest_sha256") != previous.get("release_manifest", {}).get("sha256")
-            or previous.get("release_manifest", {}).get("url") != expected_url):
+            or not github_repositories.same_url(previous.get("release_manifest", {}).get("url"), expected_url)):
         _fail("historical predecessor differs from its exact authorization")
     return published["public_key"]
 
@@ -3624,10 +3631,17 @@ def _verify_release_compatibility_command(arguments: argparse.Namespace) -> None
         "component compatibility contract",
         maximum_bytes=512 * 1024,
     )
+    # A release keeps the manifest URL it was signed with. After a repository
+    # rename the caller derives the new name; the same repository's signed URL
+    # still matches, an unrelated repository does not.
+    manifest_url = arguments.manifest_url
+    signed_manifest_url = actual_payload["release_manifest"]["url"]
+    if github_repositories.same_url(manifest_url, signed_manifest_url):
+        manifest_url = signed_manifest_url
     expected_payload, manifest_signed_messages = _release_compatibility_unsigned_payload(
         manifest,
         manifest_body,
-        arguments.manifest_url,
+        manifest_url,
         compatibility,
         arguments.trusted_public_key,
     )

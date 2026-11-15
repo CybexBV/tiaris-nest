@@ -3,6 +3,7 @@
 import argparse
 import base64
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -36,6 +37,14 @@ def require_legacy_origin(compiled, expected_origin):
         raise ValueError('compiled bootstrap legacy Tiaris origin differs from the production rename')
 
 
+def repository_names(repository):
+    """Every GitHub name of `repository` (old and new, after a rename)."""
+    spec = importlib.util.spec_from_file_location('github_repositories', REPO / 'tools/github_repositories.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.names(repository)
+
+
 def clean_checkout(directory, revision, repository):
     if not re.fullmatch('[0-9a-f]{40}', revision):
         raise ValueError('source revision must be exact lowercase 40-hex')
@@ -43,7 +52,8 @@ def clean_checkout(directory, revision, repository):
         raise ValueError('source checkout must be an ordinary directory')
     if run('git', '-C', directory, 'rev-parse', '--show-toplevel') != str(directory):
         raise ValueError('source path is not a checkout root')
-    if run('git', '-C', directory, 'remote', 'get-url', 'origin').removesuffix('.git') != 'https://github.com/CybexHQ/' + repository:
+    origins = {'https://github.com/' + name for name in repository_names(repository)}
+    if run('git', '-C', directory, 'remote', 'get-url', 'origin').removesuffix('.git') not in origins:
         raise ValueError('source checkout origin differs from its environment')
     if run('git', '-C', directory, 'rev-parse', 'HEAD') != revision:
         raise ValueError('source checkout differs from requested revision')
@@ -126,8 +136,8 @@ def require_workstation_custom_cache(cache, outputs):
 
 def build(args):
     manage = Path(args.manage_source_dir).absolute()
-    clean_checkout(REPO, args.source_revision, 'james')
-    clean_checkout(manage, args.manage_source_revision, 'development')
+    clean_checkout(REPO, args.source_revision, 'CybexHQ/james')
+    clean_checkout(manage, args.manage_source_revision, 'CybexHQ/development')
     run(sys.executable, REPO / 'tools/nest-release.py', 'validate-manage-origin',
         '--expected-manage-origin', args.expected_manage_origin)
     public_key(args.release_public_key)

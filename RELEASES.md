@@ -174,6 +174,22 @@ new release as well. A different revision, nixpkgs pin or packaged source at the
 published version is refused with the changed input named: advance
 `deploy/nixos/workstation-netboot-version`, or pin the published runtime's inputs.
 
+### Repository names
+
+`CybexHQ/james` is being renamed `CybexHQ/tiaris-nest`, and `CybexHQ/development`
+`CybexHQ/tiaris`. GitHub redirects the old names, but after a rename its API and
+`GITHUB_REPOSITORY` give the new name, while signed releases keep the URLs they
+were published with. Every check of a repository name or GitHub URL treats both
+names as the same repository: `release/github-repositories.json` lists them, and
+`tools/github_repositories.py` (Python and workflow shell) and
+`release/workstation-netboot.nix` read it. Never remove a name from that file. Its
+`current` names are still the old ones; they are what new records spell, and can
+move to the new names once the renames are done.
+
+Never create a new repository under an old name. GitHub then stops redirecting
+it, so the old-name URLs in signed releases stop working on installed Nests, and
+these checks would trust the new repository as this one.
+
 ## Release policy fast-v1 (owner, 2026-11-02)
 
 Production Nest releases must take roughly 10–30 minutes from tag to promotion.

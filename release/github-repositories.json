@@ -1,0 +1,11 @@
+{
+  "about": "GitHub names of the Nest and Tiaris repositories. `current` is the name new records and URLs use; `names` lists every name that is the same repository. A rename adds the new name to `names` and later moves `current`; a name is never removed, because signed, immutable releases keep the name they were published under. Read by tools/github_repositories.py (Python and workflow shell) and release/workstation-netboot.nix.",
+  "nest": {
+    "current": "CybexHQ/james",
+    "names": ["CybexHQ/james", "CybexHQ/tiaris-nest"]
+  },
+  "tiaris": {
+    "current": "CybexHQ/development",
+    "names": ["CybexHQ/development", "CybexHQ/tiaris"]
+  }
+}

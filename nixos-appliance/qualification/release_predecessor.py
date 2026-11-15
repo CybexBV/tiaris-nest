@@ -28,6 +28,7 @@ def module(name, path):
 
 
 release = module('nest_release', ROOT / 'tools/nest-release.py')
+repositories = release.github_repositories
 transition = module('namespace_transition', Path(__file__).with_name('namespace_transition.py'))
 TRANSITION = ROOT / 'release/namespace-transition.json'
 ORIGIN_TRANSITION = ROOT / 'release/production-origin-transition.json'
@@ -178,8 +179,8 @@ def historical_authority(path, trusted_key, previous, directory, candidate, repo
     if old.get('github_release_id') != previous['id']:
         return trusted_key
     if (value.get('schema') != 'tiaris.nest.recovery-adoption.v1' or body != canonical(value)
-            or value.get('repository') != repository or value.get('successor_version') != candidate
-            or value.get('public_key') != trusted_key):
+            or not repositories.same_repository(repository, value.get('repository'))
+            or value.get('successor_version') != candidate or value.get('public_key') != trusted_key):
         raise ValueError('Historical authority requires exact current-key authorization')
     signature = release._canonical_base64(value['signature'], 'historical authorization', expected_bytes=64)
     release._self_verify(release.ED25519_PUBLIC_DER_PREFIX + release._trusted_public_key(trusted_key), signature,
@@ -209,7 +210,8 @@ def resolve(repository, candidate, trusted_key, directory, authorization=None, r
     names = (transition.MANIFEST, transition.COMPATIBILITY) if legacy else (MANIFEST, COMPATIBILITY)
     for name in names:
         assets = [a for a in previous['assets'] if a['name'] == name]
-        if len(assets) != 1 or assets[0]['browser_download_url'] != base + name:
+        # After a rename GitHub reports the new name; either name is this repository.
+        if len(assets) != 1 or not repositories.same_url(assets[0]['browser_download_url'], base + name):
             raise ValueError('Published asset URL does not bind repository and tag')
         asset = assets[0]
         digest = asset.get('digest')

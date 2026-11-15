@@ -46,7 +46,7 @@ def prepare(template, candidate_dir, predecessor_dir, directory):
     if source == config.PRODUCTION or config.PRODUCTION in source.parents:
         raise ValueError('production checkout cannot supply qualification source')
     command = ['git', '-c', 'safe.directory=' + str(source), '-C', str(source)]
-    if run(*command, 'remote', 'get-url', 'origin').removesuffix('.git') != config.SOURCE:
+    if run(*command, 'remote', 'get-url', 'origin') not in config.SOURCE_REMOTES:
         raise ValueError('qualification source must be the development repository')
     run(*command, 'cat-file', '-e', revision + '^{commit}')
     directory = config.ordinary_path(directory.parent) / directory.name

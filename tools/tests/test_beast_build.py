@@ -50,14 +50,15 @@ class BuildIsolationTests(unittest.TestCase):
                 (source / 'cache').chmod(0o700)
 
     def test_origin_admission_is_exact_for_https_and_ssh(self):
-        for repository in ('james', 'development'):
+        # Both names of each renamed repository; the origin keeps the name it has.
+        for repository in ('james', 'tiaris-nest', 'development', 'tiaris'):
             for base in ('https://github.com/CybexHQ/', 'git@github.com:CybexHQ/',
                          'ssh://git@github.com/CybexHQ/'):
                 for suffix in ('', '.git'):
                     with self.subTest(base=base, repository=repository, suffix=suffix):
                         self.assertEqual(builder.canonical_origin(base + repository + suffix),
                                          'https://github.com/CybexHQ/' + repository)
-        for origin in ('git@github.com:CybexHQ/manage.git',
+        for origin in ('git@github.com:CybexHQ/manage.git', 'https://github.com/CybexHQ/tiaris-extra',
                        'https://github.com/CybexHQ/development/extra',
                        'https://github.com.evil/CybexHQ/development',
                        'ssh://git@github.com:2222/CybexHQ/development',

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,11 @@ import re
 import subprocess
 import sys
 import time
+
+_repositories_spec = importlib.util.spec_from_file_location(
+    'tiaris_github_repositories', Path(__file__).resolve().with_name('github_repositories.py'))
+repositories = importlib.util.module_from_spec(_repositories_spec)
+_repositories_spec.loader.exec_module(repositories)
 
 WAIT_SECONDS = 300
 RETRY_SECONDS = 3
@@ -82,15 +88,16 @@ def inspect(expected_immutable_id=None):
     if not matches:
         return None
     release = matches[0]
-    expected_body = '\n'.join((
-        f'Tiaris-Release-Workflow: {values["GITHUB_SERVER_URL"]}/{repository}/actions/runs/{values["GITHUB_RUN_ID"]}',
+    # A retry after a repository rename finds the run named under the old name.
+    expected_bodies = {'\n'.join((
+        f'Tiaris-Release-Workflow: {values["GITHUB_SERVER_URL"]}/{name}/actions/runs/{values["GITHUB_RUN_ID"]}',
         f'Tiaris-Candidate-Artifact-ID: {values["TIARIS_NEST_RELEASE_ARTIFACT_ID"]}',
         f'Tiaris-Candidate-Artifact-SHA256: {values["TIARIS_NEST_RELEASE_ARTIFACT_DIGEST"]}',
         'Tiaris-VM-Qualification: nightly',
-        'Tiaris-Public-Closure: required'))
+        'Tiaris-Public-Closure: required')) for name in repositories.names(repository)}
     if (type(release.get('id')) is not int or release['id'] <= 0
             or release.get('name') != f'Tiaris Nest {tag}'
-            or release.get('body') != expected_body
+            or release.get('body') not in expected_bodies
             or release.get('target_commitish', '').lower() != values['GITHUB_SHA'].lower()
             or release.get('prerelease') is not True):
         raise ValueError('Existing release does not belong to the exact publication candidate')

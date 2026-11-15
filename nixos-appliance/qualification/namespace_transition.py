@@ -14,9 +14,11 @@ DOMAIN = b'TIARIS-NEST-NAMESPACE-TRANSITION-V1\n'
 
 def authenticate(release, directory, authorization, trusted_key, repository, candidate, previous):
     canonical = release._canonical_json_body
+    repositories = release.github_repositories
     anchor, body = release._load_bounded_json(authorization, 'namespace transition', maximum_bytes=1024**2)
     if (body != canonical(anchor) or anchor.get('schema') != 'tiaris.nest.namespace-transition.v1'
-            or anchor.get('repository') != repository or anchor.get('successor_version') != candidate
+            or not repositories.same_repository(repository, anchor.get('repository'))
+            or anchor.get('successor_version') != candidate
             or anchor.get('public_key') != trusted_key or anchor.get('operation') != 'reinstall-only'):
         raise ValueError('Namespace transition requires exact signed successor authorization')
     signature = release._canonical_base64(anchor['signature'], 'namespace authorization', expected_bytes=64)
@@ -26,6 +28,7 @@ def authenticate(release, directory, authorization, trusted_key, repository, can
     asset, asset_body = release._load_bounded_json(directory / COMPATIBILITY, 'historical compatibility', maximum_bytes=1024**2)
     published = anchor['published']
     base = f'https://github.com/{repository}/releases/download/{previous["tag_name"]}/'
+    signed_manifest = asset.get('release_manifest')
     if (published['github_release_id'] != previous['id'] or published['tag_name'] != previous['tag_name']
             or published['target_commitish'] != previous['target_commitish']
             or published['manifest_sha256'] != hashlib.sha256(manifest_body).hexdigest()
@@ -34,7 +37,9 @@ def authenticate(release, directory, authorization, trusted_key, repository, can
             or asset.get('schema') != 'cybex.james.release-compatibility.v1'
             or manifest.get('schema') != 'cybex.james.release.v1'
             or asset.get('public_key') != published['public_key']
-            or asset.get('release_manifest') != {'url': base + MANIFEST, 'sha256': published['manifest_sha256']}
+            or not isinstance(signed_manifest, dict) or set(signed_manifest) != {'url', 'sha256'}
+            or signed_manifest['sha256'] != published['manifest_sha256']
+            or not repositories.same_url(signed_manifest['url'], base + MANIFEST)
             or manifest.get('version') != previous['tag_name'][1:]
             or asset.get('james_release_version') != manifest['version']
             or manifest['appliance_release_v1'].get('source_revision') != previous['target_commitish']
