@@ -94,12 +94,16 @@ def main():
         f'repos/{args.repository}/actions/artifacts/{args.artifact_id}/zip'])
     receipts = artifact_evidence(archive, metadata, args.artifact_digest, args.run, args.source)
     staged = api('releases/tags/' + args.tag)
-    owner = f'Tiaris-Release-Workflow: https://github.com/{args.repository}/actions/runs/{args.run}'
-    markers = [owner, f'Tiaris-Candidate-Artifact-ID: {args.candidate_id}',
+    lines = (staged.get('body') or '').splitlines()
+    # A release staged before a repository rename names its run under the old name.
+    owners = [f'Tiaris-Release-Workflow: https://github.com/{name}/actions/runs/{args.run}'
+              for name in predecessor.repositories.names(args.repository)]
+    markers = [f'Tiaris-Candidate-Artifact-ID: {args.candidate_id}',
                f'Tiaris-Candidate-Artifact-SHA256: {args.candidate_digest}', POLICY]
     if (staged.get('immutable') is not True or staged['draft']
             or staged['target_commitish'] != args.source
-            or any(marker not in (staged.get('body') or '').splitlines() for marker in markers)):
+            or not any(owner in lines for owner in owners)
+            or any(marker not in lines for marker in markers)):
         raise ValueError('Immutable staged release does not belong to this candidate and release policy')
     base = f'https://github.com/{args.repository}/releases/download/{args.tag}/'
     with tempfile.TemporaryDirectory(prefix='nest-stable-promotion-') as temporary:
@@ -109,7 +113,8 @@ def main():
             names.append('tiaris-nest-build-predecessor.json')
         for name in names:
             matches = [a for a in staged['assets'] if a['name'] == name]
-            if len(matches) != 1 or matches[0]['browser_download_url'] != base + name:
+            if len(matches) != 1 or not predecessor.repositories.same_url(matches[0]['browser_download_url'],
+                                                                          base + name):
                 raise ValueError('Staged signed asset identity changed')
             asset = matches[0]
             if not re.fullmatch(r'sha256:[0-9a-f]{64}', asset.get('digest') or ''):
