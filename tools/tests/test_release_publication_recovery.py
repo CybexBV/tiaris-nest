@@ -132,6 +132,7 @@ class PublicationRecoveryTests(unittest.TestCase):
                 'digest': 'sha256:' + hashlib.sha256(path.read_bytes()).hexdigest()})
         (self.root / 'tools').mkdir()
         (self.root / 'tools/release-publication.py').symlink_to(HELPER)
+        (self.root / 'tools/github_repositories.py').symlink_to(ROOT / 'tools/github_repositories.py')
         binary = self.root / 'bin'
         binary.mkdir()
         for name, body in [('gh', FAKE_GH), ('python3', FAKE_PYTHON.format(python=sys.executable))]:
