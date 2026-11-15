@@ -7,7 +7,7 @@ let
       let relative = pkgs.lib.removePrefix (toString repo + "/") (toString path);
           top = builtins.head (pkgs.lib.splitString "/" relative);
           handoff = "assets/autoexec.ipxe";
-      in builtins.elem top [ "Cargo.toml" "Cargo.lock" "build.rs" "src" "migrations" "protocol" "release" "assets" ]
+      in builtins.elem top [ "Cargo.toml" "Cargo.lock" "build.rs" "src" "migrations" "protocol" "release" "assets" "LICENSE" "NOTICE" ]
         || relative == handoff || (type == "directory" && pkgs.lib.hasPrefix (relative + "/") handoff);
   };
 in pkgs.rustPlatform.buildRustPackage {
@@ -19,6 +19,7 @@ in pkgs.rustPlatform.buildRustPackage {
   doCheck = false; # Locked Rust tests are a separate release gate.
   postInstall = ''
     install -Dm0444 ${source}/assets/pxe-menu.png $out/share/tiaris-nest/assets/pxe-menu.png
+    install -Dm0444 -t $out/share/doc/tiaris-nest ${source}/LICENSE ${source}/NOTICE
   '';
-  meta = { license = pkgs.lib.licenses.gpl3Only; platforms = [ "x86_64-linux" ]; };
+  meta = { license = pkgs.lib.licenses.asl20; platforms = [ "x86_64-linux" ]; };
 }

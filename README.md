@@ -434,3 +434,16 @@ Only NixOS Nest V3 is built and released. See [production qualification](nixos-a
 
 Memory accounting, bounded build/cache I/O, admission settings and the performance
 qualification procedure are documented in [Nest memory](docs/memory-implementation.md).
+
+## Licence
+
+The source code in this repository is licensed under the
+[Apache License 2.0](LICENSE). See [NOTICE](NOTICE).
+
+The Nest image also contains other software, each under its own licence. This
+includes a source archive of the Tiaris workstation software: the build
+([`build-manage-source-archive.sh`](nixos-appliance/build-manage-source-archive.sh))
+packs one exact commit of the separate Tiaris repository into
+`/usr/share/tiaris-nest/manage-source/<revision>.tar`. That archive is not part
+of this repository and is not covered by this licence. The licence does not
+grant use of the Tiaris name or logo.
