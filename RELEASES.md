@@ -186,6 +186,10 @@ names as the same repository: `release/github-repositories.json` lists them, and
 `current` names are still the old ones; they are what new records spell, and can
 move to the new names once the renames are done.
 
+Never create a new repository under an old name. GitHub then stops redirecting
+it, so the old-name URLs in signed releases stop working on installed Nests, and
+these checks would trust the new repository as this one.
+
 ## Release policy fast-v1 (owner, 2026-11-02)
 
 Production Nest releases must take roughly 10–30 minutes from tag to promotion.

@@ -294,5 +294,26 @@ class ReleaseToolTests(unittest.TestCase):
                         docker.image(image['Id'], 'app', 'a' * 40, 'c' * 64)
 
 
+class BuildCheckoutTests(unittest.TestCase):
+    def test_release_build_admits_its_checkout_under_either_name_only(self):
+        build = runpy.run_path(str(ROOT / 'nixos-appliance/build.py'))
+        cases = [(OLD, OLD, True), (OLD, NEW, True), (OLD_TIARIS, OLD_TIARIS, True), (OLD_TIARIS, NEW_TIARIS, True),
+                 (OLD, OLD_TIARIS, False), (OLD_TIARIS, NEW, False), (OLD, 'other/james', False), (OLD, 'CybexHQ/manage', False)]
+        for expected, origin_name, admitted in cases:
+            with self.subTest(expected=expected, origin=origin_name), tempfile.TemporaryDirectory() as temporary:
+                checkout = Path(temporary).resolve()
+                git = lambda *arguments: subprocess.run(['git', '-C', str(checkout), *arguments], check=True,
+                                                        capture_output=True, text=True).stdout.strip()
+                git('init', '-q')
+                git('-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit', '-q', '--allow-empty', '-m', 'x')
+                git('remote', 'add', 'origin', 'https://github.com/' + origin_name + '.git')
+                revision = git('rev-parse', 'HEAD')
+                if admitted:
+                    build['clean_checkout'](checkout, revision, expected)
+                else:
+                    with self.assertRaisesRegex(ValueError, 'origin differs'):
+                        build['clean_checkout'](checkout, revision, expected)
+
+
 if __name__ == '__main__':
     unittest.main()

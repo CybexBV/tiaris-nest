@@ -53,7 +53,10 @@ def _split(url: object) -> tuple[str, str] | None:
 
 
 def same_url(left: object, right: object) -> bool:
-    """Equal text, or the same path under two names of one GitHub repository."""
+    """Equal text, or the same path under two names of one GitHub repository.
+
+    Not a validator: two equal non-GitHub URLs are also "the same". Callers
+    compare against a URL they built or trust."""
     if isinstance(left, str) and left == right:
         return True
     a, b = _split(left), _split(right)
