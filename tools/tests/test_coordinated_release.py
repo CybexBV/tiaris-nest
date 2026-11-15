@@ -272,7 +272,7 @@ class CoordinatedReleaseTests(unittest.TestCase):
                 self.assertIn('version = "' + candidate + '"', (root / 'Cargo.toml').read_text())
                 self.assertIn('version = "' + candidate + '"', (root / 'Cargo.lock').read_text())
                 pin = json.loads((root / 'release/workstation-netboot-source.json').read_text())
-                self.assertEqual(pin, {'repository': 'CybexHQ/development', 'revision': 'a' * 40,
+                self.assertEqual(pin, {'repository': 'CybexHQ/tiaris', 'revision': 'a' * 40,
                                        'runtime_version': '1.0.108'})
 
     def test_development_candidate_rejects_other_prereleases_and_non_advancing_versions(self):
@@ -295,7 +295,10 @@ class CoordinatedReleaseTests(unittest.TestCase):
 
     def test_main_runtime_pin_is_informational_and_never_builds(self):
         pin = json.loads((ROOT / 'release/workstation-netboot-source.json').read_text())
-        self.assertEqual(pin['repository'], 'CybexHQ/development')
+        # main's copy may still spell the Tiaris repository's former name until the
+        # next pin rewrites it; either name is the same repository.
+        names = json.loads((ROOT / 'release/github-repositories.json').read_text())['tiaris']['names']
+        self.assertIn(pin['repository'], names)
         if 'informational' not in pin:
             # A vX.Y.Z tag or release/dev-nest-* branch carries `pin` output instead of
             # main's informational copy; that source must build as checked out.
@@ -338,7 +341,7 @@ class CoordinatedReleaseTests(unittest.TestCase):
             self.assertEqual(marker['appliance_family'], 'nixos')
             self.assertNotIn('ubuntu_snapshot_id', marker)
             pin = root / 'release/workstation-netboot-source.json'
-            self.assertEqual(json.loads(pin.read_text())['repository'], 'CybexHQ/development')
+            self.assertEqual(json.loads(pin.read_text())['repository'], 'CybexHQ/tiaris')
             self.assertIn('version = "0.2.6"', (root / 'Cargo.lock').read_text())
             pin.write_text(pin.read_text().replace('a' * 40, 'b' * 40))
             with self.assertRaises(ValueError):
