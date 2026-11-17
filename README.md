@@ -76,8 +76,8 @@ removed, cut to 80) and never refuses a claim; "Claimed by" shows only after
 the envelope verified, and without a name the setup goes straight on; `410 nest_installer_outdated` shows "too old"
 and retries hourly; network failures retry quietly. Any other slot content
 takes the personalized path unchanged. Tiaris stopped making personalized ISOs
-in November 2026; only release qualification still stamps an envelope into
-the slot. `tiaris-nest-bootstrap
+in November 2026, and release qualification installs the generic ISO and
+claims it too (`nixos-appliance/qualification/run-lifecycle.sh`). `tiaris-nest-bootstrap
 setup-claim-protocol` prints the protocol (`1`), signed into the ISO template
 as `setup_claim_protocol`.
 

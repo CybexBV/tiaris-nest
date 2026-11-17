@@ -124,6 +124,23 @@ container and never public DNS. Firewall rules do not open direct guest egress.
 Cleanup closes every forwarding socket. Changing a hostname allowlist alone cannot
 turn a development run into production qualification.
 
+Every phase installs the way a customer does: the guest boots the release's
+generic ISO itself (read-only, all-zero setup slot, `setup_claim_protocol`
+signed) and shows a claim code. The code is only on the guest's screen and in
+the fixture's own database, so the Owner reads it there as the database
+superuser over `docker exec` (`isolated_manage_database.claim_code`, the
+`claim_setup` RPC) and claims it with the full code through the ordinary
+Console API; the code never leaves the Owner. Manage has no route or setting
+that reveals a code. The claim installs the release the fixture's Manage
+publishes, so the Owner refuses it unless that is the manifest the phase
+qualifies, and the lifecycle checks that the claimed server reports the guest's
+own disk serial and MAC. The claimed setup downloads the closure from the
+fixture's private copy: the fixture sets
+`TIARIS_DEV_NEST_APPLIANCE_CLOSURE_TRANSPORT_URL`, which Manage uses only for
+the exact signed archive and only beside its private manifest transport;
+production sets neither. Qualification needs this fixture: `run-lifecycle.sh`
+refuses to install against any other Manage.
+
 The fixture builds its Tiaris images from the candidate's committed development
 revision. The older NixOS appliance is exercised against that current Tiaris
 harness with its separately pinned compatibility projection. Cold qualification

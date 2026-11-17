@@ -16,8 +16,9 @@ ledger determines release readiness; a source change is not a published update.
   governed expectation rather than trusting artifact URLs or bootstrap output.
 - A server gets its bounded, signed, single-use V2 provisioning envelope when
   an administrator claims its generic ISO with the code on its screen. The
-  bootstrap verifies the claimed envelope as it verifies the fixed
-  personalization slot, which only release qualification still fills.
+  bootstrap verifies the claimed envelope as it verifies a filled
+  personalization slot (only USB sticks written before November 2026 have one;
+  release qualification also installs the generic ISO and claims it).
 - Provisioning activates the reserved device identity before the installed
   service starts; the service does not accept install codes or pairing codes.
 - Agent requests are signed by the activated device key.
