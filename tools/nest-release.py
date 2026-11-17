@@ -787,6 +787,7 @@ def _validate_installer_iso_template_metadata(
         "ubuntu_snapshot_id",
         "nixpkgs_revision",
         appliance_v3.TEMPLATE_ENVELOPE_VALIDITY,
+        appliance_v3.TEMPLATE_SETUP_CLAIM,
     }
     if not required_fields <= set(metadata) or not set(metadata) <= (
         required_fields | optional_fields
@@ -823,6 +824,9 @@ def _validate_installer_iso_template_metadata(
     validity_field = appliance_v3.TEMPLATE_ENVELOPE_VALIDITY
     if metadata.get(validity_field) != descriptor.get(validity_field):
         _fail("installer ISO template build metadata envelope validity does not match")
+    claim_field = appliance_v3.TEMPLATE_SETUP_CLAIM
+    if metadata.get(claim_field) != descriptor.get(claim_field):
+        _fail("installer ISO template build metadata setup claim protocol does not match")
     metadata_delivery = metadata.get("package_delivery")
     if metadata_delivery != descriptor.get("package_delivery"):
         _fail("installer ISO template build metadata package delivery does not match")
@@ -845,6 +849,7 @@ def _inspect_installer_iso_template(
     version: str,
     *, base_os_version: str | None = None,
     envelope_max_validity_hours: int | None = None,
+    setup_claim_protocol: int | None = None,
 ) -> dict[str, Any]:
     (
         path,
@@ -876,6 +881,7 @@ def _inspect_installer_iso_template(
         metadata, _ = _load_bounded_json(metadata_path, "NixOS ISO metadata", maximum_bytes=64 * 1024)
         os_version = metadata.get("base_os_version")
         envelope_validity = metadata.get(appliance_v3.TEMPLATE_ENVELOPE_VALIDITY)
+        setup_claim = metadata.get(appliance_v3.TEMPLATE_SETUP_CLAIM)
     elif nixos:
         # The current shared pin supplies this identity; verification below also
         # binds the signed descriptor and companion system closure release.
@@ -883,6 +889,7 @@ def _inspect_installer_iso_template(
         # Verification has no build metadata: the signed descriptor supplies
         # this bounded, signature-covered value, as it does the OS version.
         envelope_validity = envelope_max_validity_hours
+        setup_claim = setup_claim_protocol
     else:
         os_version = INSTALLER_ISO_TEMPLATE_BASE_OS_VERSION
     descriptor = {
@@ -903,6 +910,8 @@ def _inspect_installer_iso_template(
         descriptor["package_delivery"] = package_delivery
     if nixos and envelope_validity is not None:
         descriptor[appliance_v3.TEMPLATE_ENVELOPE_VALIDITY] = envelope_validity
+    if nixos and setup_claim is not None:
+        descriptor[appliance_v3.TEMPLATE_SETUP_CLAIM] = setup_claim
     if metadata_path is not None:
         _validate_installer_iso_template_metadata(metadata_path, descriptor)
     if nixos:
@@ -2777,6 +2786,10 @@ def _release_manifest_artifact_identities(
         appliance_v3.TEMPLATE_ENVELOPE_VALIDITY in template_value
     ):
         template_fields.add(appliance_v3.TEMPLATE_ENVELOPE_VALIDITY)
+    if nixos and isinstance(template_value, dict) and (
+        appliance_v3.TEMPLATE_SETUP_CLAIM in template_value
+    ):
+        template_fields.add(appliance_v3.TEMPLATE_SETUP_CLAIM)
     template = _require_exact_object_keys(
         template_value, template_fields, "installer ISO template descriptor"
     )
@@ -3807,6 +3820,7 @@ def _verify_nixos_command(arguments, manifest):
     inspected = _inspect_installer_iso_template(
         iso_inputs, version, base_os_version=template["base_os_version"],
         envelope_max_validity_hours=template.get(appliance_v3.TEMPLATE_ENVELOPE_VALIDITY),
+        setup_claim_protocol=template.get(appliance_v3.TEMPLATE_SETUP_CLAIM),
     )
     if inspected != {key: value for key, value in template.items() if key != "signature"}:
         _fail("NixOS ISO bytes differ from their signed descriptor")
@@ -4015,6 +4029,7 @@ def _verify_command(arguments: argparse.Namespace) -> None:
             inputs,
             version,
             envelope_max_validity_hours=descriptor.get(appliance_v3.TEMPLATE_ENVELOPE_VALIDITY),
+            setup_claim_protocol=descriptor.get(appliance_v3.TEMPLATE_SETUP_CLAIM),
         )
         if descriptor != inspected:
             _fail("installer ISO template descriptor does not match the supplied ISO")

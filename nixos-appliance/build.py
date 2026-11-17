@@ -192,7 +192,12 @@ def build(args):
                             nixpkgs_revision=json.loads(pin_revision), provisioning_public_keys=keys,
                             envelope_max_validity_hours=int(run(
                                 package / 'bin/tiaris-nest-bootstrap',
-                                'envelope-max-validity-hours')))
+                                'envelope-max-validity-hours')),
+                            # Signed after the validity: this ISO can stay
+                            # generic (all-zero slot) and be claimed.
+                            setup_claim_protocol=int(run(
+                                package / 'bin/tiaris-nest-bootstrap',
+                                'setup-claim-protocol')))
             name = 'tiaris-nest-appliance-template-' + version + '-x86_64-linux'
             metadata_file = work / 'template.json'
             metadata_file.write_text(json.dumps(metadata, sort_keys=True, separators=(',', ':')) + '\n')
