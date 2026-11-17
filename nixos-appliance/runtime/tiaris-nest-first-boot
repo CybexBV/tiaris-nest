@@ -4,7 +4,8 @@ import hashlib
 import os
 from pathlib import Path
 import subprocess
-from appliance_state import CONTROL, STATUS, STATE, INBOX, UID, GID, current, directory, load, read, run, save, write
+import sys
+from appliance_state import CONTROL, STATUS, STATE, INBOX, UID, GID, current, directory, load, read, run, save, sync_dir, write
 from mount_policy import require_bind_mount, require_mount
 
 
@@ -22,6 +23,37 @@ def prepare_cache_directories(root=Path('/var/cache/tiaris-nest'), uid=UID, gid=
     for name in ('www/cache', 'build', 'build-outputs'):
         directory(root / name, 0o750, uid, gid)
     directory(root / 'tftp', 0o755, root_uid, root_gid)
+
+
+# A Nest installed from a generic setup ISO keeps that ISO's envelope on STATE.
+# The empty marker beside it tells the ISO, booted again later, that this Nest
+# has started: the ISO then offers a new claim before starting it again.
+RETAINED_SETUP_ENVELOPE = '.setup-claim-envelope.bin'
+SETUP_CLAIM_STARTED = '.setup-claim-started'
+
+
+def mark_setup_claim_started(state=STATE, uid=0, gid=0):
+    """Idempotent and best effort: a failure is logged and never fails the boot."""
+    try:
+        if not os.path.lexists(state / RETAINED_SETUP_ENVELOPE):
+            return False
+        try:
+            fd = os.open(state / SETUP_CLAIM_STARTED,
+                         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        except FileExistsError:
+            return True
+        try:
+            os.fchown(fd, uid, gid)
+            os.fchmod(fd, 0o600)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        sync_dir(state)
+        return True
+    except OSError as error:
+        print('could not record that this Nest has started: ' + (error.strerror or type(error).__name__),
+              file=sys.stderr)
+        return False
 
 
 def main():
@@ -56,6 +88,7 @@ def main():
         raise ValueError('invalid iPXE handoff')
     write(Path('/var/cache/tiaris-nest/tftp/autoexec.ipxe'), body, mode=0o644, group=0)
     run('/usr/lib/tiaris-nest/tiaris-nest-bootstrap', 'validate-installed-state')
+    mark_setup_claim_started()
     run('/usr/lib/tiaris-nest/tiaris-nest-network-guard', timeout=120)
     run('/usr/lib/tiaris-nest/tiaris-nest-bootstrap', 'reconcile-network-runtime')
     run('/usr/bin/tiaris-nest', '--config', '/etc/tiaris-nest/config.toml', 'validate-appliance-config')
