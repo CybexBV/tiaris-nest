@@ -921,6 +921,8 @@ struct ProvisioningHttpError {
     code: String,
     /// Management's `error_code`, read only to classify setup-claim refusals.
     error_code: Option<String>,
+    /// Management's `diagnostic_code`, read only to recognise a closed session.
+    diagnostic_code: Option<String>,
 }
 
 /// Status and Management `error_code` of an HTTP refusal; `None` for a
@@ -929,6 +931,26 @@ pub(super) fn http_refusal(error: &anyhow::Error) -> Option<(StatusCode, Option<
     error
         .downcast_ref::<ProvisioningHttpError>()
         .map(|error| (error.status, error.error_code.as_deref()))
+}
+
+/// Management refused a provisioning session because it is closed. Only for
+/// errors of the session's plan poll and claim, whose refusals are these:
+/// a poll answers `409` without a diagnostic code only when the session is
+/// revoked (also when a newer setup superseded it) or expired, or its media
+/// identity was replaced or retired; a claim answers `409`
+/// `provisioning_session_expired` for a revoked or expired session. Other
+/// refusals (`provisioning_recovery_required`, `media_already_claimed`, 401,
+/// 403, 404) and transport failures are not.
+pub(super) fn closed_session_refusal(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<ProvisioningHttpError>()
+        .is_some_and(|error| {
+            error.status == StatusCode::CONFLICT
+                && matches!(
+                    error.diagnostic_code.as_deref(),
+                    None | Some("provisioning_session_expired")
+                )
+        })
 }
 
 pub(super) fn unclaimed_session(error: &anyhow::Error) -> bool {
@@ -949,10 +971,16 @@ fn safe_http_error(status: StatusCode, body: &[u8]) -> anyhow::Error {
         .and_then(Value::as_str)
         .filter(|value| value.len() <= 64)
         .map(str::to_owned);
+    let diagnostic_code = value
+        .get("diagnostic_code")
+        .and_then(Value::as_str)
+        .filter(|value| value.len() <= 64)
+        .map(str::to_owned);
     ProvisioningHttpError {
         status,
         code: code.to_owned(),
         error_code,
+        diagnostic_code,
     }
     .into()
 }
@@ -1207,6 +1235,17 @@ pub(crate) mod tests {
         safe_http_error(
             status,
             json!({"error": "refused", "error_code": code})
+                .to_string()
+                .as_bytes(),
+        )
+    }
+
+    /// The error a refusal shaped like Manage's body produces: an
+    /// `error_code` without meaning here and, when given, a `diagnostic_code`.
+    pub(crate) fn manage_refusal(status: StatusCode, diagnostic: Option<&str>) -> anyhow::Error {
+        safe_http_error(
+            status,
+            json!({"error": "refused", "error_code": "conflict", "diagnostic_code": diagnostic})
                 .to_string()
                 .as_bytes(),
         )

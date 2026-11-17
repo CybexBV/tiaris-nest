@@ -337,3 +337,141 @@ async fn lost_acknowledgements_replay_identical_bytes_before_target_creation() {
         handle.abort();
     }
 }
+
+/// Manage's real refusal bodies: a generic `error_code` and, sometimes, a
+/// `diagnostic_code`.
+fn manage_refusal(diagnostic: Option<&str>) -> (StatusCode, Value) {
+    (
+        StatusCode::CONFLICT,
+        json!({"error":"refused","error_code":"conflict","diagnostic_code":diagnostic,"retryable":false}),
+    )
+}
+
+#[tokio::test]
+async fn a_resumed_generic_setup_asks_whether_management_closed_it() {
+    use super::super::setup_claim::resumed_setup_closed;
+    let (plan, verified, _) = fixture();
+    let session = |state: &str| {
+        (
+            StatusCode::OK,
+            json!({"session_id":verified.envelope.session_id,"state":state,"session_revision":4,"poll_after_seconds":2,"plan":null}),
+        )
+    };
+    // Before identity activation: the media key's plan poll.
+    for (reply, closed) in [
+        (manage_refusal(None), true),
+        (session("revoked"), true),
+        (session("expired"), true),
+        (session("installing"), false),
+        (
+            manage_refusal(Some("provisioning_recovery_required")),
+            false,
+        ),
+        (
+            (StatusCode::FORBIDDEN, json!({"error_code":"forbidden"})),
+            false,
+        ),
+        (
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"error_code":"service_unavailable"}),
+            ),
+            false,
+        ),
+    ] {
+        let state = Arc::new(Mutex::new(Server {
+            replies: VecDeque::from([reply]),
+            ..Default::default()
+        }));
+        let (client, handle) = server(state.clone(), verified.envelope.session_id).await;
+        assert_eq!(resumed_setup_closed(&client, &verified, None).await, closed);
+        assert_eq!(state.lock().unwrap().requests[0].0, Method::GET);
+        handle.abort();
+    }
+    // After it: an unchanged replay of event 3 with the device key.
+    let key = SigningKey::from_bytes(&[81; 32]);
+    let durable = super::super::DurableProvisioningState {
+        schema: "tiaris.nest.provisioning-state.v1".into(),
+        session_id: verified.envelope.session_id,
+        plan: serde_json::from_value(plan).unwrap(),
+        manage_origin: verified.envelope.manage_origin.clone(),
+        management_signing_public_key_b64: protocol::standard_base64(
+            verified.signing_key.to_bytes(),
+        ),
+        device_private_key_b64: protocol::standard_base64(key.to_bytes()),
+        device_public_key_b64: protocol::standard_base64(key.verifying_key().to_bytes()),
+        device_public_key_fingerprint: protocol::sha256_hex(key.verifying_key().to_bytes()),
+        next_event_sequence: 6,
+        identity_active: true,
+        installation_complete: false,
+        updated_at: chrono::Utc::now(),
+    };
+    let state = Arc::new(Mutex::new(Server::default()));
+    let (client, handle) = server(state.clone(), verified.envelope.session_id).await;
+    assert!(!resumed_setup_closed(&client, &verified, Some(&durable)).await);
+    {
+        let state = state.lock().unwrap();
+        assert_eq!(state.requests[0].0, Method::POST);
+        assert_eq!(state.events[&3]["stage"], "state_partition_created");
+    }
+    handle.abort();
+    let state = Arc::new(Mutex::new(Server {
+        replies: VecDeque::from([manage_refusal(None)]),
+        ..Default::default()
+    }));
+    let (client, handle) = server(state, verified.envelope.session_id).await;
+    assert!(resumed_setup_closed(&client, &verified, Some(&durable)).await);
+    handle.abort();
+}
+
+#[tokio::test]
+async fn a_generic_setup_closed_while_waiting_for_a_retry_claims_again() {
+    let (plan, verified, inventory) = fixture();
+    let plan = active_plan(&response(&plan, "installing"), &verified, &inventory).unwrap();
+    let key = protocol::derive_provisioning_key(&verified.envelope.media_secret).unwrap();
+    let wait = |generic: bool| {
+        let (plan, verified, inventory, key) = (&plan, &verified, &inventory, &key);
+        async move {
+            let state = Arc::new(Mutex::new(Server {
+                replies: VecDeque::from([
+                    (
+                        StatusCode::OK,
+                        json!({"accepted":true,"session_state":"failed","session_revision":3}),
+                    ),
+                    manage_refusal(None),
+                ]),
+                ..Default::default()
+            }));
+            let (client, handle) = server(state, verified.envelope.session_id).await;
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(8),
+                super::super::report_failure_and_wait_for_retry(
+                    &client,
+                    key,
+                    verified,
+                    inventory,
+                    plan,
+                    super::super::PreDestructiveFailure::new(
+                        "network_preflight_failed",
+                        "Nest could not verify the approved wired network before disk preparation.",
+                        anyhow::anyhow!("no link"),
+                    ),
+                    generic,
+                ),
+            )
+            .await;
+            handle.abort();
+            result
+        }
+    };
+    let (generic, personalized) = tokio::join!(wait(true), wait(false));
+    // A generic ISO stops waiting and claims again.
+    let error = generic.unwrap().err().unwrap();
+    assert!(
+        error
+            .downcast_ref::<super::super::setup_claim::SetupEnded>()
+            .is_some()
+    );
+    // The personalized path keeps waiting, as before.
+    assert!(personalized.is_err());
+}

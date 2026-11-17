@@ -106,16 +106,6 @@ pub(crate) fn existing_state_for_session(
 /// durable state, which holds the device key.
 pub(super) const RETAINED_SETUP_ENVELOPE: &str = ".setup-claim-envelope.bin";
 
-/// Written by the installed Nest when it boots, beside the retained envelope:
-/// this Nest has started, so a generic ISO booted later offers a new claim
-/// before starting it again. The setup ISO never writes it.
-pub(super) const SETUP_CLAIM_STARTED: &str = ".setup-claim-started";
-
-pub(super) fn setup_claim_started(state_mount: &Path) -> bool {
-    fs::symlink_metadata(state_mount.join(SETUP_CLAIM_STARTED))
-        .is_ok_and(|metadata| metadata.file_type().is_file())
-}
-
 /// Keep a generic ISO's envelope on the new STATE before any durable state
 /// refers to it, so a later run never needs the ISO slot or `/run`.
 pub(super) fn retain_setup_envelope(state_mount: &Path, envelope: &[u8]) -> Result<()> {
@@ -264,6 +254,47 @@ fn release_mounts(
             tracing::warn!(path = %path.display(), error = %format!("{error:#}"), "could not release a setup mount after a failed run");
         }
     }
+}
+
+/// The ESP of an installed NixOS Nest, found from the unique TIARIS_STATE
+/// partition without mounting anything: that layout puts STATE in partition 1
+/// and the ESP, labelled `TIARIS_EFI`, in partition 2 of the same disk. Any
+/// other layout is `None`.
+pub(super) fn installed_nest_esp() -> Result<Option<PathBuf>> {
+    let Some(state) = existing_state_device()? else {
+        return Ok(None);
+    };
+    let name = state
+        .file_name()
+        .ok_or_else(|| anyhow!("STATE device has no name"))?;
+    let sysfs = Path::new("/sys/class/block").join(name);
+    let partition = fs::read_to_string(sysfs.join("partition")).unwrap_or_default();
+    let disk = fs::canonicalize(&sysfs)
+        .context("inspect the STATE disk")?
+        .parent()
+        .and_then(Path::file_name)
+        .map(|disk| Path::new("/dev").join(disk))
+        .ok_or_else(|| anyhow!("STATE disk is unknown"))?;
+    esp_beside_state(partition.trim(), &disk, |esp| {
+        let output = StdCommand::new("blkid")
+            .args(["-s", "PARTLABEL", "-o", "value"])
+            .arg(esp)
+            .output()
+            .context("inspect the installed ESP")?;
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    })
+}
+
+fn esp_beside_state(
+    state_partition: &str,
+    disk: &Path,
+    label: impl FnOnce(&Path) -> Result<String>,
+) -> Result<Option<PathBuf>> {
+    if state_partition != "1" {
+        return Ok(None);
+    }
+    let esp = partition_path(disk, 2)?;
+    Ok((label(&esp)? == "TIARIS_EFI").then_some(esp))
 }
 
 fn existing_state_device() -> Result<Option<PathBuf>> {
@@ -1611,6 +1642,32 @@ mod tests {
     }
 
     #[test]
+    fn an_installed_nest_esp_is_partition_two_beside_state_partition_one() {
+        let efi = |esp: &Path| {
+            assert_eq!(esp, Path::new("/dev/nvme0n1p2"));
+            Ok("TIARIS_EFI".to_string())
+        };
+        assert_eq!(
+            esp_beside_state("1", Path::new("/dev/nvme0n1"), efi).unwrap(),
+            Some(PathBuf::from("/dev/nvme0n1p2"))
+        );
+        // Another layout (a legacy Ubuntu Nest keeps STATE in partition 3) or
+        // another partition 2 is never taken for the installed Nest's ESP.
+        assert_eq!(
+            esp_beside_state("3", Path::new("/dev/sda"), |_| unreachable!()).unwrap(),
+            None
+        );
+        assert_eq!(
+            esp_beside_state("1", Path::new("/dev/sda"), |_| Ok("EFI".to_string())).unwrap(),
+            None
+        );
+        assert_eq!(
+            esp_beside_state("1", Path::new("/dev/sda"), |_| Ok(String::new())).unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn retained_setup_envelope_is_private_and_read_only_when_present() {
         let root = std::env::temp_dir().join(format!(
             "tiaris-nest-retained-envelope-{}",
@@ -1640,14 +1697,6 @@ mod tests {
         assert_eq!(unmounts.get(), 1);
         // A dot file: state backups leave the media secret out.
         assert!(!crate::state_backup::included(RETAINED_SETUP_ENVELOPE));
-        // The installed Nest's start marker: a plain file only, never backed up.
-        assert!(!setup_claim_started(&root));
-        fs::create_dir(root.join(SETUP_CLAIM_STARTED)).unwrap();
-        assert!(!setup_claim_started(&root));
-        fs::remove_dir(root.join(SETUP_CLAIM_STARTED)).unwrap();
-        fs::write(root.join(SETUP_CLAIM_STARTED), b"").unwrap();
-        assert!(setup_claim_started(&root));
-        assert!(!crate::state_backup::included(SETUP_CLAIM_STARTED));
 
         // Oversized or linked copies grant nothing.
         fs::write(&path, vec![1; 8193]).unwrap();

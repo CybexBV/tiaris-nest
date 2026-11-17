@@ -451,6 +451,9 @@ async fn prepare_verified(
     verified: protocol::VerifiedEnvelope,
     retain: Option<&[u8]>,
 ) -> Result<()> {
+    // Only a generic ISO (it retains its envelope) claims again when
+    // Management closed the session; the personalized path is unchanged.
+    let generic = retain.is_some();
     if let Some(probe) =
         storage::existing_state_for_session(&options.state_mount, verified.envelope.session_id)?
     {
@@ -480,7 +483,8 @@ async fn prepare_verified(
         &inventory,
         &hardware_digest,
     )
-    .await?;
+    .await
+    .map_err(|error| setup_claim::ended_if_closed(generic, error))?;
     status.session_claimed(&inventory);
     let mut signed_plan = if recovering {
         let plan = recovery::active_plan(&session, &verified, &inventory)?;
@@ -497,7 +501,8 @@ async fn prepare_verified(
             &mut session,
             None,
         )
-        .await?;
+        .await
+        .map_err(|error| setup_claim::ended_if_closed(generic, error))?;
         status.plan_approved(&plan, &inventory);
         plan
     };
@@ -526,6 +531,7 @@ async fn prepare_verified(
                     &inventory,
                     &signed_plan,
                     failure,
+                    generic,
                 )
                 .await?;
                 status.plan_approved(&signed_plan, &inventory);
@@ -566,17 +572,7 @@ async fn prepare_verified(
     };
     storage::save_durable_state(&prepared.state_mount, &durable)?;
 
-    client
-        .send_event(
-            &provisioning_key,
-            &signed_plan,
-            3,
-            "state_partition_created",
-            "succeeded",
-            Some(20),
-            "Persistent appliance state created",
-        )
-        .await?;
+    report_state_created(&client, &provisioning_key, &signed_plan).await?;
     durable.next_event_sequence = 4;
     storage::save_durable_state(&prepared.state_mount, &durable)?;
     client
@@ -745,6 +741,7 @@ async fn report_failure_and_wait_for_retry(
     inventory: &NestProvisioningInventory,
     failed_plan: &SignedInstallPlan,
     failure: PreDestructiveFailure,
+    generic: bool,
 ) -> Result<SignedInstallPlan> {
     warn!(
         failure_code = failure.code,
@@ -785,6 +782,10 @@ async fn report_failure_and_wait_for_retry(
                     reported = true;
                 }
                 next
+            }
+            // A generic ISO whose setup Management closed claims again.
+            Err(error) if generic && protocol::closed_session_refusal(&error) => {
+                return Err(setup_claim::ended_if_closed(generic, error));
             }
             Err(error) => {
                 warn!(
@@ -905,17 +906,7 @@ async fn resume_prepare(
         verified.envelope.session_id,
     )?;
     if durable.next_event_sequence == 3 {
-        client
-            .send_event(
-                &provisioning_key,
-                &signed_plan,
-                3,
-                "state_partition_created",
-                "succeeded",
-                Some(20),
-                "Persistent appliance state created",
-            )
-            .await?;
+        report_state_created(&client, &provisioning_key, &signed_plan).await?;
         durable.next_event_sequence = 4;
         storage::save_durable_state(&prepared.state_mount, &durable)?;
     }
@@ -967,6 +958,26 @@ async fn resume_prepare(
         &signed_plan,
         package_delivery,
     )
+}
+
+/// Event 3: STATE exists. Its exact bytes are replayed, unchanged, to ask
+/// whether a resumed generic setup is still open (`setup_claim`).
+async fn report_state_created(
+    client: &protocol::ProvisioningClient,
+    key: &SigningKey,
+    plan: &SignedInstallPlan,
+) -> Result<()> {
+    client
+        .send_event(
+            key,
+            plan,
+            3,
+            "state_partition_created",
+            "succeeded",
+            Some(20),
+            "Persistent appliance state created",
+        )
+        .await
 }
 
 /// Send one late-install event using the device key on TIARIS_STATE.

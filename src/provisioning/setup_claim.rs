@@ -8,16 +8,17 @@
 //! From the moment STATE exists the envelope is kept there too, so resuming
 //! an interrupted installation never needs the ISO slot.
 //!
-//! A Nest this path installed keeps that envelope on STATE. Until the
-//! installed Nest has started once, the ISO starts it at once. Afterwards the
-//! ISO is there to reinstall or recover (or was left in): it shows a claim
-//! screen and starts the installed Nest only when nobody claims it in time.
+//! On a server that already holds an installed Nest the ISO is there to
+//! reinstall or recover it (or was left in): it shows the claim screen and
+//! starts the installed Nest only when nobody claims it within 10 minutes.
+//! A setup that Management closed before this run changed the disk always
+//! leads back to the claim screen with a new code.
 //!
 //! Letters, codes, the envelope and its media secret never reach a log: every
 //! message here is fixed text, and errors are logged by their top-level
 //! context only, never with a response body.
 use super::{
-    PrepareOptions,
+    DurableProvisioningState, PrepareOptions,
     packages::MediaLayout,
     protocol::{self, VerifiedEnvelope},
     setup_status::{ClaimState, ClaimView, SetupStatusReporter},
@@ -32,6 +33,7 @@ use reqwest::{Method, StatusCode, redirect::Policy};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
+    future::Future,
     io::ErrorKind,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     os::unix::fs::{DirBuilderExt, MetadataExt},
@@ -76,8 +78,8 @@ fn bytes_are_generic_slot(bytes: &[u8]) -> bool {
 }
 
 /// The setup flow of a generic ISO, in the contract's order: (a) STATE holds
-/// a retained envelope of an installation that may continue, (b) `/run` holds
-/// this boot's registration, (c) register.
+/// a retained envelope of an installation that may continue, or an installed
+/// Nest, (b) `/run` holds this boot's registration, (c) register.
 pub(super) async fn prepare_generic(
     options: &PrepareOptions,
     status: &SetupStatusReporter,
@@ -98,39 +100,35 @@ pub(super) async fn prepare_generic(
         starts_installed_at: None,
     };
     loop {
+        context.starts_installed_at = None;
         let claimed = match retained_from_state(options, trusted_keys)? {
-            Retained::Resume(retained) => {
-                info!("resuming a claimed Nest setup from its retained STATE envelope");
-                return super::prepare_verified(
-                    options,
-                    status,
-                    media_layout,
-                    retained.verified,
-                    Some(&retained.bytes),
-                )
-                .await;
+            Retained::Resume { claimed, durable } => {
+                let envelope = &claimed.verified.envelope;
+                let client = protocol::ProvisioningClient::new(
+                    &envelope.manage_origin,
+                    envelope.session_id,
+                )?;
+                if resumed_setup_closed(&client, &claimed.verified, durable.as_deref()).await {
+                    // "Start over": the existing flow later treats this STATE
+                    // as another session's and asks for a new disk approval.
+                    info!(
+                        "Management closed the retained Nest setup; this server is claimed again"
+                    );
+                    storage::release_state_probe(&options.state_mount)?;
+                    claim(&context).await?
+                } else {
+                    info!("resuming a claimed Nest setup from its retained STATE envelope");
+                    *claimed
+                }
             }
             Retained::Installed(installed) => {
                 storage::release_state_probe(&options.state_mount)?;
-                let deadline = store.starts_installed_at(
-                    Utc::now(),
-                    chrono::Duration::minutes(START_INSTALLED_AFTER_MINUTES),
-                )?;
-                context.starts_installed_at = Some(deadline);
                 info!("this server already runs a Nest; it starts unless claimed in time");
-                let Some(claimed) = claim_until(&context, deadline).await? else {
-                    info!("not claimed in time; starting the installed Nest");
-                    // The completed-install path, as when the Nest never started.
-                    return super::prepare_verified(
-                        options,
-                        status,
-                        media_layout,
-                        installed.verified,
-                        Some(&installed.bytes),
-                    )
-                    .await;
-                };
-                claimed
+                let start = |installed| start_installed(options, status, media_layout, installed);
+                match claim_installed(&mut context, installed, start).await? {
+                    Some(claimed) => claimed,
+                    None => return Ok(()),
+                }
             }
             Retained::None => claim(&context).await?,
         };
@@ -145,15 +143,68 @@ pub(super) async fn prepare_generic(
         let Err(error) = result else {
             return Ok(());
         };
-        if status.disk_may_be_changed() || !registration_gone(&context).await {
+        if status.disk_may_be_changed() {
             return Err(error);
         }
-        // Management deletes a claimed registration when its setup is
-        // revoked, expires or fails before the disk was changed.
+        // Management refused the session as closed, or deleted this boot's
+        // claimed registration (its setup was revoked, expired or failed).
+        if error.downcast_ref::<SetupEnded>().is_none() && !registration_gone(&context).await {
+            return Err(error);
+        }
         warn!(error = %error, "the claimed Nest setup ended before the disk was changed; registering again");
         storage::release_state_mounts(&options.state_mount);
-        store.forget()?;
+        store.forget_claimed()?;
     }
+}
+
+/// Management closed this generic ISO's claimed setup before the disk was
+/// changed: the bootstrap registers again and shows a new code.
+#[derive(Debug, thiserror::Error)]
+#[error("Management closed this claimed Nest setup")]
+pub(super) struct SetupEnded;
+
+/// Mark Management's refusal of a closed session (a plan poll or claim
+/// error, `protocol::closed_session_refusal`) on a generic ISO.
+pub(super) fn ended_if_closed(generic: bool, error: anyhow::Error) -> anyhow::Error {
+    if generic && protocol::closed_session_refusal(&error) {
+        error.context(SetupEnded)
+    } else {
+        error
+    }
+}
+
+/// Before an interrupted installation resumes from its retained envelope:
+/// did Management close that setup? Asked without changing anything: while
+/// the media key is the session's identity, by its plan poll; afterwards by
+/// replaying event 3, which Management answers unchanged, as a duplicate,
+/// while the session is open. Only Management's refusal of a closed session
+/// counts; a network failure or any other answer resumes as before.
+pub(super) async fn resumed_setup_closed(
+    client: &protocol::ProvisioningClient,
+    verified: &VerifiedEnvelope,
+    durable: Option<&DurableProvisioningState>,
+) -> bool {
+    let refused = match durable.filter(|durable| durable.identity_active) {
+        None => {
+            let Ok(key) = protocol::derive_provisioning_key(&verified.envelope.media_secret) else {
+                return false;
+            };
+            match client.poll_plan(&key).await {
+                Ok(session) => return matches!(session.state.as_str(), "revoked" | "expired"),
+                Err(error) => error,
+            }
+        }
+        Some(durable) => {
+            let Ok(key) = durable.signing_key() else {
+                return false;
+            };
+            match super::report_state_created(client, &key, &durable.plan).await {
+                Ok(()) => return false,
+                Err(error) => error,
+            }
+        }
+    };
+    protocol::closed_session_refusal(&refused)
 }
 
 pub(super) struct Claimed {
@@ -161,79 +212,209 @@ pub(super) struct Claimed {
     pub verified: VerifiedEnvelope,
 }
 
-/// What a retained STATE envelope allows on this start.
+/// What STATE allows on this start.
 pub(super) enum Retained {
     /// Nothing to continue: register and wait for a claim.
     None,
-    /// Continue that installation now.
-    Resume(Claimed),
-    /// A completed installation whose Nest has started before: offer a new
-    /// claim first and start it with this envelope when nobody claims it.
-    Installed(Claimed),
+    /// Continue that installation (its durable state, when STATE has one)
+    /// unless Management closed its setup.
+    Resume {
+        claimed: Box<Claimed>,
+        durable: Option<Box<DurableProvisioningState>>,
+    },
+    /// An installed Nest: offer a new claim first and start it when nobody
+    /// claims it in time.
+    Installed(Installed),
+}
+
+/// How an installed Nest is started when nobody claims the server.
+pub(super) enum Installed {
+    /// A completed installation with its retained envelope: the
+    /// completed-install path.
+    Retained(Box<Claimed>),
+    /// No usable retained envelope: select the installed NixOS Nest's UEFI
+    /// entry on this ESP and restart, changing nothing on disk.
+    BootEntry(PathBuf),
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum RetainedChoice {
     Claim,
     Resume,
-    ClaimThenStart,
+    StartRetained,
+    StartBootEntry,
 }
 
-/// A completed installation resumes at once until the installed Nest has
-/// started (its marker); after that it is offered for a new claim first,
-/// whether or not the old setup window is open. An incomplete installation
-/// resumes while its window is open and is claimed again once it ended.
-pub(super) fn retained_choice(current: bool, completed: bool, started: bool) -> RetainedChoice {
-    match (completed, started) {
-        (true, true) => RetainedChoice::ClaimThenStart,
-        (true, false) => RetainedChoice::Resume,
-        (false, _) if current => RetainedChoice::Resume,
-        (false, _) => RetainedChoice::Claim,
+/// What a retained envelope tells: whether its setup window is open and,
+/// when STATE holds that session's durable state, whether it completed.
+pub(super) struct RetainedEnvelope {
+    pub current: bool,
+    pub completed: Option<bool>,
+}
+
+/// A completed installation always offers a claim first and then starts with
+/// its envelope. An incomplete one resumes while its window is open and is
+/// claimed again once it ended. Without a usable envelope (none, or an
+/// expired one with no durable state of its session) a STATE disk whose
+/// installed Nest has a UEFI entry is offered for a claim and then started
+/// by that entry; anything else is claimed.
+pub(super) fn retained_choice(
+    retained: Option<RetainedEnvelope>,
+    boot_entry: impl FnOnce() -> bool,
+) -> RetainedChoice {
+    match retained {
+        Some(RetainedEnvelope {
+            completed: Some(true),
+            ..
+        }) => RetainedChoice::StartRetained,
+        Some(RetainedEnvelope { current: true, .. }) => RetainedChoice::Resume,
+        Some(RetainedEnvelope {
+            completed: Some(false),
+            ..
+        }) => RetainedChoice::Claim,
+        _ if boot_entry() => RetainedChoice::StartBootEntry,
+        _ => RetainedChoice::Claim,
     }
 }
 
-/// A STATE envelope resumes only while it can still act: an installation
-/// that completed (the ISO booted again) or a setup whose window is open.
-/// An expired, unverifiable or orphaned copy is a setup that ended: STATE is
-/// released and the server is claimed again, after which the existing flow
-/// treats that STATE as foreign. With `Installed` the probe stays mounted.
+/// Read STATE through the read-only probe. With `Resume` and a durable state,
+/// or `Installed(Retained)`, the probe stays mounted; otherwise STATE is
+/// released. Only `StartBootEntry` looks at UEFI entries, read-only.
 fn retained_from_state(
     options: &PrepareOptions,
     trusted_keys: &[VerifyingKey],
 ) -> Result<Retained> {
-    let Some(bytes) = storage::retained_setup_envelope(&options.state_mount)? else {
-        return Ok(Retained::None);
-    };
-    let verified = match protocol::verify_envelope_bytes(
-        &bytes,
-        trusted_keys,
-        &options.required_manage_origin,
-    ) {
-        Ok(verified) => verified,
-        Err(error) => {
-            warn!(error = %error, "ignoring a retained setup envelope that does not verify");
-            storage::release_state_probe(&options.state_mount)?;
-            return Ok(Retained::None);
+    let mut found = None;
+    if let Some(bytes) = storage::retained_setup_envelope(&options.state_mount)? {
+        match protocol::verify_envelope_bytes(&bytes, trusted_keys, &options.required_manage_origin)
+        {
+            Ok(verified) => {
+                let probe = storage::existing_state_for_session(
+                    &options.state_mount,
+                    verified.envelope.session_id,
+                )?;
+                found = Some((Claimed { bytes, verified }, probe.map(|probe| probe.state)));
+            }
+            Err(error) => {
+                warn!(error = %error, "ignoring a retained setup envelope that does not verify");
+                storage::release_state_probe(&options.state_mount)?;
+            }
         }
-    };
-    let probe =
-        storage::existing_state_for_session(&options.state_mount, verified.envelope.session_id)?;
-    let current = protocol::require_current_envelope(&verified).is_ok();
-    let completed = probe
-        .as_ref()
-        .is_some_and(|probe| probe.state.installation_complete);
-    // The probe of this session stays mounted: the marker sits beside it.
-    let started = completed && storage::setup_claim_started(&options.state_mount);
-    let retained = Claimed { bytes, verified };
-    match retained_choice(current, completed, started) {
-        RetainedChoice::Resume => Ok(Retained::Resume(retained)),
-        RetainedChoice::ClaimThenStart => Ok(Retained::Installed(retained)),
-        RetainedChoice::Claim => {
-            info!("the retained Nest setup has ended; this server is claimed again");
+    }
+    let envelope = found.as_ref().map(|(claimed, durable)| RetainedEnvelope {
+        current: protocol::require_current_envelope(&claimed.verified).is_ok(),
+        completed: durable
+            .as_ref()
+            .map(|durable| durable.installation_complete),
+    });
+    let mut esp = None;
+    let choice = retained_choice(envelope, || {
+        esp = installed_boot_entry();
+        esp.is_some()
+    });
+    match (choice, found, esp) {
+        (RetainedChoice::Resume, Some((claimed, durable)), _) => Ok(Retained::Resume {
+            claimed: Box::new(claimed),
+            durable: durable.map(Box::new),
+        }),
+        (RetainedChoice::StartRetained, Some((claimed, _)), _) => {
+            Ok(Retained::Installed(Installed::Retained(Box::new(claimed))))
+        }
+        (RetainedChoice::StartBootEntry, _, Some(esp)) => {
+            storage::release_state_probe(&options.state_mount)?;
+            Ok(Retained::Installed(Installed::BootEntry(esp)))
+        }
+        (_, found, _) => {
+            if found.is_some() {
+                info!("the retained Nest setup has ended; this server is claimed again");
+            }
             storage::release_state_probe(&options.state_mount)?;
             Ok(Retained::None)
         }
     }
+}
+
+/// The ESP of an installed NixOS Nest with exactly one UEFI entry for it, or
+/// `None` (logged) when the installed Nest cannot be started that way.
+fn installed_boot_entry() -> Option<PathBuf> {
+    let found = storage::installed_nest_esp().and_then(|esp| match esp {
+        Some(esp) => super::nixos_install::installed_boot_entry(&esp).map(|_| Some(esp)),
+        None => Ok(None),
+    });
+    match found {
+        Ok(esp) => esp,
+        Err(error) => {
+            info!(error = %format!("{error:#}"), "no installed Nest boot entry can be selected");
+            None
+        }
+    }
+}
+
+/// Offer the claim until the 10-minute deadline, then start the installed
+/// Nest with `start`. `None` once it is starting. When it cannot be started
+/// the claim screen stays, without a deadline.
+pub(super) async fn claim_installed<Started>(
+    context: &mut ClaimContext<'_>,
+    installed: Installed,
+    start: impl FnOnce(Installed) -> Started,
+) -> Result<Option<Claimed>>
+where
+    Started: Future<Output = Result<()>>,
+{
+    // A claim this boot holds continues; one that ended restarts the wait.
+    if let Some(claimed) = run_envelope(context)? {
+        info!("continuing this boot's claimed Nest setup");
+        return Ok(Some(claimed));
+    }
+    let deadline = context.store.starts_installed_at(
+        Utc::now(),
+        chrono::Duration::minutes(START_INSTALLED_AFTER_MINUTES),
+    )?;
+    context.starts_installed_at = Some(deadline);
+    if let Some(claimed) = claim_until(context, deadline).await? {
+        return Ok(Some(claimed));
+    }
+    info!("not claimed in time; starting the installed Nest");
+    match start(installed).await {
+        Ok(()) => Ok(None),
+        Err(error) => {
+            warn!(error = %format!("{error:#}"), "the installed Nest could not be started; waiting for a claim");
+            context.starts_installed_at = None;
+            claim(context).await.map(Some)
+        }
+    }
+}
+
+/// Start the installed Nest. Neither way writes to a target disk: the
+/// completed-install path selects its UEFI entry and reports, the boot entry
+/// path only selects that entry.
+async fn start_installed(
+    options: &PrepareOptions,
+    status: &SetupStatusReporter,
+    media_layout: MediaLayout,
+    installed: Installed,
+) -> Result<()> {
+    let result = match installed {
+        Installed::Retained(installed) => {
+            super::prepare_verified(
+                options,
+                status,
+                media_layout,
+                installed.verified,
+                Some(&installed.bytes),
+            )
+            .await
+        }
+        Installed::BootEntry(esp) => {
+            status.rebooting();
+            super::nixos_install::boot_installed_esp(&esp)
+        }
+    };
+    if result.is_err() {
+        storage::release_state_mounts(&options.state_mount);
+        status.installed_start_failed();
+    }
+    result
 }
 
 pub(super) struct ClaimContext<'a> {
@@ -357,7 +538,7 @@ pub(super) async fn claim(context: &ClaimContext<'_>) -> Result<Claimed> {
                         let verified = verify_claimed(context, &envelope, session_id)?;
                         if protocol::require_current_envelope(&verified).is_err() {
                             info!("the claimed Nest setup has already ended; registering again");
-                            store.forget()?;
+                            store.forget_claimed()?;
                             context.show(ClaimState::Connecting, url.as_deref());
                             context.wait(1).await;
                             continue;
@@ -431,7 +612,7 @@ fn run_envelope(context: &ClaimContext<'_>) -> Result<Option<Claimed>> {
         }
         _ => {
             info!("this boot's claimed Nest setup cannot continue; registering again");
-            context.store.forget()?;
+            context.store.forget_claimed()?;
             Ok(None)
         }
     }
@@ -925,7 +1106,8 @@ impl RunStore {
 
     /// When a server that already runs a Nest starts it unclaimed: counted
     /// from this boot's first claim screen and kept across service restarts.
-    /// `forget` keeps it; a damaged or implausibly late time starts again.
+    /// `forget` keeps it, `forget_claimed` starts it again; a damaged or
+    /// implausibly late time starts again too.
     pub(super) fn starts_installed_at(
         &self,
         now: DateTime<Utc>,
@@ -975,7 +1157,17 @@ impl RunStore {
     /// Forget the registration and the envelope; the next attempt registers
     /// with a new key and shows a new code.
     pub(super) fn forget(&self) -> Result<()> {
-        for name in [ENVELOPE_FILE, REGISTRATION_FILE] {
+        self.remove(&[ENVELOPE_FILE, REGISTRATION_FILE])
+    }
+
+    /// A claimed setup ended: forget it, and the claim screen that returns
+    /// gives an installed Nest its full 10 minutes again.
+    pub(super) fn forget_claimed(&self) -> Result<()> {
+        self.remove(&[ENVELOPE_FILE, REGISTRATION_FILE, STARTS_INSTALLED_FILE])
+    }
+
+    fn remove(&self, names: &[&str]) -> Result<()> {
+        for name in names {
             match fs::remove_file(self.dir.join(name)) {
                 Ok(()) => {}
                 Err(error) if error.kind() == ErrorKind::NotFound => {}

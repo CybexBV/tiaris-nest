@@ -832,29 +832,43 @@ async fn a_revoked_setup_is_recognised_by_its_vanished_registration() {
 }
 
 #[test]
-fn a_nest_that_has_started_is_offered_for_a_claim_before_it_starts_again() {
+fn every_installed_nest_is_offered_for_a_claim_before_it_starts() {
     use RetainedChoice::*;
-    // (setup window open, installation completed, installed Nest started)
-    let cases = [
-        // Completed, never started: the firmware came back to the ISO right
-        // after the installation, so the installed Nest starts at once.
-        ((true, true, false), Resume),
-        ((false, true, false), Resume),
-        // Completed and started: a new claim first, whether or not the old
-        // setup window is still open.
-        ((true, true, true), ClaimThenStart),
-        ((false, true, true), ClaimThenStart),
-        // Interrupted installations behave as before.
-        ((true, false, false), Resume),
-        ((false, false, false), Claim),
-    ];
-    for ((current, completed, started), expected) in cases {
-        assert_eq!(
-            retained_choice(current, completed, started),
-            expected,
-            "{current} {completed} {started}"
-        );
-    }
+    let envelope = |current, completed| Some(RetainedEnvelope { current, completed });
+    let no_entry = || false;
+    let entry = || true;
+    let unasked = || -> bool { panic!("a usable envelope never needs a boot entry") };
+    // A completed installation: a claim first, then its envelope starts it,
+    // whether or not the old setup window is open.
+    assert_eq!(
+        retained_choice(envelope(true, Some(true)), unasked),
+        StartRetained
+    );
+    assert_eq!(
+        retained_choice(envelope(false, Some(true)), unasked),
+        StartRetained
+    );
+    // An interrupted installation resumes while its window is open (and
+    // Management has not closed it) and is claimed again once it ended.
+    assert_eq!(
+        retained_choice(envelope(true, Some(false)), unasked),
+        Resume
+    );
+    assert_eq!(retained_choice(envelope(true, None), unasked), Resume);
+    assert_eq!(
+        retained_choice(envelope(false, Some(false)), unasked),
+        Claim
+    );
+    // No usable envelope (every Nest a personalized ISO installed): the
+    // installed Nest's UEFI entry starts it after the claim screen; without
+    // one the claim screen stays.
+    assert_eq!(retained_choice(None, entry), StartBootEntry);
+    assert_eq!(
+        retained_choice(envelope(false, None), entry),
+        StartBootEntry
+    );
+    assert_eq!(retained_choice(None, no_entry), Claim);
+    assert_eq!(retained_choice(envelope(false, None), no_entry), Claim);
 }
 
 #[test]
@@ -887,6 +901,14 @@ fn the_start_deadline_survives_a_service_restart() {
     assert_eq!(
         store.starts_installed_at(later, wait).unwrap(),
         later + wait
+    );
+    // A claimed setup that ended gives the installed Nest its full wait again.
+    store.forget_claimed().unwrap();
+    assert!(!path.exists());
+    let after = later + chrono::Duration::minutes(9);
+    assert_eq!(
+        store.starts_installed_at(after, wait).unwrap(),
+        after + wait
     );
 }
 
@@ -990,28 +1012,248 @@ async fn a_claim_before_the_deadline_wins() {
     assert_eq!(claimed.bytes, bytes);
 }
 
-/// Not claimed in time, the generic ISO starts the installed Nest exactly as
-/// the completed-install path does: `prepare_verified` with the retained
-/// envelope, which resumes that same session's completed STATE.
+fn installed_entry() -> Installed {
+    Installed::BootEntry(PathBuf::from("/dev/nvme0n1p2"))
+}
+
+/// What `claim_installed` asked the injected start to do.
+type Starts = Arc<Mutex<Vec<String>>>;
+
+fn recording_start(
+    starts: &Starts,
+    result: fn() -> Result<()>,
+) -> impl FnOnce(Installed) -> std::future::Ready<Result<()>> {
+    let starts = starts.clone();
+    move |installed| {
+        starts.lock().unwrap().push(match installed {
+            Installed::Retained(claimed) => {
+                format!("retained {}", claimed.verified.envelope.session_id)
+            }
+            Installed::BootEntry(esp) => format!("boot entry {}", esp.display()),
+        });
+        std::future::ready(result())
+    }
+}
+
+#[tokio::test]
+async fn an_unclaimed_server_starts_its_installed_nest_with_the_chosen_way_at_the_deadline() {
+    let id = Uuid::new_v4();
+    let (origin, _, server) = fake_manage(vec![(StatusCode::CREATED, claimable(id))], None).await;
+    let harness = Harness::new(origin);
+    // The deadline this boot already set has passed.
+    harness
+        .store
+        .starts_installed_at(
+            Utc::now() - chrono::Duration::minutes(11),
+            chrono::Duration::minutes(10),
+        )
+        .unwrap();
+    let starts = Starts::default();
+    let mut context = harness.context();
+    let outcome = claim_installed(
+        &mut context,
+        installed_entry(),
+        recording_start(&starts, || Ok(())),
+    )
+    .await
+    .unwrap();
+    assert!(outcome.is_none());
+    assert_eq!(*starts.lock().unwrap(), ["boot entry /dev/nvme0n1p2"]);
+
+    // With a retained envelope, the completed-install path gets that envelope.
+    let session = Uuid::new_v4();
+    let bytes = envelope(session, 30);
+    let retained = Installed::Retained(Box::new(Claimed {
+        verified: protocol::verify_envelope_bytes(&bytes, &harness.keys, ORIGIN).unwrap(),
+        bytes,
+    }));
+    let starts = Starts::default();
+    assert!(
+        claim_installed(&mut context, retained, recording_start(&starts, || Ok(())))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(*starts.lock().unwrap(), [format!("retained {session}")]);
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_server_claimed_before_the_deadline_never_starts_its_installed_nest() {
+    let id = Uuid::new_v4();
+    let session = Uuid::new_v4();
+    let bytes = envelope(session, 30);
+    let (origin, _, server) = fake_manage(
+        vec![
+            (StatusCode::CREATED, claimable(id)),
+            (StatusCode::OK, claimed(id, session, &bytes)),
+        ],
+        None,
+    )
+    .await;
+    let harness = Harness::new(origin);
+    let starts = Starts::default();
+    let mut context = harness.context();
+    let claimed = claim_installed(
+        &mut context,
+        installed_entry(),
+        recording_start(&starts, || Ok(())),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(claimed.verified.envelope.session_id, session);
+    assert!(starts.lock().unwrap().is_empty());
+    // After a restart of the service, past the deadline, this boot's claim
+    // still wins.
+    harness
+        .store
+        .starts_installed_at(
+            Utc::now() - chrono::Duration::minutes(11),
+            chrono::Duration::minutes(10),
+        )
+        .unwrap();
+    let claimed = claim_installed(
+        &mut context,
+        installed_entry(),
+        recording_start(&starts, || Ok(())),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(claimed.bytes, bytes);
+    assert!(starts.lock().unwrap().is_empty());
+    server.abort();
+}
+
+#[tokio::test]
+async fn an_installed_nest_that_cannot_start_leaves_the_claim_screen_without_a_deadline() {
+    let id = Uuid::new_v4();
+    let session = Uuid::new_v4();
+    let bytes = envelope(session, 30);
+    let dir = TempDir::new();
+    let status_path = dir.0.join("setup/status.json");
+    let (origin, fake, server) = fake_manage(
+        vec![
+            (StatusCode::CREATED, claimable(id)),
+            (StatusCode::OK, claimable(id)),
+            (StatusCode::OK, claimed(id, session, &bytes)),
+        ],
+        Some(status_path.clone()),
+    )
+    .await;
+    let mut harness = Harness::new(origin);
+    harness.status = SetupStatusReporter::new(Some(status_path.clone()));
+    harness.status_path = status_path;
+    harness
+        .store
+        .starts_installed_at(
+            Utc::now() - chrono::Duration::minutes(11),
+            chrono::Duration::minutes(10),
+        )
+        .unwrap();
+    let starts = Starts::default();
+    let mut context = harness.context();
+    let claimed = claim_installed(
+        &mut context,
+        installed_entry(),
+        recording_start(&starts, || {
+            Err(anyhow!(
+                "installed UEFI systemd-boot entry is missing or ambiguous"
+            ))
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(claimed.verified.envelope.session_id, session);
+    assert_eq!(starts.lock().unwrap().len(), 1);
+    let seen = fake.lock().unwrap().seen.clone();
+    server.abort();
+    // The claim screen after the failed start announces no start.
+    let last = seen.last().unwrap().screen.as_ref().unwrap();
+    assert_eq!(last["claim"]["state"], "claimable");
+    assert!(last["claim"].get("starts_installed_at").is_none());
+}
+
+#[tokio::test]
+async fn a_claimed_setup_that_ended_gives_the_installed_nest_its_full_wait_again() {
+    let id = Uuid::new_v4();
+    let session = Uuid::new_v4();
+    let (origin, _, server) = fake_manage(vec![], None).await;
+    let harness = Harness::new(origin);
+    // Claimed at minute 9, then the setup ended: this boot's envelope expired
+    // and the old deadline has passed.
+    harness.store.prepare().unwrap();
+    harness
+        .store
+        .save_registration(&Registration {
+            key: SigningKey::from_bytes(&[2; 32]),
+            id: Some(id),
+        })
+        .unwrap();
+    harness.store.save_envelope(&envelope(session, 0)).unwrap();
+    harness
+        .store
+        .starts_installed_at(
+            Utc::now() - chrono::Duration::minutes(11),
+            chrono::Duration::minutes(10),
+        )
+        .unwrap();
+    let starts = Starts::default();
+    let mut context = harness.context();
+    let before = Utc::now();
+    // Manage is unreachable here, so the claim screen simply waits.
+    let waited = tokio::time::timeout(
+        Duration::from_millis(300),
+        claim_installed(
+            &mut context,
+            installed_entry(),
+            recording_start(&starts, || Ok(())),
+        ),
+    )
+    .await;
+    assert!(waited.is_err());
+    assert!(starts.lock().unwrap().is_empty());
+    let deadline = context.starts_installed_at.unwrap();
+    assert!(deadline >= before + chrono::Duration::minutes(10));
+    server.abort();
+}
+
 #[test]
-fn the_timer_path_starts_the_installed_nest_with_the_retained_envelope() {
-    let source = include_str!("../setup_claim.rs");
-    let branch = source
-        .split_once("Retained::Installed(installed) => {")
-        .unwrap()
-        .1
-        .split_once("Retained::None =>")
-        .unwrap()
-        .0;
-    let started = branch
-        .split_once("let Some(claimed) = claim_until(&context, deadline).await? else {")
-        .unwrap()
-        .1
-        .split_once("};")
-        .unwrap()
-        .0;
-    assert!(started.contains("super::prepare_verified("));
-    assert!(started.contains("installed.verified,"));
-    assert!(started.contains("Some(&installed.bytes),"));
-    assert!(branch.find("release_state_probe").unwrap() < branch.find("claim_until").unwrap());
+fn only_managements_refusal_of_a_closed_session_ends_a_generic_setup() {
+    use protocol::tests::manage_refusal;
+    // Manage's plan poll for a revoked, superseded or expired session, and its
+    // claim of one.
+    for closed in [
+        manage_refusal(StatusCode::CONFLICT, None),
+        manage_refusal(StatusCode::CONFLICT, Some("provisioning_session_expired")),
+    ] {
+        assert!(protocol::closed_session_refusal(&closed));
+        let ended = ended_if_closed(true, closed);
+        assert!(ended.downcast_ref::<SetupEnded>().is_some());
+        // The personalized path is unchanged.
+        let closed = manage_refusal(StatusCode::CONFLICT, None);
+        assert!(
+            ended_if_closed(false, closed)
+                .downcast_ref::<SetupEnded>()
+                .is_none()
+        );
+    }
+    for open in [
+        manage_refusal(StatusCode::CONFLICT, Some("provisioning_recovery_required")),
+        manage_refusal(StatusCode::CONFLICT, Some("media_already_claimed")),
+        manage_refusal(StatusCode::UNAUTHORIZED, None),
+        manage_refusal(StatusCode::FORBIDDEN, None),
+        manage_refusal(StatusCode::NOT_FOUND, None),
+        manage_refusal(StatusCode::SERVICE_UNAVAILABLE, None),
+        anyhow!("send provisioning request"),
+    ] {
+        assert!(!protocol::closed_session_refusal(&open));
+        assert!(
+            ended_if_closed(true, open)
+                .downcast_ref::<SetupEnded>()
+                .is_none()
+        );
+    }
 }

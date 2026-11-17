@@ -1047,6 +1047,15 @@ impl SetupStatusReporter {
         });
     }
 
+    /// Starting an installed Nest failed. That start writes no target disk
+    /// (it selects a UEFI entry and reports), so the claim screen that
+    /// follows may claim again after a setup that ends before disk changes.
+    pub(super) fn installed_start_failed(&self) {
+        self.update(Milestone::Started, |state| {
+            state.disk_may_be_changed = false;
+        });
+    }
+
     /// Whether a target write may have happened in this run.
     pub(super) fn disk_may_be_changed(&self) -> bool {
         self.state
