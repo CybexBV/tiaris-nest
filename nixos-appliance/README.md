@@ -220,7 +220,12 @@ sorted unique `provisioning_public_keys`, `package_delivery=system-closure-v1`,
 `manage_origin`, `signature`. Sign domain
 `TIARIS-NEST-INSTALLER-ISO-TEMPLATE-V3`, then each preceding field except
 signature in that exact order, one field per line, with a final LF; join key array
-with commas. Origin is independently supplied and checked against compiled
+with commas. Two optional integers follow `manage_origin` as further signed lines:
+`envelope_max_validity_hours` (24-744, from `tiaris-nest-bootstrap
+envelope-max-validity-hours`) and then, only together with it,
+`setup_claim_protocol` (>= 1, from `tiaris-nest-bootstrap setup-claim-protocol`:
+the ISO may stay generic and be claimed). `build.py` copies both from the
+compiled bootstrap; a template without them verifies as before. Origin is independently supplied and checked against compiled
 bootstrap bytes. Release/ISO use standard Base64 signatures; install/network
 plans retain URL-safe unpadded signatures.
 
@@ -260,6 +265,17 @@ the verified closure offline into the target store and use `nixos-install --syst
 <toplevel> --no-root-passwd` with the explicit target root. Installed systemd-boot
 can touch EFI variables. Materialize STATE config/network/CA/principal/CIDRs,
 record completion durably and reboot without prompting.
+
+A generic ISO (all-zero slot) gets its envelope by being claimed (top-level
+README) and then runs this same flow. Its order on every start: STATE holding a
+retained envelope (`.setup-claim-envelope.bin`, written right after STATE is
+created and before the durable state) resumes while that installation is
+complete or its setup window is open; otherwise this boot's `/run/tiaris-nest-claim`
+registration continues (a claimed envelope kept there is reused); otherwise it
+registers. An expired, unverifiable or orphaned retained copy is a setup that
+ended: STATE is released and the server is claimed again, after which that STATE
+is a different session's and needs a new exact-disk approval. If power fails
+between GPT erasure and the STATE copy, the generic ISO is claimed again too.
 
 Recovery probes existing STATE `ro,noload,nodev,nosuid`. Same-session resume
 requires exact media/session/plan/geometry and freshly verified closure while
@@ -301,7 +317,12 @@ secrets, keys, tokens, serials, raw errors or URLs with paths.
 `tiaris-nest-bootstrap prepare` writes `/run/tiaris-nest-setup/status.json`
 (`--setup-status`; `RuntimeDirectory` 0755, preserved across restarts), schema
 `tiaris.nest-setup-status.v1`. A write failure is logged and never changes
-provisioning. `state` is `checking` (rows `firmware`, `processor`, `memory`,
+provisioning. `state` is `claim` on a generic ISO before its envelope is
+verified: only `schema`, `state`, `updated_at`, `tiaris_host` and `claim`, whose
+`state` is `connecting`, `claimable` (`letters`, `code`), `backoff`
+(`retry_at`), `claimed` (`organization`) or `outdated`, plus `url` once Tiaris
+answered; letters and code appear in no other state and never in a log. A claim
+screen replaces a preserved `stopped` screen. Then `checking` (rows `firmware`, `processor`, `memory`,
 `ethernet`, `disk`, `tiaris` with `done|active|queued|error`; a row below the
 Tiaris admission minimum of UEFI, 4 cores, 16 GiB, a linked wired interface and
 an eligible 160 GiB disk is `error`), `awaiting_approval` (`tiaris_host`,

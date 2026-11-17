@@ -35,8 +35,28 @@ activated device key and ID into the installed state partition. The signed
 install plan also binds the canonical organization UUID and slug; both are
 validated and written to the installed managed configuration so Nest can
 issue organization-scoped workstation boot grants immediately. There is no
-install-code, pairing-code, generic ISO, or Proxmox/LXC path. Use x86-64 UEFI with
-Secure Boot turned off, four cores, at least 16 GiB RAM and a 160 GiB fixed disk.
+Proxmox/LXC path. Use x86-64 UEFI with Secure Boot turned off, four cores, at
+least 16 GiB RAM and a 160 GiB fixed disk.
+
+**Generic ISO with a claim code.** The release's ISO template as built (its
+8192-byte slot `/TIARIS_PROVISIONING.BIN` all zeros) is a generic Nest ISO
+that never expires. Booted, it registers with Tiaris
+(`POST /v1/agent/nest/setup-registrations`, signed by a registration key kept
+only in memory and in `/run/tiaris-nest-claim`, mode 0700/0600), polls over
+IPv4 and, with a global IPv6 route, also IPv6, and shows four letters and a
+full code (`KX-4821-QM`) on its screen. An administrator claims it in the
+Console; Tiaris then hands over the same signed envelope it would have stamped
+into a personalized ISO. The bootstrap verifies those bytes exactly as it
+verifies the slot and runs the existing flow: session claim, disk approval,
+installation. The envelope is kept in `/run` until STATE exists and on STATE
+(`.setup-claim-envelope.bin`, root 0600, left out of state backups) from then
+on, so resuming after a power cut never needs the ISO. A vanished
+registration (`404`), or a setup revoked or expired before the disk changed,
+registers again with a new code; `410 nest_installer_outdated` shows "too old"
+and retries hourly; network failures retry quietly. Any other slot content
+takes the personalized path unchanged. `tiaris-nest-bootstrap
+setup-claim-protocol` prints the protocol (`1`), signed into the ISO template
+as `setup_claim_protocol`.
 
 The bootstrap accepts an envelope signed for up to 31 days
 (`tiaris-nest-bootstrap envelope-max-validity-hours`). The signed ISO template
