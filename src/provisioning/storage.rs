@@ -101,6 +101,77 @@ pub(crate) fn existing_state_for_session(
     })
 }
 
+/// The claimed envelope of a generic ISO, kept on STATE beside the durable
+/// state. A dot file: state backups leave it out. Root-only like the flat
+/// durable state, which holds the device key.
+pub(super) const RETAINED_SETUP_ENVELOPE: &str = ".setup-claim-envelope.bin";
+
+/// Keep a generic ISO's envelope on the new STATE before any durable state
+/// refers to it, so a later run never needs the ISO slot or `/run`.
+pub(super) fn retain_setup_envelope(state_mount: &Path, envelope: &[u8]) -> Result<()> {
+    atomic_write(&state_mount.join(RETAINED_SETUP_ENVELOPE), envelope, 0o600)
+}
+
+/// A generic ISO's retained envelope on an existing STATE, read through the
+/// same read-only, journal-free probe as `existing_state_for_session`. With
+/// an envelope the probe stays mounted for that call; without one STATE is
+/// released again.
+pub(crate) fn retained_setup_envelope(state_mount: &Path) -> Result<Option<Vec<u8>>> {
+    let Some(device_path) = existing_state_device()? else {
+        if DurableProvisioningState::path(state_mount).exists()
+            || state_mount_is_mounted(state_mount)?
+        {
+            bail!("mounted TIARIS_STATE has no unique partition-label device")
+        }
+        return Ok(None);
+    };
+    if state_mount_is_mounted(state_mount)? {
+        validate_state_mount(state_mount, &device_path)?;
+        validate_existing_recovery_probe(state_mount)?;
+    } else if !mount_existing_state_probe(state_mount, &device_path)? {
+        return Ok(None);
+    }
+    read_retained_envelope(state_mount, || unmount_probe(state_mount))
+}
+
+fn read_retained_envelope(
+    state_mount: &Path,
+    unmount: impl FnOnce() -> Result<()>,
+) -> Result<Option<Vec<u8>>> {
+    let path = state_mount.join(RETAINED_SETUP_ENVELOPE);
+    let found = match fs::symlink_metadata(&path) {
+        Ok(_) => Some(super::read_bounded_nofollow(
+            &path,
+            super::protocol::ENVELOPE_SIZE as u64,
+            "retained setup envelope",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => Some(Err(error).context("inspect retained setup envelope")),
+    };
+    match found {
+        Some(Ok(bytes)) => Ok(Some(bytes)),
+        // An unreadable or unsafe copy grants nothing: release STATE and let
+        // the generic ISO be claimed again.
+        Some(Err(error)) => {
+            tracing::warn!(error = %error, "ignoring an unusable retained setup envelope");
+            unmount()?;
+            Ok(None)
+        }
+        None => {
+            unmount()?;
+            Ok(None)
+        }
+    }
+}
+
+/// Unmount a read-only STATE probe that grants nothing after all.
+pub(crate) fn release_state_probe(state_mount: &Path) -> Result<()> {
+    if state_mount_is_mounted(state_mount)? {
+        unmount_probe(state_mount)?;
+    }
+    Ok(())
+}
+
 fn finish_existing_state_probe(
     state_mount: &Path,
     session_id: Uuid,
@@ -1527,6 +1598,49 @@ mod tests {
             installation_complete: false,
             updated_at: now,
         }
+    }
+
+    #[test]
+    fn retained_setup_envelope_is_private_and_read_only_when_present() {
+        let root = std::env::temp_dir().join(format!(
+            "tiaris-nest-retained-envelope-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let unmounts = std::cell::Cell::new(0);
+        let unmount = || {
+            unmounts.set(unmounts.get() + 1);
+            Ok(())
+        };
+        // Missing: STATE is released and nothing resumes.
+        assert!(read_retained_envelope(&root, unmount).unwrap().is_none());
+        assert_eq!(unmounts.get(), 1);
+
+        retain_setup_envelope(&root, &[7; 8192]).unwrap();
+        let path = root.join(RETAINED_SETUP_ENVELOPE);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // Present: the probe stays mounted for the session probe that follows.
+        assert_eq!(
+            read_retained_envelope(&root, unmount).unwrap().unwrap(),
+            vec![7; 8192]
+        );
+        assert_eq!(unmounts.get(), 1);
+        // A dot file: state backups leave the media secret out.
+        assert!(!crate::state_backup::included(RETAINED_SETUP_ENVELOPE));
+
+        // Oversized or linked copies grant nothing.
+        fs::write(&path, vec![1; 8193]).unwrap();
+        assert!(read_retained_envelope(&root, unmount).unwrap().is_none());
+        assert_eq!(unmounts.get(), 2);
+        fs::remove_file(&path).unwrap();
+        fs::write(root.join("elsewhere"), [1; 8192]).unwrap();
+        std::os::unix::fs::symlink(root.join("elsewhere"), &path).unwrap();
+        assert!(read_retained_envelope(&root, unmount).unwrap().is_none());
+        assert_eq!(unmounts.get(), 3);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

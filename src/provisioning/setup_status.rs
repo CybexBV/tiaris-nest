@@ -4,7 +4,8 @@
 //! only: provisioning never reads it back, and a failed write is logged and
 //! ignored. The projection carries fixed public sentences and hardware
 //! summaries; it never carries envelope or media secrets, keys, tokens,
-//! serial numbers, transport URLs or raw error text.
+//! serial numbers, transport URLs or raw error text. A generic ISO's claim
+//! letters and code appear only while the claim state is `claimable`.
 use super::{
     NestProvisioningInventory, SignedInstallPlan,
     inventory::{MIN_DISK_BYTES, NestProvisioningDisk, NestProvisioningEthernetInterface},
@@ -41,6 +42,8 @@ const UNTOUCHED: &str = "Nothing was written to the disk.";
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SetupState {
+    /// A generic ISO waits to be claimed; see [`ClaimStatus`].
+    Claim,
     Checking,
     AwaitingApproval,
     Installing,
@@ -187,6 +190,68 @@ impl InstallStep {
     }
 }
 
+/// The `claim` object of a generic ISO (`state: "claim"`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimState {
+    Connecting,
+    Claimable,
+    Backoff,
+    Claimed,
+    Outdated,
+}
+
+/// Exactly the fields its state allows: `letters` and `code` only while
+/// `claimable`, `retry_at` only in `backoff`, `organization` only when
+/// `claimed`, `url` whenever Management has answered.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ClaimStatus {
+    pub state: ClaimState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub letters: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub organization: Option<String>,
+}
+
+/// What the claim loop knows; `claim_status` drops what the state forbids.
+pub(super) struct ClaimView<'a> {
+    pub state: ClaimState,
+    pub letters: Option<&'a str>,
+    pub code: Option<&'a str>,
+    pub url: Option<&'a str>,
+    pub retry_at: Option<chrono::DateTime<Utc>>,
+    pub organization: Option<&'a str>,
+}
+
+pub(super) fn claim_status(view: &ClaimView<'_>) -> ClaimStatus {
+    let only = |state: ClaimState, value: Option<&str>| {
+        value
+            .filter(|_| view.state == state)
+            .map(|value| bounded(value, MAX_VALUE_CHARS))
+            .filter(|value| !value.is_empty())
+    };
+    ClaimStatus {
+        state: view.state,
+        letters: only(ClaimState::Claimable, view.letters),
+        code: only(ClaimState::Claimable, view.code),
+        url: view
+            .url
+            .map(|url| bounded(url, MAX_VALUE_CHARS))
+            .filter(|url| !url.is_empty()),
+        retry_at: view
+            .retry_at
+            .filter(|_| view.state == ClaimState::Backoff)
+            .map(timestamp),
+        organization: only(ClaimState::Claimed, view.organization),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct SetupStatus {
     pub schema: &'static str,
@@ -218,6 +283,8 @@ pub struct SetupStatus {
     pub progress_percent: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<StopDetail>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claim: Option<ClaimStatus>,
 }
 
 impl SetupStatus {
@@ -239,6 +306,19 @@ impl SetupStatus {
             step: None,
             progress_percent: None,
             stop: None,
+            claim: None,
+        }
+    }
+
+    /// The claim screen: schema, state, time, Tiaris host and the claim.
+    fn claim(tiaris_host: Option<String>, claim: ClaimStatus) -> Self {
+        Self {
+            state: SetupState::Claim,
+            boot_mode: None,
+            checks: Vec::new(),
+            tiaris_host,
+            claim: Some(claim),
+            ..Self::initial(None)
         }
     }
 }
@@ -834,6 +914,8 @@ enum Snapshot {
 
 struct ReporterState {
     status: SetupStatus,
+    /// Boot mode of the initial screen, restored when a claim screen ends.
+    boot_mode: Option<&'static str>,
     /// Preserved screen still shown instead of `status`, if any.
     held: Option<HeldScreen>,
     reached: Milestone,
@@ -873,6 +955,7 @@ impl SetupStatusReporter {
             path,
             state: Mutex::new(ReporterState {
                 status: SetupStatus::initial(boot_mode),
+                boot_mode,
                 held,
                 reached: Milestone::Started,
                 phase: Phase::Media,
@@ -933,8 +1016,35 @@ impl SetupStatusReporter {
         self.update(Milestone::Started, |_| {});
     }
 
+    /// A generic ISO's claim screen. It replaces any preserved screen: a
+    /// claim is shown only while no installation is in progress on disk.
+    pub(super) fn claim(&self, manage_origin: &str, view: &ClaimView<'_>) {
+        let claim = claim_status(view);
+        self.update(Milestone::Started, |state| {
+            state.held = None;
+            state.reached = Milestone::Started;
+            state.phase = Phase::Media;
+            state.hardware_blocked = false;
+            state.current_step = None;
+            state.last_progress = None;
+            state.status = SetupStatus::claim(origin_host(manage_origin), claim);
+        });
+    }
+
+    /// Whether a target write may have happened in this run.
+    pub(super) fn disk_may_be_changed(&self) -> bool {
+        self.state
+            .lock()
+            .map(|state| state.disk_may_be_changed)
+            .unwrap_or(true)
+    }
+
     pub(super) fn media_verified(&self, manage_origin: &str) {
         self.update(Milestone::MediaVerified, |state| {
+            if state.status.state == SetupState::Claim {
+                // Leave the claim screen for the existing setup screens.
+                state.status = SetupStatus::initial(state.boot_mode);
+            }
             state.phase = Phase::Inventory;
             state.status.tiaris_host = origin_host(manage_origin);
         });
