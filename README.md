@@ -50,15 +50,19 @@ into a personalized ISO. The bootstrap verifies those bytes exactly as it
 verifies the slot and runs the existing flow: session claim, disk approval,
 installation. The envelope is kept in `/run` until STATE exists and on STATE
 (`.setup-claim-envelope.bin`, root 0600, left out of state backups) from then
-on, so resuming after a power cut never needs the ISO. The installed Nest
-writes the empty `.setup-claim-started` beside it when it boots (first boot,
-after its state is validated; a dot file, never fatal). Booted again on such a
-server, the ISO starts the installed Nest at once while that marker is absent;
-with the marker it shows the claim screen with `starts_installed_at` and starts
-the installed Nest after 10 minutes unless it is claimed, so the generic ISO can
-still reinstall or recover it (a new claim treats the old STATE as another
-session's). A vanished
-registration (`404`), or a setup revoked or expired before the disk changed,
+on, so resuming after a power cut never needs the ISO. Booted on a server
+that already holds an installed Nest (a completed installation with that
+envelope, or a STATE partition whose NixOS Nest has its systemd-boot UEFI
+entry, as every Nest a personalized ISO installed), the ISO shows the claim
+screen with `starts_installed_at` and starts the installed Nest after 10
+minutes unless it is claimed (with the envelope as the completed-install path
+does, without one by selecting that UEFI entry and restarting, changing
+nothing on disk), so the generic ISO can always reinstall or recover it (a new
+claim treats the old STATE as another session's). A Nest that cannot be
+started that way leaves the claim screen up without a deadline. A vanished
+registration (`404`), or a setup Management closed (revoked, superseded,
+expired or failed) before this run changed the disk, also while waiting for
+approval or for a retry, or when resuming from STATE after "Start over",
 registers again with a new code; `410 nest_installer_outdated` shows "too old"
 and retries hourly; network failures retry quietly. Any other slot content
 takes the personalized path unchanged. `tiaris-nest-bootstrap
