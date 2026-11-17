@@ -1678,3 +1678,45 @@ fn a_retained_envelope_from_the_future_waits_for_the_clock_instead_of_claiming()
     let verified = verify_retained(&ended, &keys, ORIGIN).unwrap().unwrap();
     assert!(protocol::require_current_envelope(&verified).is_err());
 }
+
+#[test]
+fn a_completed_installation_whose_envelope_is_ahead_of_the_clock_still_starts() {
+    let keys = [provisioning_key().verifying_key()];
+    let session = Uuid::new_v4();
+    let ahead = Utc::now() + chrono::Duration::hours(2);
+    let future = protocol::tests::signed_envelope_bytes(
+        &provisioning_key(),
+        session,
+        ORIGIN,
+        ahead,
+        ahead + chrono::Duration::days(30),
+    );
+    let behind = || match verify_retained(&future, &keys, ORIGIN) {
+        Err(error) => error,
+        Ok(_) => panic!("an envelope ahead of the clock verified"),
+    };
+    let asked = |completed| {
+        move |asked: Uuid| {
+            assert_eq!(asked, session);
+            Ok(completed)
+        }
+    };
+    // Completed: no usable envelope, so the claim screen with its deadline
+    // and then the installed Nest's boot entry, as `retained_choice` decides.
+    ahead_of_clock(behind(), asked(true)).unwrap();
+    assert_eq!(
+        retained_choice(None, || true),
+        RetainedChoice::StartBootEntry
+    );
+    // Incomplete or without durable state: the run fails and is retried.
+    let error = ahead_of_clock(behind(), asked(false)).unwrap_err();
+    assert!(error.is::<protocol::EnvelopeIssuedInFuture>());
+    // A STATE that cannot be read fails the run too.
+    let unreadable = ahead_of_clock(behind(), |_| Err(anyhow::anyhow!("STATE")));
+    assert!(unreadable.is_err());
+    // Any other error is never treated as the clock's.
+    let other = ahead_of_clock(anyhow::anyhow!("other"), |_| -> Result<bool> {
+        panic!("STATE is not asked")
+    });
+    assert!(other.is_err());
+}

@@ -270,8 +270,9 @@ pub(super) struct RetainedEnvelope {
 
 /// A completed installation always offers a claim first and then starts with
 /// its envelope. An incomplete one resumes while its window is open and is
-/// claimed again once it ended. Without a usable envelope (none, or an
-/// expired one with no durable state of its session) a STATE disk whose
+/// claimed again once it ended. Without a usable envelope (none, an expired
+/// one with no durable state of its session, or a completed installation's
+/// that this server's clock is behind) a STATE disk whose
 /// installed Nest has a UEFI entry is offered for a claim and then started
 /// by that entry; anything else is claimed.
 pub(super) fn retained_choice(
@@ -312,8 +313,14 @@ fn retained_from_state(
             }
             Ok(None) => storage::release_state_probe(&options.state_mount)?,
             Err(error) => {
+                let behind = ahead_of_clock(error, |session| {
+                    Ok(
+                        storage::existing_state_for_session(&options.state_mount, session)?
+                            .is_some_and(|probe| probe.state.installation_complete),
+                    )
+                });
                 storage::release_state_probe(&options.state_mount)?;
-                return Err(error);
+                behind?;
             }
         }
     }
@@ -355,7 +362,7 @@ fn retained_from_state(
 /// looks issued in the future (this server's clock is behind, for example
 /// before NTP answered) is "not yet", never a reason to claim again: the run
 /// fails like the slot path's and the service retries until the clock is
-/// right. Whether its window is still open is `require_current_envelope`'s.
+/// right, unless `ahead_of_clock` finds its installation completed. Whether its window is still open is `require_current_envelope`'s.
 pub(super) fn verify_retained(
     bytes: &[u8],
     trusted_keys: &[VerifyingKey],
@@ -372,6 +379,30 @@ pub(super) fn verify_retained(
             Ok(None)
         }
     }
+}
+
+/// `verify_retained`'s error for an envelope this server's clock is behind,
+/// once STATE was asked whether that session's installation `completed`. A
+/// completed one is `Ok`: a retained envelope it cannot use yet, so the
+/// installed Nest is offered for a claim and started by its boot entry
+/// (amendment 11), as one without a usable envelope is; its completed-install
+/// path needs the envelope verified. An incomplete one, or any other error,
+/// fails the run until the clock is right.
+pub(super) fn ahead_of_clock(
+    error: anyhow::Error,
+    completed: impl FnOnce(Uuid) -> Result<bool>,
+) -> Result<()> {
+    let Some(session) = error
+        .downcast_ref::<protocol::EnvelopeIssuedInFuture>()
+        .map(|ahead| ahead.session_id)
+    else {
+        return Err(error);
+    };
+    if !completed(session)? {
+        return Err(error);
+    }
+    warn!(error = %format!("{error:#}"), "the installed Nest's retained setup envelope cannot be used before this server's clock is right");
+    Ok(())
 }
 
 /// The ESP of an installed NixOS Nest with exactly one UEFI entry for it, or

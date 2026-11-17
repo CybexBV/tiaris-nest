@@ -293,7 +293,9 @@ is a different session's and needs a new exact-disk approval. A retained copy
 that is valid except that it looks issued more than 5 minutes in the future
 (this server's clock is behind, for example before NTP answered) is not one:
 the run fails as the slot path does and the service retries every 15 seconds
-until the clock is right. If power fails
+until the clock is right, unless its installation completed: then the server
+counts as an installed Nest with no usable envelope (claim screen, then its
+UEFI entry), so a Nest with a wrong clock and no internet still starts. If power fails
 between GPT erasure and the STATE copy, the generic ISO is claimed again too.
 
 A setup Management closed before this run changed the disk leads back to the

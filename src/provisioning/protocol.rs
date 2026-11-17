@@ -275,7 +275,10 @@ pub(crate) fn verify_envelope_bytes(
         .copied()
         .ok_or_else(|| anyhow!("provisioning envelope signature is not trusted"))?;
     if issued_in_future {
-        return Err(EnvelopeIssuedInFuture.into());
+        return Err(EnvelopeIssuedInFuture {
+            session_id: envelope.session_id,
+        }
+        .into());
     }
     Ok(VerifiedEnvelope {
         envelope,
@@ -319,7 +322,10 @@ fn validate_envelope_fields(
         bail!("provisioning envelope has invalid validity")
     }
     if envelope.issued_at > Utc::now() + chrono::Duration::minutes(5) {
-        return Err(EnvelopeIssuedInFuture.into());
+        return Err(EnvelopeIssuedInFuture {
+            session_id: envelope.session_id,
+        }
+        .into());
     }
     Ok(())
 }
@@ -327,10 +333,12 @@ fn validate_envelope_fields(
 /// The envelope's only fault is that it looks issued more than five minutes
 /// from now: this server's clock is behind. From `verify_envelope_bytes`
 /// only for an envelope whose signature, origin and fields are otherwise
-/// valid.
+/// valid, so its session id can be trusted to identify STATE's setup.
 #[derive(Debug, thiserror::Error)]
 #[error("provisioning envelope has invalid validity: it looks issued in the future")]
-pub(crate) struct EnvelopeIssuedInFuture;
+pub(crate) struct EnvelopeIssuedInFuture {
+    pub session_id: Uuid,
+}
 
 pub(super) fn require_current_envelope(verified: &VerifiedEnvelope) -> Result<()> {
     if verified.envelope.expires_at <= Utc::now() {
