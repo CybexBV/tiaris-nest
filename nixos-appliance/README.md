@@ -82,6 +82,11 @@ python3 tools/pack-system-closure.py \
   --metadata-output "$SIGNED_CLOSURE_METADATA"
 ```
 
+`$ISO_OUTPUT` receives the template ISO and its JSON record, and, when the pinned
+Tiaris revision builds a USB installer stick, `tiaris-usb-installer.img` and
+`tiaris-usb-installer.json` copied from the `usbInstaller` store path (unsigned,
+not release assets; Tiaris publishes them as public downloads).
+
 ## Disk and state contract
 
 All sizes use GiB (1024³ bytes), checked arithmetic and 1 MiB alignment. Read disk
