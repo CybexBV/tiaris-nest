@@ -23,17 +23,16 @@ class PackageAnchorContractTests(unittest.TestCase):
             'linux-firmware', 'linux-generic', 'nix-bin', 'python3',
         })
         metadata = json.loads((fixture.directory / 'package-snapshot.json').read_text())
-        self.assertEqual(metadata['required_package_versions']['udpcast'], '20120424-2build2')
         self.assertEqual(descriptor['tiaris_repository_snapshot']['sha256'], metadata['sha256'])
         self.assertEqual(descriptor['tiaris_repository_snapshot']['size_bytes'], metadata['size_bytes'])
         self.assertEqual(descriptor['source_revision'], 'd' * 40)
 
-    def test_signer_still_requires_udpcast_in_authenticated_build_inputs(self):
+    def test_signer_requires_every_wire_anchor_in_authenticated_build_inputs(self):
         fixture = self.fixture
         extra, _ = fixture.network_package_arguments()
         path = fixture.directory / 'package-snapshot.json'
         metadata = json.loads(path.read_text())
-        del metadata['required_package_versions']['udpcast']
+        del metadata['required_package_versions']['python3']
         path.write_text(json.dumps(metadata))
         result = fixture.run_tool(*fixture.manifest_arguments(fixture.directory / 'release.json'), *extra)
         self.assertEqual(result.returncode, 2)

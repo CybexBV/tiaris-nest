@@ -20,7 +20,6 @@ pub mod manage;
 pub(crate) mod manage_source;
 pub mod models;
 pub mod netboot;
-pub mod netboot_multicast;
 pub(crate) mod nix_command;
 pub mod nix_log;
 pub(crate) mod protected_material;
@@ -55,7 +54,6 @@ use sqlx::SqlitePool;
 pub struct AppState {
     pub config: Arc<AppConfig>,
     pub db: SqlitePool,
-    pub netboot_multicast: netboot_multicast::NetbootMulticast,
     runtime: Arc<RwLock<RuntimeSettings>>,
     /// `/cache/*` egress totals of the persisted epoch (`cache_egress`);
     /// shared by every clone of the state so the report task sees what the
@@ -71,7 +69,6 @@ impl AppState {
         Self {
             config: Arc::new(config),
             db,
-            netboot_multicast: netboot_multicast::NetbootMulticast::new(),
             runtime: Arc::new(RwLock::new(runtime)),
             cache_egress,
             build_admission: Arc::new(resources::Admission::default()),

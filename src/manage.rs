@@ -55,7 +55,6 @@ const CAPABILITY_INSTALLER_TARGET_BUILD_V3: &str = "installer_target_build_v3";
 const CAPABILITY_CACHE_REPLICA_V1: &str = "cache_replica_v1";
 const CAPABILITY_WORKSTATION_NETBOOT_TRANSPORT_V1: &str = "workstation_netboot_transport_v1";
 const CAPABILITY_WORKSTATION_NETBOOT_V1: &str = "workstation_netboot_v1";
-const CAPABILITY_WORKSTATION_ROOTFS_MULTICAST_V1: &str = crate::netboot_multicast::CAPABILITY;
 const CAPABILITY_NEST_BOOT_GRANT_V1: &str = "nest_boot_grant_v1";
 const CAPABILITY_WAKE_ON_LAN_V1: &str = crate::wake_on_lan::CAPABILITY;
 const CAPABILITY_APPLIANCE_UPDATE_V1: &str = crate::appliance::APPLIANCE_UPDATE_CAPABILITY;
@@ -205,8 +204,6 @@ struct AgentNestConfigResponse {
     #[serde(default)]
     workstation_netboot: Option<Value>,
     #[serde(default)]
-    workstation_multicast: Option<Value>,
-    #[serde(default)]
     wake_on_lan: Vec<crate::wake_on_lan::ManagedWakeRequest>,
     #[serde(default)]
     software_cache: Option<Value>,
@@ -242,8 +239,6 @@ struct NestReportResponse {
     status: String,
     #[serde(default)]
     workstation_netboot: Option<WorkstationNetbootReportReceipt>,
-    #[serde(default)]
-    workstation_multicast: Option<Value>,
     #[serde(default)]
     wake_on_lan: Vec<String>,
     #[serde(default)]
@@ -527,8 +522,6 @@ struct NestAgentReportRequest {
     disk: Option<crate::disk::DiskStats>,
     host: Option<crate::host::HostStats>,
     workstation_netboot: Option<crate::netboot::WorkstationNetbootReport>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    workstation_multicast: Option<crate::netboot_multicast::WorkstationMulticastReport>,
     wake_on_lan: Vec<crate::wake_on_lan::WakeReport>,
     appliance: Option<crate::appliance::ApplianceReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1205,25 +1198,6 @@ async fn apply_nest_desired(
     {
         retain_sync_failure(first_failure, "software update check settings", error);
     }
-    let multicast_desired = desired.workstation_multicast.clone();
-    if let Err(error) =
-        crate::netboot_multicast::apply_desired_policy(state, multicast_desired).await
-    {
-        warn!(
-            error_code = "workstation_multicast_policy_invalid",
-            "isolated an unusable workstation multicast desired lane"
-        );
-        if let Err(disable_error) =
-            crate::netboot_multicast::apply_desired_policy(state, None).await
-        {
-            debug!(
-                error_code = "workstation_multicast_policy_disable_failed",
-                "could not persist fail-closed multicast policy state"
-            );
-            let _ = disable_error;
-        }
-        let _ = error;
-    }
     if let Some(workstation_netboot) = desired.workstation_netboot {
         match crate::netboot::decode_desired(workstation_netboot.clone()) {
             Ok(workstation_netboot) => {
@@ -1566,16 +1540,6 @@ async fn report_nest_state(
             None
         }
     };
-    let workstation_multicast = match crate::netboot_multicast::report_page(state).await {
-        Ok(report) => report,
-        Err(_) => {
-            warn!(
-                error_code = "workstation_multicast_report_storage_unavailable",
-                "multicast evidence is unavailable; continuing independent Nest report lanes"
-            );
-            None
-        }
-    };
     let wake_on_lan = match crate::wake_on_lan::report(&state.db).await {
         Ok(report) => report,
         Err(error) => {
@@ -1671,7 +1635,7 @@ async fn report_nest_state(
     };
     let body = NestAgentReportRequest {
         protocol_version: report_protocol,
-        capabilities: nest_capabilities(&state.config, peer_supports_scheduling, peer_support),
+        capabilities: nest_capabilities(peer_supports_scheduling, peer_support),
         cache,
         build_jobs,
         cache_artifacts,
@@ -1681,7 +1645,6 @@ async fn report_nest_state(
         disk: crate::disk::stats(&state.config.cache.root_dir).ok(),
         host: crate::host::sample().await,
         workstation_netboot,
-        workstation_multicast,
         wake_on_lan,
         appliance,
         appliance_report_error,
@@ -1717,73 +1680,10 @@ async fn report_nest_state(
         &state.config.manage.api_url,
     )?;
     crate::console_status::notify_changed();
-    accept_workstation_multicast_receipt(state, &response, &body).await;
     if let Err(error) = crate::wake_on_lan::acknowledge(&state.db, &response.wake_on_lan).await {
         debug!(error = %error, "Wake-on-LAN receipts remain queued for acknowledgement");
     }
     Ok(NestReportReceipt)
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WorkstationMulticastReportReceipt {
-    report_instance_id: String,
-    acknowledged_through: i64,
-}
-
-fn workstation_multicast_receipt_matches_sent(
-    receipt: &WorkstationMulticastReportReceipt,
-    sent_instance_id: &str,
-    last_sent_event_id: Option<i64>,
-) -> bool {
-    last_sent_event_id.is_some_and(|event_id| {
-        receipt.report_instance_id == sent_instance_id && receipt.acknowledged_through == event_id
-    })
-}
-
-async fn accept_workstation_multicast_receipt(
-    state: &AppState,
-    response: &NestReportResponse,
-    body: &NestAgentReportRequest,
-) {
-    let (Some(raw), Some(sent)) = (
-        response.workstation_multicast.as_ref(),
-        body.workstation_multicast.as_ref(),
-    ) else {
-        return;
-    };
-    let Ok(receipt) = serde_json::from_value::<WorkstationMulticastReportReceipt>(raw.clone())
-    else {
-        debug!(
-            error_code = "workstation_multicast_receipt_invalid",
-            "multicast report receipt remained retryable"
-        );
-        return;
-    };
-    if !workstation_multicast_receipt_matches_sent(
-        &receipt,
-        &sent.report_instance_id,
-        sent.events.last().map(|event| event.event_id),
-    ) {
-        debug!(
-            error_code = "workstation_multicast_receipt_mismatch",
-            "multicast report receipt remained retryable"
-        );
-        return;
-    }
-    if crate::netboot_multicast::acknowledge_report(
-        state,
-        &receipt.report_instance_id,
-        receipt.acknowledged_through,
-    )
-    .await
-    .is_err()
-    {
-        debug!(
-            error_code = "workstation_multicast_receipt_storage_unavailable",
-            "multicast report receipt remained retryable"
-        );
-    }
 }
 
 fn accept_nest_report_response(
@@ -2113,8 +2013,6 @@ fn fit_nest_report_body(
         body.software_update_findings = None;
     }
 
-    trim_workstation_multicast_reports(&mut body, max_bytes);
-
     match priority {
         NestReportPriority::ActiveBuilds => {
             trim_ordinary_terminal_reports(&mut body, max_bytes);
@@ -2155,17 +2053,6 @@ fn fit_nest_report_body(
         "managed nest report trimmed to fit request budget"
     );
     Ok((body, body_bytes))
-}
-
-fn trim_workstation_multicast_reports(body: &mut NestAgentReportRequest, max_bytes: usize) {
-    while !nest_report_body_fits(body, max_bytes) {
-        let Some(report) = body.workstation_multicast.as_mut() else {
-            break;
-        };
-        if report.events.pop().is_none() {
-            break;
-        }
-    }
 }
 
 fn terminal_build_job_removal_index(jobs: &[NestBuildJobReport]) -> Option<usize> {
@@ -2871,12 +2758,10 @@ struct PeerReportSupport {
 }
 
 fn nest_capabilities(
-    config: &AppConfig,
     peer_supports_scheduling: bool,
     peer_support: PeerReportSupport,
 ) -> Vec<&'static str> {
     let mut capabilities = nest_capabilities_for_mode(
-        config,
         peer_supports_scheduling,
         crate::appliance::nixos::is_nixos(),
     );
@@ -2910,11 +2795,7 @@ fn push_peer_capabilities(capabilities: &mut Vec<&'static str>, uploads: bool, u
     }
 }
 
-fn nest_capabilities_for_mode(
-    config: &AppConfig,
-    peer_supports_scheduling: bool,
-    nixos: bool,
-) -> Vec<&'static str> {
+fn nest_capabilities_for_mode(peer_supports_scheduling: bool, nixos: bool) -> Vec<&'static str> {
     let mut capabilities = vec![
         CAPABILITY_BOOT_V1,
         CAPABILITY_BUILDER_V1,
@@ -2937,9 +2818,6 @@ fn nest_capabilities_for_mode(
         if peer_supports_scheduling {
             capabilities.push(crate::appliance::schedule::CAPABILITY);
         }
-    }
-    if crate::netboot_multicast::binary_available(config) {
-        capabilities.push(CAPABILITY_WORKSTATION_ROOTFS_MULTICAST_V1);
     }
     capabilities
 }
@@ -5062,9 +4940,8 @@ mod tests {
 
     #[test]
     fn nest_capabilities_report_build_and_cache() {
-        let config = AppConfig::default();
         assert_eq!(
-            nest_capabilities_for_mode(&config, true, false),
+            nest_capabilities_for_mode(true, false),
             vec![
                 "boot_v1",
                 "builder_v1",
@@ -5090,15 +4967,14 @@ mod tests {
         let older: AgentNestConfigResponse = serde_json::from_value(json!({})).unwrap();
         let newer: AgentNestConfigResponse =
             serde_json::from_value(json!({"software_cache_upload_supported": true})).unwrap();
-        let config = AppConfig::default();
         let support = |desired: &AgentNestConfigResponse| PeerReportSupport {
             uploads: desired.software_cache_upload_supported,
             usb_installer: desired.usb_installer_supported,
             when_idle: false,
             site_check: false,
         };
-        let legacy = nest_capabilities(&config, false, support(&older));
-        let modern = nest_capabilities(&config, false, support(&newer));
+        let legacy = nest_capabilities(false, support(&older));
+        let modern = nest_capabilities(false, support(&newer));
         assert!(!legacy.contains(&crate::software_cache_upload::CAPABILITY));
         assert!(modern.contains(&crate::software_cache_upload::CAPABILITY));
         assert_eq!(modern.len(), legacy.len() + 1);
@@ -5116,21 +4992,14 @@ mod tests {
         .unwrap();
         assert!(!older.site_check_supported && older.site_check.is_none());
         assert!(newer.site_check_supported && newer.site_check.is_some());
-        let config = AppConfig::default();
         let support = |site_check| PeerReportSupport {
             uploads: false,
             usb_installer: false,
             when_idle: false,
             site_check,
         };
-        assert!(
-            !nest_capabilities(&config, false, support(false))
-                .contains(&crate::site_check::CAPABILITY)
-        );
-        assert!(
-            nest_capabilities(&config, false, support(true))
-                .contains(&crate::site_check::CAPABILITY)
-        );
+        assert!(!nest_capabilities(false, support(false)).contains(&crate::site_check::CAPABILITY));
+        assert!(nest_capabilities(false, support(true)).contains(&crate::site_check::CAPABILITY));
         // A stored contract from before the lane existed keeps it off.
         let stored: PeerContract = serde_json::from_value(json!({
             "supports_scheduling": true, "accepts_uploads": true, "accepts_usb_installer": true,
@@ -5167,9 +5036,7 @@ mod tests {
         }
         // This test process has no stick image, so even a supporting Manage
         // gets no capability.
-        let config = AppConfig::default();
         let reported = nest_capabilities(
-            &config,
             false,
             PeerReportSupport {
                 uploads: false,
@@ -5186,9 +5053,8 @@ mod tests {
         let older: AgentNestConfigResponse = serde_json::from_value(json!({})).unwrap();
         let newer: AgentNestConfigResponse =
             serde_json::from_value(json!({"update_schedule_supported":true})).unwrap();
-        let config = AppConfig::default();
-        let legacy = nest_capabilities_for_mode(&config, older.update_schedule_supported, true);
-        let modern = nest_capabilities_for_mode(&config, newer.update_schedule_supported, true);
+        let legacy = nest_capabilities_for_mode(older.update_schedule_supported, true);
+        let modern = nest_capabilities_for_mode(newer.update_schedule_supported, true);
         assert!(!legacy.contains(&crate::appliance::schedule::CAPABILITY));
         assert!(modern.contains(&crate::appliance::schedule::CAPABILITY));
         assert_eq!(
@@ -6430,34 +6296,6 @@ mod tests {
     }
 
     #[test]
-    fn multicast_receipts_advance_only_the_exact_page_that_was_sent() {
-        let receipt = WorkstationMulticastReportReceipt {
-            report_instance_id: "instance-a".to_string(),
-            acknowledged_through: 7,
-        };
-        assert!(workstation_multicast_receipt_matches_sent(
-            &receipt,
-            "instance-a",
-            Some(7)
-        ));
-        assert!(!workstation_multicast_receipt_matches_sent(
-            &receipt,
-            "instance-b",
-            Some(7)
-        ));
-        assert!(!workstation_multicast_receipt_matches_sent(
-            &receipt,
-            "instance-a",
-            Some(6)
-        ));
-        assert!(!workstation_multicast_receipt_matches_sent(
-            &receipt,
-            "instance-a",
-            None
-        ));
-    }
-
-    #[test]
     fn appliance_update_transport_override_is_optional_wire_data() {
         let update = json!({
             "attempt_id": "d4a17ec8-e854-4bc4-84c7-e490f51640c3",
@@ -6582,7 +6420,6 @@ mod tests {
             disk: None,
             host: None,
             workstation_netboot: None,
-            workstation_multicast: None,
             wake_on_lan: vec![],
             appliance: None,
             appliance_report_error: None,

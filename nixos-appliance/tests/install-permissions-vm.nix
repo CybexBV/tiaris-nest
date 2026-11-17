@@ -1,7 +1,7 @@
 { nixpkgs, common }:
 let
   pkgs = import nixpkgs { system = "x86_64-linux"; };
-  runtime = import ../runtime.nix { inherit pkgs; inherit (common) package udpcast; };
+  runtime = import ../runtime.nix { inherit pkgs; inherit (common) package; };
   firstBootProbe = pkgs.writeText "tiaris-first-boot-permission-probe.py" ''
     from importlib.machinery import SourceFileLoader
     helper = SourceFileLoader('tiaris_first_boot', '${../runtime/tiaris-nest-first-boot}').load_module()

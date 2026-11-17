@@ -1,11 +1,11 @@
-{ pkgs, package, udpcast }:
+{ pkgs, package }:
 let
   source = pkgs.lib.cleanSourceWith {
     src = ./runtime;
     filter = path: type: builtins.baseNameOf path != "__pycache__" && !(pkgs.lib.hasSuffix ".pyc" path);
   };
   commands = [ "coreutils" "curl" "jq" "sqlite" "util-linux" "iproute2" "nftables" "systemd" "findutils" "gawk" "gnugrep" "gnused" "procps" "openssh" "nix" "dnsmasq" ];
-  path = pkgs.lib.makeBinPath ((map (name: pkgs.${name}) commands) ++ [ pkgs.python3 package udpcast ]);
+  path = pkgs.lib.makeBinPath ((map (name: pkgs.${name}) commands) ++ [ pkgs.python3 package ]);
 in pkgs.runCommand "tiaris-nest-runtime" { nativeBuildInputs = [ pkgs.makeWrapper ]; } ''
   mkdir -p $out/lib/tiaris-nest $out/bin
   find ${source} -maxdepth 1 -type f -exec cp {} $out/lib/tiaris-nest/ \;

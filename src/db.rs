@@ -3137,6 +3137,8 @@ mod tests {
             .unwrap();
         // The .19 dev appliances already applied this migration. Removing it
         // from a later release makes sqlx reject their database on startup.
+        // Multicast is retired and nothing reads these tables any more, but a
+        // Nest update refuses any migration, so they stay unused.
         migrate(&pool).await.unwrap();
         let historical_migration_applied: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 20260829000000 AND success = 1",

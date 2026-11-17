@@ -45,7 +45,6 @@ let
     provisioningPublicKeys = publicKeys;
     nixpkgsRevision = pin.revision;
     nixpkgsPath = nixpkgs;
-    udpcast = import (builtins.toPath manageRepo + "/deploy/nixos/udpcast-pinned.nix") { inherit pkgs; };
     # The USB installer stick for computers that cannot network-boot
     # (Tiaris docs/design/usb-installer.md), built from the same pinned
     # Tiaris source. The Nest serves it at /usb-installer/ with its own site
