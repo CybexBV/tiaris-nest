@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use std::{fs, path::Path, time::Duration};
 use uuid::Uuid;
 
-const ENVELOPE_SIZE: usize = 8192;
+pub(crate) const ENVELOPE_SIZE: usize = 8192;
 /// Longest signed validity a setup ISO accepts. The ISO template descriptor
 /// declares this value so Management signs longer windows only for media that
 /// accept them; older bootstraps reject anything above 24 hours.
@@ -216,6 +216,17 @@ pub(crate) fn load_and_verify_envelope(
     required_manage_origin: &str,
 ) -> Result<VerifiedEnvelope> {
     let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    verify_envelope_bytes(&bytes, trusted_keys, required_manage_origin)
+}
+
+/// The one envelope verification, for slot bytes and for the bytes Management
+/// hands a claimed generic ISO alike. Fresh install authority must separately
+/// pass `require_current_envelope`.
+pub(crate) fn verify_envelope_bytes(
+    bytes: &[u8],
+    trusted_keys: &[VerifyingKey],
+    required_manage_origin: &str,
+) -> Result<VerifiedEnvelope> {
     if bytes.len() != ENVELOPE_SIZE {
         bail!("provisioning envelope slot must be exactly 8192 bytes")
     }
@@ -823,49 +834,16 @@ impl ProvisioningClient {
         media_secret: Option<&str>,
         body: Option<&B>,
     ) -> Result<R> {
-        let body = match body {
-            Some(body) => serde_json::to_vec(body).context("serialize provisioning request")?,
-            None => Vec::new(),
-        };
-        let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-        let request_id = random_request_id();
-        let canonical = format!(
-            "{REQUEST_SIGNATURE_DOMAIN}\n{}\n{}\n{}\n{}\n{}",
-            method.as_str().to_uppercase(),
+        signed_json(
+            &self.http,
+            &self.origin,
+            method,
             path,
-            timestamp,
-            request_id,
-            sha256_hex(&body),
-        );
-        let signature = URL_SAFE_NO_PAD.encode(key.sign(canonical.as_bytes()).to_bytes());
-        let mut request = self
-            .http
-            .request(method, format!("{}{}", self.origin, path))
-            .header("x-tiaris-request-id", request_id)
-            .header("x-tiaris-timestamp", timestamp)
-            .header("x-tiaris-signature", signature);
-        if let Some(secret) = media_secret {
-            request = request.header("x-tiaris-nest-provisioning-secret", secret);
-        }
-        if !body.is_empty() {
-            request = request
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(body);
-        }
-        let response = request.send().await.context("send provisioning request")?;
-        let status = response.status();
-        let bytes = response
-            .bytes()
-            .await
-            .context("read provisioning response")?;
-        if bytes.len() > 1024 * 1024 {
-            bail!("provisioning response exceeds its size limit")
-        }
-        if !status.is_success() {
-            return Err(safe_http_error(status, &bytes));
-        }
-        let value = crate::appliance::release_v3::strict_json(&bytes)?;
-        serde_json::from_value(value).context("parse provisioning response")
+            key,
+            media_secret,
+            body,
+        )
+        .await
     }
 
     fn validate_session_response(
@@ -879,11 +857,78 @@ impl ProvisioningClient {
     }
 }
 
+/// Send one request signed like every provisioning request: domain
+/// `TIARIS-NEST-PROVISIONING-V1`, method, path, timestamp, request id and the
+/// body's SHA-256. Errors never carry the response body; an HTTP refusal is a
+/// `ProvisioningHttpError` with its status and bounded code.
+pub(crate) async fn signed_json<B: Serialize + ?Sized, R: DeserializeOwned>(
+    http: &reqwest::Client,
+    origin: &str,
+    method: Method,
+    path: &str,
+    key: &SigningKey,
+    media_secret: Option<&str>,
+    body: Option<&B>,
+) -> Result<R> {
+    let body = match body {
+        Some(body) => serde_json::to_vec(body).context("serialize provisioning request")?,
+        None => Vec::new(),
+    };
+    let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let request_id = random_request_id();
+    let canonical = format!(
+        "{REQUEST_SIGNATURE_DOMAIN}\n{}\n{}\n{}\n{}\n{}",
+        method.as_str().to_uppercase(),
+        path,
+        timestamp,
+        request_id,
+        sha256_hex(&body),
+    );
+    let signature = URL_SAFE_NO_PAD.encode(key.sign(canonical.as_bytes()).to_bytes());
+    let mut request = http
+        .request(method, format!("{origin}{path}"))
+        .header("x-tiaris-request-id", request_id)
+        .header("x-tiaris-timestamp", timestamp)
+        .header("x-tiaris-signature", signature);
+    if let Some(secret) = media_secret {
+        request = request.header("x-tiaris-nest-provisioning-secret", secret);
+    }
+    if !body.is_empty() {
+        request = request
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body);
+    }
+    let response = request.send().await.context("send provisioning request")?;
+    let status = response.status();
+    let bytes = response
+        .bytes()
+        .await
+        .context("read provisioning response")?;
+    if bytes.len() > 1024 * 1024 {
+        bail!("provisioning response exceeds its size limit")
+    }
+    if !status.is_success() {
+        return Err(safe_http_error(status, &bytes));
+    }
+    let value = crate::appliance::release_v3::strict_json(&bytes)?;
+    serde_json::from_value(value).context("parse provisioning response")
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("Management rejected provisioning request ({status}, {code})")]
 struct ProvisioningHttpError {
     status: StatusCode,
     code: String,
+    /// Management's `error_code`, read only to classify setup-claim refusals.
+    error_code: Option<String>,
+}
+
+/// Status and Management `error_code` of an HTTP refusal; `None` for a
+/// transport, size or parse failure.
+pub(super) fn http_refusal(error: &anyhow::Error) -> Option<(StatusCode, Option<&str>)> {
+    error
+        .downcast_ref::<ProvisioningHttpError>()
+        .map(|error| (error.status, error.error_code.as_deref()))
 }
 
 pub(super) fn unclaimed_session(error: &anyhow::Error) -> bool {
@@ -899,9 +944,15 @@ fn safe_http_error(status: StatusCode, body: &[u8]) -> anyhow::Error {
         .and_then(Value::as_str)
         .filter(|value| value.len() <= 64)
         .unwrap_or("request_rejected");
+    let error_code = value
+        .get("error_code")
+        .and_then(Value::as_str)
+        .filter(|value| value.len() <= 64)
+        .map(str::to_owned);
     ProvisioningHttpError {
         status,
         code: code.to_owned(),
+        error_code,
     }
     .into()
 }
@@ -1149,6 +1200,100 @@ pub(crate) mod tests {
             ("signature".to_string(), json!(signature)),
         ]);
         (plan, envelope, inventory, signing_key)
+    }
+
+    /// The error an HTTP refusal with Management's `error_code` produces.
+    pub(crate) fn http_error(status: StatusCode, code: &str) -> anyhow::Error {
+        safe_http_error(
+            status,
+            json!({"error": "refused", "error_code": code})
+                .to_string()
+                .as_bytes(),
+        )
+    }
+
+    /// Exact 8192 slot bytes of an envelope signed by `signing`.
+    pub(crate) fn signed_envelope_bytes(
+        signing: &SigningKey,
+        session_id: Uuid,
+        manage_origin: &str,
+        issued_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+    ) -> Vec<u8> {
+        let mut envelope = ProvisioningEnvelope {
+            schema: ENVELOPE_SCHEMA.to_string(),
+            session_id,
+            media_secret: URL_SAFE_NO_PAD.encode([7; 32]),
+            manage_origin: manage_origin.to_string(),
+            release_version: "0.2.141".to_string(),
+            template_sha256: "c".repeat(64),
+            issued_at,
+            expires_at,
+            signature: String::new(),
+            zero_padding: String::new(),
+        };
+        let mut unsigned = serde_json::to_value(&envelope).unwrap();
+        unsigned.as_object_mut().unwrap().remove("signature");
+        unsigned.as_object_mut().unwrap().remove("zero_padding");
+        let mut payload = ENVELOPE_SIGNATURE_DOMAIN.as_bytes().to_vec();
+        payload.push(b'\n');
+        payload.extend(serde_json::to_vec(&canonical_json(unsigned)).unwrap());
+        envelope.signature = URL_SAFE_NO_PAD.encode(signing.sign(&payload).to_bytes());
+        let mut body = serde_json::to_vec(&envelope).unwrap();
+        body.resize(ENVELOPE_SIZE, 0);
+        body
+    }
+
+    #[test]
+    fn envelope_bytes_verify_exactly_like_the_slot_file() {
+        let signing = SigningKey::from_bytes(&[5; 32]);
+        let origin = "https://manage.example.test";
+        let now = Utc::now();
+        let bytes = signed_envelope_bytes(
+            &signing,
+            Uuid::from_bytes([6; 16]),
+            origin,
+            now,
+            now + chrono::Duration::days(30),
+        );
+        let verified = verify_envelope_bytes(&bytes, &[signing.verifying_key()], origin).unwrap();
+        assert_eq!(verified.envelope.session_id, Uuid::from_bytes([6; 16]));
+        require_current_envelope(&verified).unwrap();
+
+        let directory =
+            std::env::temp_dir().join(format!("nest-envelope-bytes-{}", Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("TIARIS_PROVISIONING.BIN");
+        fs::write(&path, &bytes).unwrap();
+        let from_file =
+            load_and_verify_envelope(&path, &[signing.verifying_key()], origin).unwrap();
+        assert_eq!(
+            serde_json::to_value(&from_file.envelope).unwrap(),
+            serde_json::to_value(&verified.envelope).unwrap()
+        );
+        fs::remove_dir_all(directory).unwrap();
+
+        // The same refusals as the slot: origin, trust, size, padding, tampering.
+        let other = SigningKey::from_bytes(&[8; 32]).verifying_key();
+        assert!(verify_envelope_bytes(&bytes, &[other], origin).is_err());
+        assert!(
+            verify_envelope_bytes(&bytes, &[signing.verifying_key()], "https://other.test")
+                .is_err()
+        );
+        assert!(verify_envelope_bytes(&bytes[..8191], &[signing.verifying_key()], origin).is_err());
+        let mut padded = bytes.clone();
+        padded[8191] = 1;
+        assert!(verify_envelope_bytes(&padded, &[signing.verifying_key()], origin).is_err());
+        let mut tampered = bytes.clone();
+        let at = tampered
+            .windows(7)
+            .position(|window| window == b"0.2.141")
+            .unwrap();
+        tampered[at + 6] = b'2';
+        assert!(verify_envelope_bytes(&tampered, &[signing.verifying_key()], origin).is_err());
+        assert!(
+            verify_envelope_bytes(&[0; ENVELOPE_SIZE], &[signing.verifying_key()], origin).is_err()
+        );
     }
 
     pub(crate) fn resign_plan(
