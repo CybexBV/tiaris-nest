@@ -4,7 +4,7 @@ use std::os::{
     unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     ffi::OsString,
     fs,
     io::{self, Write},
@@ -137,6 +137,9 @@ struct PeerContract {
     /// Manage accepts the site check lane (`site_check`).
     #[serde(default)]
     accepts_site_check: bool,
+    /// Manage accepts `boot_machine_identity_v1` (`boot_machines`).
+    #[serde(default)]
+    accepts_boot_machine_identity: bool,
     runtime_epoch: bool,
     report_protocol: u32,
 }
@@ -169,6 +172,16 @@ struct AgentBootConfigResponse {
     deleted_client_ids: Vec<String>,
     #[serde(default)]
     clients_complete: bool,
+    /// The computers Tiaris knows, by hardware fingerprint (`boot_machines`).
+    #[serde(default)]
+    machines: Vec<ManagedBootMachine>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManagedBootMachine {
+    fingerprint: String,
+    #[serde(default)]
+    installed: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -232,6 +245,10 @@ struct AgentNestConfigResponse {
     /// What the site check also tests and "Check again" (`site_check`).
     #[serde(default)]
     site_check: Option<Value>,
+    /// Manage accepts `boot_machine_identity_v1`; until it says so, Nest does
+    /// not advertise it (an older Manage rejects the report).
+    #[serde(default)]
+    boot_machine_identity_supported: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -460,9 +477,20 @@ struct ManagedBootClient {
     managed_device_id: Option<String>,
     #[serde(default)]
     reinstall_request_id: Option<String>,
+    /// The computer the reinstall is for (`boot_machines`).
+    #[serde(default)]
+    reinstall_machine: Option<ManagedReinstallMachine>,
     notes: String,
     #[serde(default)]
     tags: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManagedReinstallMachine {
+    #[serde(default)]
+    fingerprints: Vec<String>,
+    #[serde(default)]
+    required: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1046,6 +1074,7 @@ async fn sync_nest_foundation(
                 accepts_when_idle: desired.update_when_idle_supported,
                 accepts_state_backup_chunks: desired.state_backup_chunked_upload_supported,
                 accepts_site_check: desired.site_check_supported,
+                accepts_boot_machine_identity: desired.boot_machine_identity_supported,
                 runtime_epoch: desired
                     .compatibility
                     .as_ref()
@@ -1081,6 +1110,7 @@ async fn sync_nest_foundation(
             usb_installer: peer.accepts_usb_installer,
             when_idle: peer.accepts_when_idle,
             site_check: peer.accepts_site_check,
+            boot_machine_identity: peer.accepts_boot_machine_identity,
         },
         peer.report_protocol,
     )
@@ -1114,6 +1144,7 @@ fn peer_contract_after_failed_fetch(
         accepts_when_idle: false,
         accepts_state_backup_chunks: false,
         accepts_site_check: false,
+        accepts_boot_machine_identity: false,
         runtime_epoch: false,
         report_protocol: TIARIS_COMPONENT_PROTOCOL_VERSION,
     })
@@ -2229,6 +2260,9 @@ async fn apply_boot_config(state: &AppState, config: &AgentBootConfigResponse) -
         config.clients_complete,
     )
     .await?;
+    // Before the commit: a reinstall binding is never served without the
+    // computer Manage says it is for.
+    save_boot_machines(&state.config.paths.data_dir, &mut tx, config).await?;
     tx.commit().await?;
     let mut discovery = config.pxe_discovery.clone();
     if let Some(desired) = &mut discovery {
@@ -2242,6 +2276,53 @@ async fn apply_boot_config(state: &AppState, config: &AgentBootConfigResponse) -
     });
     Ok(())
 }
+/// What Manage says about the computers behind network boots, kept for the
+/// boot routes (`boot_machines`).
+async fn save_boot_machines(
+    data_dir: &Path,
+    tx: &mut Transaction<'_, Sqlite>,
+    config: &AgentBootConfigResponse,
+) -> Result<()> {
+    let live: BTreeSet<String> = sqlx::query_scalar::<_, String>(
+        "SELECT reinstall_request_id FROM devices WHERE reinstall_request_id IS NOT NULL",
+    )
+    .fetch_all(&mut **tx)
+    .await?
+    .into_iter()
+    .collect();
+    let request_ids: Vec<Option<String>> = config
+        .clients
+        .iter()
+        .map(|client| clean_optional(client.reinstall_request_id.clone()))
+        .collect();
+    let named: Vec<_> = config
+        .clients
+        .iter()
+        .zip(&request_ids)
+        .filter_map(|(client, request_id)| {
+            let machine = client.reinstall_machine.as_ref().map(|machine| {
+                crate::boot_machines::NamedReinstall {
+                    fingerprints: &machine.fingerprints,
+                    required: machine.required,
+                }
+            });
+            request_id
+                .as_deref()
+                .map(|request_id| (request_id, machine))
+        })
+        .collect();
+    let record = crate::boot_machines::merge(
+        &crate::boot_machines::load(data_dir),
+        &named,
+        &live,
+        config
+            .machines
+            .iter()
+            .map(|machine| (machine.fingerprint.clone(), machine.installed)),
+    );
+    crate::boot_machines::save(data_dir, &record).await
+}
+
 async fn sync_profiles(
     tx: &mut Transaction<'_, Sqlite>,
     profiles: &[ManagedBootProfile],
@@ -2755,6 +2836,7 @@ struct PeerReportSupport {
     usb_installer: bool,
     when_idle: bool,
     site_check: bool,
+    boot_machine_identity: bool,
 }
 
 fn nest_capabilities(
@@ -2775,6 +2857,9 @@ fn nest_capabilities(
     push_peer_capabilities(&mut capabilities, peer_support.uploads, usb_image);
     if peer_support.site_check {
         capabilities.push(crate::site_check::CAPABILITY);
+    }
+    if peer_support.boot_machine_identity {
+        capabilities.push(crate::boot_machines::CAPABILITY);
     }
     capabilities
 }
@@ -3665,6 +3750,7 @@ mod tests {
             accepts_when_idle: true,
             accepts_state_backup_chunks: true,
             accepts_site_check: true,
+            accepts_boot_machine_identity: true,
             runtime_epoch: true,
             report_protocol: TIARIS_DETECTED_COMMITS_PROTOCOL_VERSION,
         };
@@ -4481,6 +4567,73 @@ mod tests {
         assert!(report.get("one_time_profile_id").is_none());
     }
 
+    #[tokio::test]
+    async fn managed_sync_keeps_the_computer_each_reinstall_is_for() {
+        let pool = managed_test_pool().await;
+        let data_dir =
+            std::env::temp_dir().join(format!("tiaris-nest-boot-machines-sync-{}", Uuid::new_v4()));
+        let profile_id = "00000000-0000-4000-8000-000000000102";
+        let fingerprint = "a".repeat(64);
+        let mut armed = sample_client(
+            "00000000-0000-4000-8000-000000000301",
+            "02:00:00:00:30:01",
+            profile_id,
+        );
+        armed.one_time_profile_id = Some(profile_id.to_string());
+        armed.managed_device_id = Some("dev_laptop_a".to_string());
+        armed.reinstall_request_id = Some("00000000-0000-4000-8000-000000000401".to_string());
+        armed.reinstall_machine = Some(ManagedReinstallMachine {
+            fingerprints: vec![fingerprint.clone(), "not hex".to_string()],
+            required: true,
+        });
+        let mut config = sample_boot_config();
+        config.profiles = vec![sample_profile(profile_id)];
+        config.clients = vec![armed];
+        config.machines = vec![ManagedBootMachine {
+            fingerprint: "c".repeat(64),
+            installed: true,
+        }];
+
+        let mut tx = pool.begin().await.unwrap();
+        sync_profiles(&mut tx, &config.profiles, true)
+            .await
+            .unwrap();
+        let profile_map = managed_profile_map(&mut tx).await.unwrap();
+        sync_clients(&mut tx, &config.clients, &profile_map, true)
+            .await
+            .unwrap();
+        save_boot_machines(&data_dir, &mut tx, &config)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let record = crate::boot_machines::load(&data_dir);
+        let named = &record.reinstalls["00000000-0000-4000-8000-000000000401"];
+        assert_eq!(named.fingerprints, vec![fingerprint]);
+        assert!(named.required);
+        assert_eq!(record.machines.get(&"c".repeat(64)), Some(&true));
+
+        // Once Manage withdraws the binding, the computer is forgotten too.
+        config.clients[0].reinstall_request_id = None;
+        config.clients[0].managed_device_id = None;
+        config.clients[0].reinstall_machine = None;
+        config.machines.clear();
+        let mut tx = pool.begin().await.unwrap();
+        let profile_map = managed_profile_map(&mut tx).await.unwrap();
+        sync_clients(&mut tx, &config.clients, &profile_map, true)
+            .await
+            .unwrap();
+        save_boot_machines(&data_dir, &mut tx, &config)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            crate::boot_machines::load(&data_dir),
+            crate::boot_machines::Record::default()
+        );
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
     async fn synced_serials(pool: &SqlitePool) -> Vec<(String, Option<String>)> {
         sqlx::query_as("SELECT mac, serial_number FROM devices ORDER BY mac")
             .fetch_all(pool)
@@ -4972,6 +5125,7 @@ mod tests {
             usb_installer: desired.usb_installer_supported,
             when_idle: false,
             site_check: false,
+            boot_machine_identity: false,
         };
         let legacy = nest_capabilities(false, support(&older));
         let modern = nest_capabilities(false, support(&newer));
@@ -4997,6 +5151,7 @@ mod tests {
             usb_installer: false,
             when_idle: false,
             site_check,
+            boot_machine_identity: false,
         };
         assert!(!nest_capabilities(false, support(false)).contains(&crate::site_check::CAPABILITY));
         assert!(nest_capabilities(false, support(true)).contains(&crate::site_check::CAPABILITY));
@@ -5007,6 +5162,35 @@ mod tests {
         }))
         .unwrap();
         assert!(!stored.accepts_site_check);
+    }
+
+    #[test]
+    fn boot_machine_identity_capability_requires_manage_support() {
+        // An older Manage rejects a report that lists an unknown capability.
+        let older: AgentNestConfigResponse = serde_json::from_value(json!({})).unwrap();
+        let newer: AgentNestConfigResponse =
+            serde_json::from_value(json!({"boot_machine_identity_supported": true})).unwrap();
+        assert!(!older.boot_machine_identity_supported);
+        assert!(newer.boot_machine_identity_supported);
+        let support = |boot_machine_identity| PeerReportSupport {
+            uploads: false,
+            usb_installer: false,
+            when_idle: false,
+            site_check: false,
+            boot_machine_identity,
+        };
+        assert!(
+            !nest_capabilities(false, support(false)).contains(&crate::boot_machines::CAPABILITY)
+        );
+        assert!(
+            nest_capabilities(false, support(true)).contains(&crate::boot_machines::CAPABILITY)
+        );
+        let stored: PeerContract = serde_json::from_value(json!({
+            "supports_scheduling": true, "accepts_uploads": true, "accepts_usb_installer": true,
+            "runtime_epoch": true, "report_protocol": 1
+        }))
+        .unwrap();
+        assert!(!stored.accepts_boot_machine_identity);
     }
 
     #[test]
@@ -5043,6 +5227,7 @@ mod tests {
                 usb_installer: true,
                 when_idle: false,
                 site_check: false,
+                boot_machine_identity: false,
             },
         );
         assert!(!reported.contains(&crate::usb_installer::CAPABILITY));
@@ -5855,6 +6040,7 @@ mod tests {
             clients: vec![sample_client("client-1", "02:00:00:00:00:01", "profile-1")],
             deleted_client_ids: vec![],
             clients_complete: true,
+            machines: vec![],
         }
     }
 
@@ -6507,6 +6693,7 @@ mod tests {
             one_time_profile_id: None,
             managed_device_id: None,
             reinstall_request_id: None,
+            reinstall_machine: None,
             notes: String::new(),
             tags: vec!["rack-a".to_string()],
         }
