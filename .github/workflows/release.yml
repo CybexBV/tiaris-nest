@@ -268,7 +268,8 @@ jobs:
           set -euo pipefail
           test "$(git -C manage-source rev-parse HEAD)" = "${{ steps.workstation-source.outputs.revision }}"
           test -z "$(git -C manage-source status --porcelain)"
-          test "$(tr -d '\n' < manage-source/deploy/nixos/workstation-netboot-version)" = "${{ steps.workstation-source.outputs.runtime_version }}"
+          # The runtime version is the pin's: release/workstation-netboot.nix passes it to the
+          # Tiaris build (an older Tiaris source must carry it in its own version file).
           python3 tools/nest-release.py verify-component-compatibility \
             --nest-compatibility protocol/compatibility.json \
             --manage-compatibility manage-source/protocol/compatibility.json
