@@ -50,7 +50,14 @@ into a personalized ISO. The bootstrap verifies those bytes exactly as it
 verifies the slot and runs the existing flow: session claim, disk approval,
 installation. The envelope is kept in `/run` until STATE exists and on STATE
 (`.setup-claim-envelope.bin`, root 0600, left out of state backups) from then
-on, so resuming after a power cut never needs the ISO. A vanished
+on, so resuming after a power cut never needs the ISO. The installed Nest
+writes the empty `.setup-claim-started` beside it when it boots (first boot,
+after its state is validated; a dot file, never fatal). Booted again on such a
+server, the ISO starts the installed Nest at once while that marker is absent;
+with the marker it shows the claim screen with `starts_installed_at` and starts
+the installed Nest after 10 minutes unless it is claimed, so the generic ISO can
+still reinstall or recover it (a new claim treats the old STATE as another
+session's). A vanished
 registration (`404`), or a setup revoked or expired before the disk changed,
 registers again with a new code; `410 nest_installer_outdated` shows "too old"
 and retries hourly; network failures retry quietly. Any other slot content

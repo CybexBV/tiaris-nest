@@ -269,8 +269,17 @@ record completion durably and reboot without prompting.
 A generic ISO (all-zero slot) gets its envelope by being claimed (top-level
 README) and then runs this same flow. Its order on every start: STATE holding a
 retained envelope (`.setup-claim-envelope.bin`, written right after STATE is
-created and before the durable state) resumes while that installation is
-complete or its setup window is open; otherwise this boot's `/run/tiaris-nest-claim`
+created and before the durable state) resumes while its setup window is open
+or the installation is complete and the installed Nest never started. Once
+it has started (first boot writes the empty `.setup-claim-started` beside the
+envelope after `validate-installed-state`; idempotent, root 0600, left out of
+state backups, never fails the boot), the ISO registers and shows the claim
+screen first, whether or not the old window is open: claimed, the new session
+runs the existing flow and the old STATE is a different session's; not claimed
+within 10 minutes (from this boot's first claim screen, kept in
+`/run/tiaris-nest-claim/starts-installed-at` across service restarts, network
+or not), it starts the installed Nest with the retained envelope as the
+completed-install path does. Otherwise this boot's `/run/tiaris-nest-claim`
 registration continues (a claimed envelope kept there is reused); otherwise it
 registers. An expired, unverifiable or orphaned retained copy is a setup that
 ended: STATE is released and the server is claimed again, after which that STATE
@@ -321,7 +330,9 @@ provisioning. `state` is `claim` on a generic ISO before its envelope is
 verified: only `schema`, `state`, `updated_at`, `tiaris_host` and `claim`, whose
 `state` is `connecting`, `claimable` (`letters`, `code`), `backoff`
 (`retry_at`), `claimed` (`organization`) or `outdated`, plus `url` once Tiaris
-answered; letters and code appear in no other state and never in a log. A claim
+answered, and `starts_installed_at` (RFC 3339, only in `connecting`, `claimable`
+and `backoff`) when this server already runs a Nest that the ISO starts at that
+time unless it is claimed; letters and code appear in no other state and never in a log. A claim
 screen replaces a preserved `stopped` screen. Then `checking` (rows `firmware`, `processor`, `memory`,
 `ethernet`, `disk`, `tiaris` with `done|active|queued|error`; a row below the
 Tiaris admission minimum of UEFI, 4 cores, 16 GiB, a linked wired interface and
