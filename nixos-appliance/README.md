@@ -56,8 +56,6 @@ Store directories are 0555 and optimized files may be hardlinked, so a directory
 symlink or direct bind fails existing verification. Retain bounded secure reopening;
 do not weaken it to follow untrusted symlinks. The signed
 workstation descriptor, embedded archive and release Tiaris revision must agree.
-Preserve corresponding source/licence/SPDX material for the pinned udpcast
-implementation and the published GPL source offer.
 
 ### Local build commands
 
@@ -399,15 +397,15 @@ a status older than 90 seconds as stale attention.
 ## Services and network changes
 
 The NixOS module provides unprivileged Nest, sandboxed Nix daemon, nginx IPv4
-listener, immutable TFTP root, dnsmasq ProxyDHCP supervisor, pinned udpcast,
+listener, immutable TFTP root, dnsmasq ProxyDHCP supervisor,
 certificate-only OpenSSH, atomic management-CIDR SSH nftables policy, watchdog,
 time synchronization, bounded journald and coordinated daily GC. Nest has private
 HOME/XDG/TMP leaves and no Linux capabilities or Nix trusted-user status.
 
 PXE keeps authenticated complete/fresh inventory, same-link peer MAC checks,
 responder election, per-device placement and external-PXE mode. It never assigns
-DHCP addresses. Workstation netboot/runtime import, signed binary cache, Blueprint
-builds and multicast are the existing product paths.
+DHCP addresses. Workstation netboot/runtime import, signed binary cache and
+Blueprint builds are the existing product paths.
 
 Networkd renders STATE's approved deterministic network JSON before startup.
 A protected `network-committed.json` stores the exact signed change and
@@ -523,7 +521,7 @@ qualification fixtures. Never use a host reset as evidence of automatic rollback
 
 Required real scenarios: personalized-media install/identity/Ready; untouched disk
 on preflight failure and same-media retry; interrupted install resume; workstation
-PXE/runtime/install/adoption/Blueprint/multicast; window and Update now updates,
+PXE/runtime/install/adoption/Blueprint; window and Update now updates,
 holds/schedules and retention; failing-service, failed-health and nonbooting
 candidate rollback; power-cut receipt recovery; acknowledged and timed-out network
 changes; certificate-only SSH/CIDR isolation; existing-device recovery/decommission;

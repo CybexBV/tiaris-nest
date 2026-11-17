@@ -231,8 +231,8 @@ the active runtime's evidence.
 
 The migration history retains the multicast state migration already used by
 the `.19` development appliances. Later builds must preserve that migration
-and its checksum even when the multicast capability is unavailable, so those
-appliances can restart or upgrade without discarding their state.
+and its checksum even though multicast is retired, so those appliances can
+restart or upgrade without discarding their state.
 
 The SQLite schema starts with the inventory of the published releases
 (`release/sqlite-migrations.sha256`): releases before schema evolution refuse
@@ -342,34 +342,12 @@ Tiaris revision builds a stick. Tiaris publishes that copy as a public download
 (Tiaris `docs/downloads.md`). It is not a release asset and nothing signed
 changes: the release manifest keeps its exact keys.
 
-## Classroom rootfs multicast
+## Retired rootfs multicast
 
-Nest can advertise `workstation_rootfs_multicast_v1` and coalesce live boot
-sessions for the same immutable `nix-store.squashfs` into one rate-limited,
-TTL-1 UDPcast stream. The optimization is disabled unless Tiaris supplies an
-`automatic` policy for an explicitly qualified wired L2 multicast domain; a
-missing or invalid policy, an older runtime, an unsuitable interface, or the
-root-owned `workstation_netboot.multicast_emergency_disabled` override leaves
-the existing HTTP path unchanged. A complete gathering window admits up to 30
-compatible sessions before one sender starts. Late, single, failed, or dropped
-receivers use HTTP and independently verify the signed size and SHA-256.
-
-Only the organization-neutral rootfs bytes enter multicast. Boot contexts,
-grants, nonces, device identities, enrollment, commands, secrets, closures,
-and results remain per-device unicast. The sender uses one canonical
-`O_NOFOLLOW`-opened artifact, a selected wired interface, fixed administrative
-groups and ports, TTL 1, an absolute timeout, bounded receiver drop behavior,
-and no added Linux capabilities. Nginx suppresses access logging for
-bearer-like boot-session context paths. Aggregate transfer evidence is
-isolated from other managed report lanes and contains no session, device, URL,
-address, or interface identifiers.
-
-The NixOS closure uses the same pinned UDPcast derivation as the workstation
-runtime. Its corresponding source and license remain available through the
-pinned source offer. Appliance update and rollback qualification covers the
-installed dependency. The nftables boundary
-remains unchanged: it restricts SSH; the unprivileged sender's own high-UDP
-socket is the runtime gate.
+Nest no longer sends the workstation root filesystem by multicast (November
+2026); computers download it over HTTP. Older runtimes still ask for a
+multicast offer, get a 404 and download over HTTP at once. Its SQLite tables
+stay, unused: a Nest update refuses any database migration.
 
 ## NixOS appliance
 
@@ -464,8 +442,8 @@ it. The service polls requests every 30 seconds.
 
 Idle means nothing kept the Nest busy for 10 minutes: no request from a
 computer in flight or served (boot, netboot, installer, USB stick, cache; health
-probes do not count), no unexpired boot grant, no queued or running build and no
-multicast transfer. The daemon writes this to `/run/tiaris-nest/activity.json`
+probes do not count), no unexpired boot grant and no queued or running build.
+The daemon writes this to `/run/tiaris-nest/activity.json`
 every 20 seconds (`src/activity.rs`). A missing or stale report counts as busy
 until the Nest has been up for 30 minutes: then the daemon serves nothing.
 
