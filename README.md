@@ -309,6 +309,37 @@ queued and converges when it next checks in. Nest reports only bounded error
 codes and never treats a wake receipt as proof that a workstation actually
 started.
 
+## Laptops that share one network adapter
+
+Laptops without their own network port start through a USB adapter or dock
+that moves from laptop to laptop, so the MAC address names no single
+computer. `autoexec.ipxe` therefore also sends the SMBIOS serial
+(`serial_hex=${serial:hexraw}`) and system UUID (`uuid=${uuid}`); menu links
+carry both. The Nest hashes the UUID into the hardware fingerprint the Tiaris
+agent reports (`sha256("tiaris-hardware-v1\ndmi_product_uuid=<uuid>")`).
+
+- **Reinstall.** A network reinstall armed on a MAC goes only to the computer
+  Manage names for it (`reinstall_machine` on the boot client: its
+  fingerprints, and `required` when the MAC is shared). A boot whose UUID is
+  another computer's, or on a shared MAC a boot without a UUID, gets the menu
+  and no reinstall binding, also in the installer grant. The computer the
+  reinstall is for gets it even when the MAC is registered to another
+  laptop's serial. `GET /boot/<mac>/kexec.json` is unchanged: the computer's
+  own agent asks for it on Manage's signed command.
+- **Known computers.** On another computer's adapter, a computer Tiaris knows
+  (the boot configuration's `machines`) starts its local disk first when it
+  is installed, and gets the menu without the "registered to another
+  computer" notice while it is being installed; so does a computer whose
+  serial this Nest knows from another adapter. Only a computer nobody knows
+  gets the notice.
+- Without a usable UUID the serial rule decides as before. What Manage says
+  is kept in the state file `boot-identity/boot-identity.json`, written before
+  the boot configuration that needs it is committed.
+
+Nest advertises `boot_machine_identity_v1` only when Manage says it accepts
+the capability (`boot_machine_identity_supported`); Manage arms a network
+reinstall on a shared MAC only for such a Nest.
+
 ## USB installer stick
 
 Computers that cannot network-boot (no PXE through their USB Ethernet adapter,
