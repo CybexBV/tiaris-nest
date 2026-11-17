@@ -16,12 +16,14 @@ use axum::{
 use maud::{DOCTYPE, Markup, html};
 
 use super::boot::{
-    BootEventInput, BootQuery, boot_profile_id_from_path, choose_boot_profile, clean_optional,
-    create_installer_launch_for_runtime, identify_boot_client, identify_selecting_client,
-    record_boot_event, record_selection,
+    BootEventInput, BootQuery, OtherComputer, boot_profile_id_from_path, choose_boot_profile,
+    clean_optional, create_installer_launch_for_runtime, identify_boot_client,
+    identify_selecting_client, record_boot_event, record_selection,
 };
 use crate::{
-    AppState, boot as boot_logic, db,
+    AppState, boot as boot_logic,
+    boot_machines::BootIdentity,
+    db,
     error::AppError,
     models::{BootProfile, BootProfileType, normalize_mac},
     usb_installer::{
@@ -74,7 +76,7 @@ pub async fn usb_boot(
         return error_response(StatusCode::BAD_REQUEST, ERROR_INVALID_REQUEST);
     };
     let connect = connect.map(|value| value.0);
-    match usb_boot_inner(&state, mac, query.reported_serial(), &headers, connect).await {
+    match usb_boot_inner(&state, mac, query.reported_identity(), &headers, connect).await {
         Ok(response) => response,
         Err(error) => internal_error(error),
     }
@@ -83,17 +85,17 @@ pub async fn usb_boot(
 async fn usb_boot_inner(
     state: &AppState,
     mac: String,
-    reported_serial: Option<String>,
+    identity: BootIdentity,
     headers: &HeaderMap,
     connect: Option<SocketAddr>,
 ) -> Result<Response, AppError> {
-    let client = identify_boot_client(state, Some(mac.clone()), reported_serial, false).await?;
+    let client = identify_boot_client(state, Some(mac.clone()), identity, false).await?;
     let profiles = db::list_enabled_profiles(&state.db).await?;
     let selection = choose_boot_profile(
         &profiles,
         client.device.as_ref(),
         client.known_device,
-        client.serial_conflict,
+        client.other_computer.is_some(),
         Some(&mac),
         false,
     );
@@ -102,25 +104,29 @@ async fn usb_boot_inner(
     // computer assigned to its local disk or to custom iPXE gets the menu:
     // someone chose to start the installer stick on it.
     if let Some(profile) = selection.profile.filter(|profile| launchable(profile)) {
-        let launch =
-            match create_installer_launch_for_runtime(state, profile, &mac, client.device.as_ref())
-                .await
-            {
-                Ok((session, runtime)) => UsbLaunch::new(session, runtime),
-                Err(error) => {
-                    if selection.source == boot_logic::SelectionSource::AutomaticEnrollment {
-                        if let Some(device) = client.device.as_ref() {
-                            // As on PXE: a transient failure must not leave a
-                            // fresh MAC behind as a known computer.
-                            let _ =
-                                db::remove_unclaimed_auto_discovered_device(&state.db, device.id)
-                                    .await;
-                        }
+        let launch = match create_installer_launch_for_runtime(
+            state,
+            profile,
+            &mac,
+            client.device.as_ref(),
+            Some(&client.identity),
+        )
+        .await
+        {
+            Ok((session, runtime)) => UsbLaunch::new(session, runtime),
+            Err(error) => {
+                if selection.source == boot_logic::SelectionSource::AutomaticEnrollment {
+                    if let Some(device) = client.device.as_ref() {
+                        // As on PXE: a transient failure must not leave a
+                        // fresh MAC behind as a known computer.
+                        let _ =
+                            db::remove_unclaimed_auto_discovered_device(&state.db, device.id).await;
                     }
-                    tracing::warn!(error = %error, "USB installer session could not be created");
-                    return Ok(session_unavailable(state).await);
                 }
-            };
+                tracing::warn!(error = %error, "USB installer session could not be created");
+                return Ok(session_unavailable(state).await);
+            }
+        };
         if let Some(device) = client.device.as_ref() {
             record_selection(state, device, profile, selection.source).await?;
         }
@@ -153,12 +159,12 @@ async fn usb_boot_inner(
         headers,
     )
     .await?;
-    let notice = if client.serial_conflict {
-        Some(NOTICE_ADAPTER_OF_ANOTHER_COMPUTER)
-    } else if client.known_device {
-        Some(NOTICE_KNOWN_COMPUTER)
-    } else {
-        None
+    let notice = match client.other_computer {
+        Some(OtherComputer::Unknown) => Some(NOTICE_ADAPTER_OF_ANOTHER_COMPUTER),
+        Some(OtherComputer::Installed) => Some(NOTICE_KNOWN_COMPUTER),
+        Some(OtherComputer::Known) => None,
+        None if client.known_device => Some(NOTICE_KNOWN_COMPUTER),
+        None => None,
     };
     let menu = boot_logic::installer_menu_profiles(&profiles)
         .into_iter()
@@ -223,16 +229,16 @@ pub async fn usb_select(
         return error_response(StatusCode::NOT_FOUND, ERROR_PROFILE_UNAVAILABLE);
     }
     let connect = connect.map(|value| value.0);
-    let reported_serial = query.reported_serial();
+    let identity = query.reported_identity();
     let result = async {
         let (device, known_device) =
-            identify_selecting_client(&state, Some(&mac), reported_serial.as_deref(), profile.id)
-                .await?;
+            identify_selecting_client(&state, Some(&mac), &identity, profile.id).await?;
         let launch = match create_installer_launch_for_runtime(
             &state,
             &profile,
             &mac,
             device.as_ref(),
+            Some(&identity),
         )
         .await
         {
@@ -242,7 +248,7 @@ pub async fn usb_select(
                 return Ok(session_unavailable(&state).await);
             }
         };
-        let serial = clean_optional(reported_serial.clone());
+        let serial = clean_optional(identity.serial.clone());
         record_boot_event(
             &state,
             &BootEventInput {
