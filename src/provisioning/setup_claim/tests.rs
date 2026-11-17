@@ -332,8 +332,11 @@ fn run_store_keeps_its_secrets_private_and_forgets_cleanly() {
     assert!(store.prepare().is_err());
 }
 
-/// What the fake Manage saw: method, path, signed headers and body, plus the
-/// kiosk status published when the request arrived.
+/// The tests' tick: one second in production.
+const TICK: Duration = Duration::from_micros(100);
+
+/// What the fake Manage saw: method, path, signed headers and body, the
+/// kiosk status published when the request arrived, and its answer.
 #[derive(Clone)]
 struct Seen {
     method: HttpMethod,
@@ -341,13 +344,17 @@ struct Seen {
     headers: HeaderMap,
     body: Bytes,
     screen: Option<Value>,
+    answered: StatusCode,
 }
 
-#[derive(Default)]
 struct Fake {
     replies: VecDeque<(StatusCode, Value)>,
     seen: Vec<Seen>,
     status_path: Option<PathBuf>,
+    /// Manage's poll limit, one tick: a registration's poll within it of the
+    /// one before is answered `429` with `Retry-After: 1`, without a reply.
+    poll_interval: Duration,
+    last_poll: std::collections::HashMap<String, std::time::Instant>,
 }
 
 async fn handle(
@@ -363,18 +370,35 @@ async fn handle(
         .as_ref()
         .and_then(|path| fs::read(path).ok())
         .and_then(|body| serde_json::from_slice(&body).ok());
+    let path = uri.path().to_string();
+    let now = std::time::Instant::now();
+    let too_fast = path.ends_with("/status")
+        && fake
+            .last_poll
+            .get(&path)
+            .is_some_and(|last| now.duration_since(*last) < fake.poll_interval);
+    let mut reply_headers = HeaderMap::new();
+    let (status, reply) = if too_fast {
+        reply_headers.insert("retry-after", "1".parse().unwrap());
+        refusal(StatusCode::TOO_MANY_REQUESTS, "nest_setup_poll_too_fast")
+    } else {
+        if path.ends_with("/status") {
+            fake.last_poll.insert(path.clone(), now);
+        }
+        fake.replies.pop_front().unwrap_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error_code":"script_ended"}),
+        ))
+    };
     fake.seen.push(Seen {
         method,
-        path: uri.path().to_string(),
+        path,
         headers,
         body,
         screen,
+        answered: status,
     });
-    let (status, body) = fake.replies.pop_front().unwrap_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        json!({"error_code":"script_ended"}),
-    ));
-    (status, Json(body))
+    (status, reply_headers, Json(reply))
 }
 
 async fn fake_manage(
@@ -383,8 +407,10 @@ async fn fake_manage(
 ) -> (String, Arc<Mutex<Fake>>, tokio::task::JoinHandle<()>) {
     let state = Arc::new(Mutex::new(Fake {
         replies: replies.into(),
+        seen: Vec::new(),
         status_path,
-        ..Default::default()
+        poll_interval: TICK,
+        last_poll: Default::default(),
     }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
@@ -464,7 +490,7 @@ impl Harness {
             required_origin: ORIGIN,
             status: &self.status,
             hardware: &self.hardware,
-            tick: Duration::from_micros(100),
+            tick: TICK,
             starts_installed_at: None,
         }
     }
@@ -1456,4 +1482,131 @@ async fn start_over_without_a_reboot_forgets_this_boots_claim_and_registers_agai
     );
     assert_eq!(harness.screen()["claim"]["state"], "claimable");
     assert_eq!(harness.screen()["claim"]["letters"], LETTERS);
+}
+
+/// The fake Manage just answered a regular poll of `id`.
+fn polled_just_now(fake: &Arc<Mutex<Fake>>, id: Uuid, interval: Duration) {
+    let mut fake = fake.lock().unwrap();
+    fake.poll_interval = interval;
+    fake.last_poll.insert(
+        format!("{REGISTRATIONS_PATH}/{id}/status"),
+        std::time::Instant::now(),
+    );
+}
+
+fn saved_registration(harness: &Harness, id: Uuid) {
+    harness.store.prepare().unwrap();
+    harness
+        .store
+        .save_registration(&Registration {
+            key: SigningKey::from_bytes(&[3; 32]),
+            id: Some(id),
+        })
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_claim_in_the_deadlines_last_second_is_not_lost_to_the_poll_limit() {
+    // A regular poll was answered a moment before the deadline, the
+    // administrator claimed right after it, and the deadline's poll comes
+    // within the same second: Manage answers `429`, which is no answer.
+    let id = Uuid::new_v4();
+    let session = Uuid::new_v4();
+    let bytes = envelope(session, 30);
+    let (origin, fake, server) =
+        fake_manage(vec![(StatusCode::OK, claimed(id, session, &bytes))], None).await;
+    let harness = Harness::new(origin);
+    saved_registration(&harness, id);
+    let mut context = harness.context();
+    context.tick = Duration::from_millis(50);
+    polled_just_now(&fake, id, context.tick);
+    let taken = last_poll(&context).await.unwrap().unwrap();
+    let seen = fake.lock().unwrap().seen.clone();
+    server.abort();
+    assert_eq!(taken.verified.envelope.session_id, session);
+    assert_eq!(
+        seen.iter().map(|seen| seen.answered).collect::<Vec<_>>(),
+        [StatusCode::TOO_MANY_REQUESTS, StatusCode::OK]
+    );
+
+    // The same through the deadline: the loop's last regular poll lands
+    // shortly before it, the claim right after.
+    let mut fast = claimable(id);
+    fast["poll_after_seconds"] = json!(2);
+    let (origin, fake, server) = fake_manage(
+        vec![
+            (StatusCode::CREATED, fast.clone()),
+            (StatusCode::OK, fast),
+            (StatusCode::OK, claimed(id, session, &bytes)),
+        ],
+        None,
+    )
+    .await;
+    let harness = Harness::new(origin);
+    let mut context = harness.context();
+    context.tick = Duration::from_millis(400);
+    fake.lock().unwrap().poll_interval = context.tick;
+    // Registered at 0, polled at 800 ms, deadline at 1000 ms.
+    let deadline = Utc::now() + chrono::Duration::milliseconds(1000);
+    let taken = claim_until(&context, deadline).await.unwrap().unwrap();
+    let seen = fake.lock().unwrap().seen.clone();
+    server.abort();
+    assert_eq!(taken.verified.envelope.session_id, session);
+    assert_eq!(
+        seen.iter().map(|seen| seen.answered).collect::<Vec<_>>(),
+        [
+            StatusCode::CREATED,
+            StatusCode::OK,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::OK
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_deadline_without_an_answer_asks_a_bounded_number_of_times() {
+    let id = Uuid::new_v4();
+    let (origin, fake, server) = fake_manage(vec![], None).await;
+    let harness = Harness::new(origin);
+    saved_registration(&harness, id);
+    // Manage never lets a poll through: the installed Nest still starts.
+    polled_just_now(&fake, id, Duration::from_secs(3600));
+    assert!(last_poll(&harness.context()).await.unwrap().is_none());
+    let seen = fake.lock().unwrap().seen.clone();
+    server.abort();
+    assert_eq!(seen.len(), DECIDING_POLL_ATTEMPTS as usize);
+    assert!(
+        seen.iter()
+            .all(|seen| seen.answered == StatusCode::TOO_MANY_REQUESTS)
+    );
+
+    // No network at all: asked again too, and then the Nest starts.
+    let harness = Harness::new("http://127.0.0.1:9".to_string());
+    saved_registration(&harness, id);
+    assert!(last_poll(&harness.context()).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_poll_refused_as_too_fast_never_reads_as_a_registration_still_there() {
+    let id = Uuid::new_v4();
+    let (origin, fake, server) = fake_manage(
+        vec![refusal(
+            StatusCode::NOT_FOUND,
+            "nest_setup_registration_not_found",
+        )],
+        None,
+    )
+    .await;
+    let harness = Harness::new(origin);
+    saved_registration(&harness, id);
+    let mut context = harness.context();
+    context.tick = Duration::from_millis(50);
+    polled_just_now(&fake, id, context.tick);
+    assert!(registration_gone(&context).await);
+    let seen = fake.lock().unwrap().seen.clone();
+    server.abort();
+    assert_eq!(
+        seen.iter().map(|seen| seen.answered).collect::<Vec<_>>(),
+        [StatusCode::TOO_MANY_REQUESTS, StatusCode::NOT_FOUND]
+    );
 }

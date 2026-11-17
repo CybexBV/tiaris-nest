@@ -67,6 +67,11 @@ const FAILURE_BACKOFF_CAP_TICKS: u32 = 60;
 const RATE_LIMIT_BACKOFF_CAP_TICKS: u32 = 900;
 /// Failed attempts in a row before the screen says it is connecting again.
 const FAILURES_BEFORE_CONNECTING: u32 = 3;
+/// A poll that decides (at the deadline, or whether the registration is
+/// gone) is asked at most this often when it gets no answer.
+const DECIDING_POLL_ATTEMPTS: u32 = 3;
+/// The longest `Retry-After` such a poll waits for, in ticks.
+const DECIDING_RETRY_CAP_TICKS: u32 = 5;
 
 /// The slot of a generic ISO: exactly 8192 zero bytes. Anything else is a
 /// personalized envelope and takes the existing path.
@@ -631,21 +636,17 @@ pub(super) async fn claim_until(
     last_poll(context).await
 }
 
-/// One poll at the deadline: a claim that landed since the last poll wins.
-/// Any other answer, or none, lets the installed Nest start.
-async fn last_poll(context: &ClaimContext<'_>) -> Result<Option<Claimed>> {
+/// One deciding poll at the deadline: a claim that landed since the last
+/// poll wins. Any other answer, or still none after its retries, lets the
+/// installed Nest start.
+pub(super) async fn last_poll(context: &ClaimContext<'_>) -> Result<Option<Claimed>> {
     if let Some(claimed) = run_envelope(context)? {
         return Ok(Some(claimed));
     }
     let Some(Registration { key, id: Some(id) }) = context.store.load_registration()? else {
         return Ok(None);
     };
-    let reply = context
-        .transport
-        .poll(&key, id)
-        .await
-        .and_then(|body| validate_reply(body, Some(id)));
-    match reply {
+    match deciding_poll(context, &key, id).await {
         Ok(Reply {
             claim_url,
             answer:
@@ -732,14 +733,48 @@ async fn registration_gone(context: &ClaimContext<'_>) -> bool {
     let Some(id) = registration.id else {
         return false;
     };
-    let outcome = context.transport.poll(&registration.key, id).await;
-    matches!(
-        classify(
-            outcome.and_then(|body| validate_reply(body, Some(id))),
-            true
-        ),
-        Step::Gone
-    )
+    let reply = deciding_poll(context, &registration.key, id).await;
+    matches!(classify(reply, true), Step::Gone)
+}
+
+/// A poll whose answer decides something. Management answers a poll in the
+/// same second as the one before `429` (`Retry-After: 1`) without reading
+/// it, and a transport failure says nothing either: neither is an answer.
+/// Wait as `Retry-After` says (one tick without it, at most
+/// `DECIDING_RETRY_CAP_TICKS`) and ask again, at most
+/// `DECIDING_POLL_ATTEMPTS` times in all; then the last outcome stands.
+pub(super) async fn deciding_poll(
+    context: &ClaimContext<'_>,
+    key: &SigningKey,
+    id: Uuid,
+) -> Result<Reply> {
+    let mut attempt = 1;
+    loop {
+        let reply = context
+            .transport
+            .poll(key, id)
+            .await
+            .and_then(|body| validate_reply(body, Some(id)));
+        let error = match reply {
+            Err(error) if attempt < DECIDING_POLL_ATTEMPTS && no_answer(&error) => error,
+            reply => return reply,
+        };
+        let ticks = protocol::retry_after_seconds(&error)
+            .map_or(1, |seconds| u32::try_from(seconds).unwrap_or(u32::MAX))
+            .clamp(1, DECIDING_RETRY_CAP_TICKS);
+        debug!(error = %error, "a deciding Nest setup poll got no answer; asking again");
+        context.wait(ticks).await;
+        attempt += 1;
+    }
+}
+
+/// Too fast, or no HTTP answer at all (connection, timeout, a body that
+/// could not be read).
+fn no_answer(error: &anyhow::Error) -> bool {
+    match protocol::http_refusal(error) {
+        Some((status, _)) => status == StatusCode::TOO_MANY_REQUESTS,
+        None => error.chain().any(|cause| cause.is::<reqwest::Error>()),
+    }
 }
 
 fn retry_ticks(failures: u32, rate_limited: bool) -> u32 {

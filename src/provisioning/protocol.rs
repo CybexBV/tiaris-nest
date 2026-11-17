@@ -900,6 +900,11 @@ pub(crate) async fn signed_json<B: Serialize + ?Sized, R: DeserializeOwned>(
     }
     let response = request.send().await.context("send provisioning request")?;
     let status = response.status();
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok());
     let bytes = response
         .bytes()
         .await
@@ -908,7 +913,11 @@ pub(crate) async fn signed_json<B: Serialize + ?Sized, R: DeserializeOwned>(
         bail!("provisioning response exceeds its size limit")
     }
     if !status.is_success() {
-        return Err(safe_http_error(status, &bytes));
+        let mut error = safe_http_error(status, &bytes);
+        if let Some(refusal) = error.downcast_mut::<ProvisioningHttpError>() {
+            refusal.retry_after_seconds = retry_after;
+        }
+        return Err(error);
     }
     let value = crate::appliance::release_v3::strict_json(&bytes)?;
     serde_json::from_value(value).context("parse provisioning response")
@@ -923,6 +932,8 @@ struct ProvisioningHttpError {
     error_code: Option<String>,
     /// Management's `diagnostic_code`, read only to recognise a closed session.
     diagnostic_code: Option<String>,
+    /// `Retry-After` in seconds, when Management sent one.
+    retry_after_seconds: Option<u64>,
 }
 
 /// Status and Management `error_code` of an HTTP refusal; `None` for a
@@ -931,6 +942,13 @@ pub(super) fn http_refusal(error: &anyhow::Error) -> Option<(StatusCode, Option<
     error
         .downcast_ref::<ProvisioningHttpError>()
         .map(|error| (error.status, error.error_code.as_deref()))
+}
+
+/// The `Retry-After` seconds of an HTTP refusal that carried one.
+pub(super) fn retry_after_seconds(error: &anyhow::Error) -> Option<u64> {
+    error
+        .downcast_ref::<ProvisioningHttpError>()
+        .and_then(|error| error.retry_after_seconds)
 }
 
 /// Management refused a provisioning session because it is closed. Only for
@@ -981,6 +999,7 @@ fn safe_http_error(status: StatusCode, body: &[u8]) -> anyhow::Error {
         code: code.to_owned(),
         error_code,
         diagnostic_code,
+        retry_after_seconds: None,
     }
     .into()
 }

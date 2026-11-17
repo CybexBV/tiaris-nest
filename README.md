@@ -56,7 +56,8 @@ envelope, or a STATE partition whose NixOS Nest has its systemd-boot UEFI
 entry, as every Nest a personalized ISO installed), the ISO shows the claim
 screen with `starts_installed_at` and starts the installed Nest after 10
 minutes unless it is claimed (it polls once more at the deadline, so a claim
-that landed since the last poll wins; with the envelope as the completed-install path
+that landed since the last poll wins; a `429` or no answer at all is asked again,
+as `Retry-After` says, up to three polls in all; with the envelope as the completed-install path
 does, without one by selecting that UEFI entry and restarting, changing
 nothing on disk), so the generic ISO can always reinstall or recover it (a new
 claim treats the old STATE as another session's). A Nest that cannot be
