@@ -275,15 +275,14 @@ exactly its own items; a missing or altered document fails that grant.
   forgotten; without `upload`, the token file and every grant are removed.
 - **Uploading.** Each grant is registered (`POST <tree>/upload-grants`), then
   each granted store path is uploaded from the Nest cache, NAR before
-  narinfo, the narinfo exactly as Nix wrote it with the Nest signature, then
-  each granted file (`manage-source/<revision>.tar` from
-  `/usr/share/tiaris-nest/manage-source`). Every PUT carries the write token
-  as the Basic password and `X-Tiaris-Upload-Grant: <grant id>`. Nothing
-  outside a grant is sent: a path whose local narinfo or NAR, or a file whose
-  size or SHA-256, does not match the grant is refused locally
-  (`narinfo_mismatch`, `nar_mismatch`, `file_mismatch`, `not_in_cache`); a
-  NAR's FileHash and a file's SHA-256 are checked before the same open file
-  is sent. A path already in the tree is skipped; a stored grant that no
+  narinfo, the narinfo exactly as Nix wrote it with the Nest signature.
+  Every PUT carries the write token as the Basic password and
+  `X-Tiaris-Upload-Grant: <grant id>`. Nothing outside a grant is sent: a path
+  whose local narinfo or NAR does not match the grant is refused locally
+  (`narinfo_mismatch`, `nar_mismatch`, `not_in_cache`); a NAR's FileHash is
+  checked before the same open file is sent. Files a grant names (Manage's
+  source archive, which Manage stopped granting on 17 November 2026) are
+  never uploaded. A path already in the tree is skipped; a stored grant that no
   longer decodes fails alone (`grant_invalid`).
 - **Bounds.** One grant and one upload at a time, at most 8 MiB/s. Network,
   server and token errors stop the pass and retry the grant 1, 2, 4 …
@@ -293,8 +292,7 @@ exactly its own items; a missing or altered document fails that grant.
 - **Report.** To such a Manage each report carries
   `software_cache_uploads`: per grant `{grant_id, manifest_id, state:
   pending|uploading|uploaded|failed|expired, paths_total, paths_uploaded,
-  files_total, files_uploaded, items_failed, bytes_uploaded, error?,
-  updated_at}`.
+  items_failed, bytes_uploaded, error?, updated_at}`.
 
 ## Wake-on-LAN
 
