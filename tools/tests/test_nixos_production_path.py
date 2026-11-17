@@ -152,7 +152,9 @@ class ProductionTests(unittest.TestCase):
         source = (HELPERS.parent / 'build.py').read_text()
         self.assertIn("'-A', 'usbInstallerAvailable'", source)
         nix = (HELPERS.parent / 'default.nix').read_text()
-        self.assertIn('usbInstallerAvailable = common.usbInstaller != null;', nix)
+        self.assertIn('usbInstallerAvailable = usbInstaller != null;', nix)
+        # The installed Nest neither carries nor serves the stick.
+        self.assertNotIn('usbInstaller', (HELPERS.parent / 'module.nix').read_text())
 
     def test_signed_appliance_cache_requires_exact_workstation_agent(self):
         build = runpy.run_path(str(HELPERS.parent / 'build.py'))

@@ -39,23 +39,24 @@ let
     inherit pkgs;
     repoRoot = builtins.toPath manageRepo;
   };
+  # The generic USB installer stick for computers that cannot network-boot
+  # (Tiaris docs/design/usb-installer.md), built from the same pinned Tiaris
+  # source and exported beside the template ISO for public downloads. The
+  # Nest itself does not carry or serve it; a Tiaris revision without it
+  # simply builds no stick.
+  usbInstaller =
+    let stick = builtins.toPath manageRepo + "/deploy/nixos/tiaris-usb-installer.nix";
+    in if builtins.pathExists stick then import stick {
+      inherit nixpkgs pkgs system;
+      repoRoot = builtins.toPath manageRepo;
+      sourceRevision = manageSourceRevision;
+    } else null;
   common = {
     inherit package sourceArchive migrations workstationAgent workstationCacheSeeds installerKiosk sourceRevision manageSourceRevision manageOrigin sourceDateEpoch releasePublicKey;
     sourceArchiveFile = archiveInput;
     provisioningPublicKeys = publicKeys;
     nixpkgsRevision = pin.revision;
     nixpkgsPath = nixpkgs;
-    # The USB installer stick for computers that cannot network-boot
-    # (Tiaris docs/design/usb-installer.md), built from the same pinned
-    # Tiaris source. The Nest serves it at /usb-installer/ with its own site
-    # file; a Tiaris revision without it simply ships no stick.
-    usbInstaller =
-      let stick = builtins.toPath manageRepo + "/deploy/nixos/tiaris-usb-installer.nix";
-      in if builtins.pathExists stick then import stick {
-        inherit nixpkgs pkgs system;
-        repoRoot = builtins.toPath manageRepo;
-        sourceRevision = manageSourceRevision;
-      } else null;
     # Presentation-only GRUB theme directory (theme.txt, images, .pf2 fonts).
     grubTheme = import (builtins.toPath manageRepo + "/deploy/nixos/tiaris-grub-theme.nix") {
       inherit pkgs;
@@ -113,8 +114,8 @@ assert publicKeys == lib.sort builtins.lessThan (lib.unique publicKeys);
   inherit package unsignedCache buildMetadata workstationAgent workstationCacheSeeds installerKiosk;
   # The stick image, exported beside the template ISO for public downloads
   # (Tiaris docs/downloads.md); null when the pinned Tiaris revision has none.
-  inherit (common) usbInstaller;
-  usbInstallerAvailable = common.usbInstaller != null;
+  inherit usbInstaller;
+  usbInstallerAvailable = usbInstaller != null;
   workstationCacheSeedPaths = map toString workstationCacheSeeds.packages;
   system = installed.config.system.build.toplevel;
   iso = live.config.system.build.isoImage;

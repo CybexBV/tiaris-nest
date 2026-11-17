@@ -1,4 +1,4 @@
-//! `/usb-installer/*`: the USB installer stick protocol and its download.
+//! `/usb-installer/v1/*`: the USB installer stick protocol.
 //!
 //! The stick asks the same questions iPXE asks `/boot/<mac>` and
 //! `/boot/select/<profile>`, and gets the same answers: one selection rule
@@ -10,10 +10,9 @@ use std::net::SocketAddr;
 
 use axum::{
     extract::{ConnectInfo, Path, Query, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
-    response::{IntoResponse, Response},
+    http::{HeaderMap, StatusCode},
+    response::Response,
 };
-use maud::{DOCTYPE, Markup, html};
 
 use super::boot::{
     BootEventInput, BootQuery, boot_profile_id_from_path, choose_boot_profile, clean_optional,
@@ -279,116 +278,4 @@ pub async fn usb_runtime(State(state): State<AppState>, headers: HeaderMap) -> R
         ),
         Err(_) => error_response(StatusCode::SERVICE_UNAVAILABLE, ERROR_RUNTIME_UNAVAILABLE),
     }
-}
-
-fn page(title: &str, body: Markup) -> Response {
-    let markup = html! {
-        (DOCTYPE)
-        html lang="en" {
-            head {
-                meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
-                title { (title) }
-            }
-            body {
-                h1 { (title) }
-                (body)
-            }
-        }
-    };
-    (
-        [
-            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-            (header::CACHE_CONTROL, "no-store, max-age=0"),
-        ],
-        markup.into_string(),
-    )
-        .into_response()
-}
-
-/// `GET /usb-installer/`: a plain page with the download link. The Console
-/// opens it on the school network, so the browser downloads the image from an
-/// HTTP page instead of blocking an HTTP download started on the HTTPS
-/// Console.
-pub async fn usb_page(State(state): State<AppState>) -> Response {
-    let dir = usb_installer::image_dir();
-    let metadata = usb_installer::open_image(&dir).map(|(metadata, _)| metadata);
-    let site = usb_installer::site_for(&state.config);
-    let body = match (metadata, site) {
-        (Ok(metadata), Ok(site)) => {
-            let megabytes = metadata.size_bytes.div_ceil(1024 * 1024);
-            html! {
-                p { "For computers that cannot start from the network. This stick belongs to Tiaris Nest " code { (site.nest_url) } "." }
-                p { a href={ "/usb-installer/" (usb_installer::IMAGE_FILE_NAME) } download=(usb_installer::IMAGE_FILE_NAME) { "Download the USB installer" } " (" (megabytes) " MB)" }
-                ol {
-                    li { "Write the image to a USB stick of at least 4 GB with an image writer such as balenaEtcher, Rufus (DD mode) or dd. This erases the stick." }
-                    li { "For Wi-Fi: open the TIARIS drive and fill in " code { "tiaris/wifi.txt" } ", or save the file the Tiaris Console creates. The password stays on the stick and the installed computer." }
-                    li { "Turn off Secure Boot, start the computer from the stick, and approve the computer in Tiaris." }
-                }
-                p { small { "Stick protocol " (metadata.protocol) ", source " (metadata.source_revision) "." } }
-            }
-        }
-        (Err(_), _) => html! {
-            p { "This Nest has no USB installer image. Update the Nest in the Tiaris Console, then open this page again." }
-        },
-        (_, Err(_)) => html! {
-            p { "This Nest is not connected to Tiaris yet. Finish its setup, then open this page again." }
-        },
-    };
-    page("Tiaris USB installer", body)
-}
-
-/// `GET /usb-installer/tiaris-usb-installer.img`: the image, with this Nest's
-/// `tiaris/site.json` in its placeholder.
-pub async fn usb_image(State(state): State<AppState>) -> Response {
-    let dir = usb_installer::image_dir();
-    let (metadata, file) = match usb_installer::open_image(&dir) {
-        Ok(opened) => opened,
-        Err(error) => {
-            tracing::warn!(error = %error, "USB installer image is unavailable");
-            return (
-                StatusCode::NOT_FOUND,
-                "USB installer image is unavailable\n",
-            )
-                .into_response();
-        }
-    };
-    let site = match usb_installer::site_for(&state.config)
-        .and_then(|site| usb_installer::render_site(&site, metadata.site_size))
-    {
-        Ok(site) => site,
-        Err(error) => {
-            tracing::warn!(error = %error, "USB installer site is unavailable");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "This Nest is not connected to Tiaris yet\n",
-            )
-                .into_response();
-        }
-    };
-    let body = match usb_installer::personalized_stream(file, &metadata, site) {
-        Ok(body) => body,
-        Err(error) => {
-            tracing::warn!(error = %error, "USB installer image could not be personalized");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-    let mut response = Response::new(body);
-    let headers = response.headers_mut();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/octet-stream"),
-    );
-    headers.insert(
-        header::CONTENT_DISPOSITION,
-        HeaderValue::from_static("attachment; filename=\"tiaris-usb-installer.img\""),
-    );
-    headers.insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("no-store, max-age=0"),
-    );
-    if let Ok(length) = HeaderValue::from_str(&metadata.size_bytes.to_string()) {
-        headers.insert(header::CONTENT_LENGTH, length);
-    }
-    response
 }

@@ -36,12 +36,6 @@ pub fn router(state: AppState) -> Router {
         .route("/boot/:mac/kexec.json", get(boot::boot_kexec))
         .route("/boot/by-serial/:serial", get(boot::boot_serial))
         .route("/boot/select/:profile_id", get(boot::boot_select_profile))
-        .route("/usb-installer", get(usb_installer::usb_page))
-        .route("/usb-installer/", get(usb_installer::usb_page))
-        .route(
-            "/usb-installer/tiaris-usb-installer.img",
-            get(usb_installer::usb_image),
-        )
         .route("/usb-installer/v1/boot", get(usb_installer::usb_boot))
         .route("/usb-installer/v1/runtime", get(usb_installer::usb_runtime))
         .route(
