@@ -737,6 +737,7 @@ fn claim_view<'a>(state: ClaimState) -> ClaimView<'a> {
         url: Some("dev.tiaris.com/nest"),
         retry_at: Some(chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap()),
         organization: Some("Greenfield School"),
+        starts_installed_at: None,
     }
 }
 
@@ -777,6 +778,28 @@ fn claim_states_carry_only_the_fields_the_contract_allows() {
         serde_json::to_value(claim_status(&view)).unwrap(),
         json!({"state":"connecting"})
     );
+    // A server that already runs a Nest says when the ISO starts it, but only
+    // while it waits for a claim.
+    for state in [
+        ClaimState::Connecting,
+        ClaimState::Claimable,
+        ClaimState::Backoff,
+        ClaimState::Claimed,
+        ClaimState::Outdated,
+    ] {
+        let mut view = claim_view(state);
+        view.starts_installed_at = chrono::DateTime::from_timestamp(1_800_000_600, 0);
+        let status = serde_json::to_value(claim_status(&view)).unwrap();
+        let waiting = matches!(
+            state,
+            ClaimState::Connecting | ClaimState::Claimable | ClaimState::Backoff
+        );
+        assert_eq!(
+            status.get("starts_installed_at"),
+            waiting.then(|| json!("2027-01-15T08:10:00Z")).as_ref(),
+            "{state:?}"
+        );
+    }
     // Single-line, bounded public text.
     let mut view = claim_view(ClaimState::Claimed);
     let long = format!("Green\nfield {}", "x".repeat(200));

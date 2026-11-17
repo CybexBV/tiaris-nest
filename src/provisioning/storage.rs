@@ -106,6 +106,16 @@ pub(crate) fn existing_state_for_session(
 /// durable state, which holds the device key.
 pub(super) const RETAINED_SETUP_ENVELOPE: &str = ".setup-claim-envelope.bin";
 
+/// Written by the installed Nest when it boots, beside the retained envelope:
+/// this Nest has started, so a generic ISO booted later offers a new claim
+/// before starting it again. The setup ISO never writes it.
+pub(super) const SETUP_CLAIM_STARTED: &str = ".setup-claim-started";
+
+pub(super) fn setup_claim_started(state_mount: &Path) -> bool {
+    fs::symlink_metadata(state_mount.join(SETUP_CLAIM_STARTED))
+        .is_ok_and(|metadata| metadata.file_type().is_file())
+}
+
 /// Keep a generic ISO's envelope on the new STATE before any durable state
 /// refers to it, so a later run never needs the ISO slot or `/run`.
 pub(super) fn retain_setup_envelope(state_mount: &Path, envelope: &[u8]) -> Result<()> {
@@ -1630,6 +1640,14 @@ mod tests {
         assert_eq!(unmounts.get(), 1);
         // A dot file: state backups leave the media secret out.
         assert!(!crate::state_backup::included(RETAINED_SETUP_ENVELOPE));
+        // The installed Nest's start marker: a plain file only, never backed up.
+        assert!(!setup_claim_started(&root));
+        fs::create_dir(root.join(SETUP_CLAIM_STARTED)).unwrap();
+        assert!(!setup_claim_started(&root));
+        fs::remove_dir(root.join(SETUP_CLAIM_STARTED)).unwrap();
+        fs::write(root.join(SETUP_CLAIM_STARTED), b"").unwrap();
+        assert!(setup_claim_started(&root));
+        assert!(!crate::state_backup::included(SETUP_CLAIM_STARTED));
 
         // Oversized or linked copies grant nothing.
         fs::write(&path, vec![1; 8193]).unwrap();

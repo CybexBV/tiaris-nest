@@ -8,6 +8,11 @@
 //! From the moment STATE exists the envelope is kept there too, so resuming
 //! an interrupted installation never needs the ISO slot.
 //!
+//! A Nest this path installed keeps that envelope on STATE. Until the
+//! installed Nest has started once, the ISO starts it at once. Afterwards the
+//! ISO is there to reinstall or recover (or was left in): it shows a claim
+//! screen and starts the installed Nest only when nobody claims it in time.
+//!
 //! Letters, codes, the envelope and its media secret never reach a log: every
 //! message here is fixed text, and errors are logged by their top-level
 //! context only, never with a response body.
@@ -46,6 +51,9 @@ const STORED_SCHEMA: &str = "tiaris.nest.setup-registration-state.v1";
 const REGISTRATIONS_PATH: &str = "/v1/agent/nest/setup-registrations";
 const REGISTRATION_FILE: &str = "registration.json";
 const ENVELOPE_FILE: &str = "envelope.bin";
+const STARTS_INSTALLED_FILE: &str = "starts-installed-at";
+/// How long a server that already runs a Nest waits for a new claim.
+const START_INSTALLED_AFTER_MINUTES: i64 = 10;
 const LETTER_ALPHABET: &str = "ABCDEFGHJKMNPQRTVWXY";
 const MAX_HARDWARE_CHARS: usize = 80;
 const MAX_TEXT_CHARS: usize = 200;
@@ -79,7 +87,7 @@ pub(super) async fn prepare_generic(
     let store = RunStore::new(options.setup_claim_dir.clone());
     let transport = Transport::new(&options.required_manage_origin)?;
     let hardware = Hardware::collect().await;
-    let context = ClaimContext {
+    let mut context = ClaimContext {
         transport: &transport,
         store: &store,
         trusted_keys,
@@ -87,20 +95,45 @@ pub(super) async fn prepare_generic(
         status,
         hardware: &hardware,
         tick: Duration::from_secs(1),
+        starts_installed_at: None,
     };
     loop {
-        if let Some(retained) = retained_from_state(options, trusted_keys)? {
-            info!("resuming a claimed Nest setup from its retained STATE envelope");
-            return super::prepare_verified(
-                options,
-                status,
-                media_layout,
-                retained.verified,
-                Some(&retained.bytes),
-            )
-            .await;
-        }
-        let claimed = claim(&context).await?;
+        let claimed = match retained_from_state(options, trusted_keys)? {
+            Retained::Resume(retained) => {
+                info!("resuming a claimed Nest setup from its retained STATE envelope");
+                return super::prepare_verified(
+                    options,
+                    status,
+                    media_layout,
+                    retained.verified,
+                    Some(&retained.bytes),
+                )
+                .await;
+            }
+            Retained::Installed(installed) => {
+                storage::release_state_probe(&options.state_mount)?;
+                let deadline = store.starts_installed_at(
+                    Utc::now(),
+                    chrono::Duration::minutes(START_INSTALLED_AFTER_MINUTES),
+                )?;
+                context.starts_installed_at = Some(deadline);
+                info!("this server already runs a Nest; it starts unless claimed in time");
+                let Some(claimed) = claim_until(&context, deadline).await? else {
+                    info!("not claimed in time; starting the installed Nest");
+                    // The completed-install path, as when the Nest never started.
+                    return super::prepare_verified(
+                        options,
+                        status,
+                        media_layout,
+                        installed.verified,
+                        Some(&installed.bytes),
+                    )
+                    .await;
+                };
+                claimed
+            }
+            Retained::None => claim(&context).await?,
+        };
         let result = super::prepare_verified(
             options,
             status,
@@ -128,17 +161,48 @@ pub(super) struct Claimed {
     pub verified: VerifiedEnvelope,
 }
 
+/// What a retained STATE envelope allows on this start.
+pub(super) enum Retained {
+    /// Nothing to continue: register and wait for a claim.
+    None,
+    /// Continue that installation now.
+    Resume(Claimed),
+    /// A completed installation whose Nest has started before: offer a new
+    /// claim first and start it with this envelope when nobody claims it.
+    Installed(Claimed),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum RetainedChoice {
+    Claim,
+    Resume,
+    ClaimThenStart,
+}
+
+/// A completed installation resumes at once until the installed Nest has
+/// started (its marker); after that it is offered for a new claim first,
+/// whether or not the old setup window is open. An incomplete installation
+/// resumes while its window is open and is claimed again once it ended.
+pub(super) fn retained_choice(current: bool, completed: bool, started: bool) -> RetainedChoice {
+    match (completed, started) {
+        (true, true) => RetainedChoice::ClaimThenStart,
+        (true, false) => RetainedChoice::Resume,
+        (false, _) if current => RetainedChoice::Resume,
+        (false, _) => RetainedChoice::Claim,
+    }
+}
+
 /// A STATE envelope resumes only while it can still act: an installation
 /// that completed (the ISO booted again) or a setup whose window is open.
 /// An expired, unverifiable or orphaned copy is a setup that ended: STATE is
 /// released and the server is claimed again, after which the existing flow
-/// treats that STATE as foreign.
+/// treats that STATE as foreign. With `Installed` the probe stays mounted.
 fn retained_from_state(
     options: &PrepareOptions,
     trusted_keys: &[VerifyingKey],
-) -> Result<Option<Claimed>> {
+) -> Result<Retained> {
     let Some(bytes) = storage::retained_setup_envelope(&options.state_mount)? else {
-        return Ok(None);
+        return Ok(Retained::None);
     };
     let verified = match protocol::verify_envelope_bytes(
         &bytes,
@@ -149,22 +213,27 @@ fn retained_from_state(
         Err(error) => {
             warn!(error = %error, "ignoring a retained setup envelope that does not verify");
             storage::release_state_probe(&options.state_mount)?;
-            return Ok(None);
+            return Ok(Retained::None);
         }
     };
     let probe =
         storage::existing_state_for_session(&options.state_mount, verified.envelope.session_id)?;
     let current = protocol::require_current_envelope(&verified).is_ok();
-    if current
-        || probe
-            .as_ref()
-            .is_some_and(|probe| probe.state.installation_complete)
-    {
-        return Ok(Some(Claimed { bytes, verified }));
+    let completed = probe
+        .as_ref()
+        .is_some_and(|probe| probe.state.installation_complete);
+    // The probe of this session stays mounted: the marker sits beside it.
+    let started = completed && storage::setup_claim_started(&options.state_mount);
+    let retained = Claimed { bytes, verified };
+    match retained_choice(current, completed, started) {
+        RetainedChoice::Resume => Ok(Retained::Resume(retained)),
+        RetainedChoice::ClaimThenStart => Ok(Retained::Installed(retained)),
+        RetainedChoice::Claim => {
+            info!("the retained Nest setup has ended; this server is claimed again");
+            storage::release_state_probe(&options.state_mount)?;
+            Ok(Retained::None)
+        }
     }
-    info!("the retained Nest setup has ended; this server is claimed again");
-    storage::release_state_probe(&options.state_mount)?;
-    Ok(None)
 }
 
 pub(super) struct ClaimContext<'a> {
@@ -175,6 +244,8 @@ pub(super) struct ClaimContext<'a> {
     pub status: &'a SetupStatusReporter,
     pub hardware: &'a Hardware,
     pub tick: Duration,
+    /// When this server, which already runs a Nest, starts it unclaimed.
+    pub starts_installed_at: Option<DateTime<Utc>>,
 }
 
 impl ClaimContext<'_> {
@@ -188,6 +259,7 @@ impl ClaimContext<'_> {
                 url,
                 retry_at: None,
                 organization: None,
+                starts_installed_at: self.starts_installed_at,
             },
         );
     }
@@ -250,6 +322,7 @@ pub(super) async fn claim(context: &ClaimContext<'_>) -> Result<Claimed> {
                             url: url.as_deref(),
                             retry_at: None,
                             organization: None,
+                            starts_installed_at: context.starts_installed_at,
                         },
                     ),
                     Answer::Backoff { retry_at } => context.status.claim(
@@ -261,6 +334,7 @@ pub(super) async fn claim(context: &ClaimContext<'_>) -> Result<Claimed> {
                             url: url.as_deref(),
                             retry_at: Some(retry_at),
                             organization: None,
+                            starts_installed_at: context.starts_installed_at,
                         },
                     ),
                     Answer::Claimed {
@@ -277,6 +351,7 @@ pub(super) async fn claim(context: &ClaimContext<'_>) -> Result<Claimed> {
                                 url: url.as_deref(),
                                 retry_at: None,
                                 organization: Some(&organization),
+                                starts_installed_at: None,
                             },
                         );
                         let verified = verify_claimed(context, &envelope, session_id)?;
@@ -319,6 +394,21 @@ pub(super) async fn claim(context: &ClaimContext<'_>) -> Result<Claimed> {
                 context.wait(retry_ticks(failures, rate_limited)).await;
             }
         }
+    }
+}
+
+/// `claim`, but only until `deadline`: `None` when nobody claimed this
+/// server in time. A network that is down does not stop the clock. A claim
+/// this boot already holds wins even after the deadline.
+pub(super) async fn claim_until(
+    context: &ClaimContext<'_>,
+    deadline: DateTime<Utc>,
+) -> Result<Option<Claimed>> {
+    let remaining = (deadline - Utc::now()).to_std().unwrap_or_default();
+    tokio::select! {
+        biased;
+        claimed = claim(context) => claimed.map(Some),
+        () = tokio::time::sleep(remaining) => Ok(None),
     }
 }
 
@@ -831,6 +921,32 @@ impl RunStore {
         };
         let body = serde_json::to_vec(&stored).context("serialize setup registration")?;
         storage::atomic_write(&self.dir.join(REGISTRATION_FILE), &body, 0o600)
+    }
+
+    /// When a server that already runs a Nest starts it unclaimed: counted
+    /// from this boot's first claim screen and kept across service restarts.
+    /// `forget` keeps it; a damaged or implausibly late time starts again.
+    pub(super) fn starts_installed_at(
+        &self,
+        now: DateTime<Utc>,
+        wait: chrono::Duration,
+    ) -> Result<DateTime<Utc>> {
+        self.prepare()?;
+        let path = self.dir.join(STARTS_INSTALLED_FILE);
+        if exists(&path)? {
+            let kept = super::read_bounded_nofollow(&path, 64, "setup claim deadline")
+                .ok()
+                .and_then(|body| String::from_utf8(body).ok())
+                .and_then(|text| DateTime::parse_from_rfc3339(text.trim()).ok())
+                .map(|at| at.with_timezone(&Utc))
+                .filter(|at| *at <= now + wait);
+            if let Some(at) = kept {
+                return Ok(at);
+            }
+        }
+        let at = now + wait;
+        storage::atomic_write(&path, at.to_rfc3339().as_bytes(), 0o600)?;
+        Ok(at)
     }
 
     pub(super) fn save_envelope(&self, envelope: &[u8]) -> Result<()> {

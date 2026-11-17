@@ -465,6 +465,7 @@ impl Harness {
             status: &self.status,
             hardware: &self.hardware,
             tick: Duration::from_micros(100),
+            starts_installed_at: None,
         }
     }
 
@@ -828,4 +829,189 @@ async fn a_revoked_setup_is_recognised_by_its_vanished_registration() {
     server.abort();
     harness.store.forget().unwrap();
     assert!(!registration_gone(&harness.context()).await);
+}
+
+#[test]
+fn a_nest_that_has_started_is_offered_for_a_claim_before_it_starts_again() {
+    use RetainedChoice::*;
+    // (setup window open, installation completed, installed Nest started)
+    let cases = [
+        // Completed, never started: the firmware came back to the ISO right
+        // after the installation, so the installed Nest starts at once.
+        ((true, true, false), Resume),
+        ((false, true, false), Resume),
+        // Completed and started: a new claim first, whether or not the old
+        // setup window is still open.
+        ((true, true, true), ClaimThenStart),
+        ((false, true, true), ClaimThenStart),
+        // Interrupted installations behave as before.
+        ((true, false, false), Resume),
+        ((false, false, false), Claim),
+    ];
+    for ((current, completed, started), expected) in cases {
+        assert_eq!(
+            retained_choice(current, completed, started),
+            expected,
+            "{current} {completed} {started}"
+        );
+    }
+}
+
+#[test]
+fn the_start_deadline_survives_a_service_restart() {
+    let dir = TempDir::new();
+    let store = RunStore::new(dir.0.join("claim"));
+    let wait = chrono::Duration::minutes(10);
+    let first = Utc::now();
+    let deadline = store.starts_installed_at(first, wait).unwrap();
+    assert_eq!(deadline, first + wait);
+    let path = dir.0.join("claim").join(STARTS_INSTALLED_FILE);
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    // A restarted service, minutes later and after forgetting a vanished
+    // registration, keeps the first claim screen's deadline.
+    store.forget().unwrap();
+    let later = first + chrono::Duration::minutes(4);
+    assert_eq!(store.starts_installed_at(later, wait).unwrap(), deadline);
+    let past = first + chrono::Duration::minutes(12);
+    assert_eq!(store.starts_installed_at(past, wait).unwrap(), deadline);
+    // A damaged or implausibly late deadline starts the wait again.
+    fs::write(&path, b"soon").unwrap();
+    assert_eq!(
+        store.starts_installed_at(later, wait).unwrap(),
+        later + wait
+    );
+    fs::write(&path, (later + chrono::Duration::hours(2)).to_rfc3339()).unwrap();
+    assert_eq!(
+        store.starts_installed_at(later, wait).unwrap(),
+        later + wait
+    );
+}
+
+#[tokio::test]
+async fn an_unclaimed_nest_starts_the_installed_one_at_its_deadline() {
+    let id = Uuid::new_v4();
+    let dir = TempDir::new();
+    let status_path = dir.0.join("setup/status.json");
+    let (origin, fake, server) = fake_manage(
+        vec![
+            (StatusCode::CREATED, claimable(id)),
+            (StatusCode::OK, backoff(id)),
+        ],
+        Some(status_path.clone()),
+    )
+    .await;
+    let mut harness = Harness::new(origin);
+    harness.status = SetupStatusReporter::new(Some(status_path.clone()));
+    harness.status_path = status_path;
+    let deadline = Utc::now() + chrono::Duration::milliseconds(300);
+    let mut context = harness.context();
+    context.starts_installed_at = Some(deadline);
+    let started = std::time::Instant::now();
+    assert!(claim_until(&context, deadline).await.unwrap().is_none());
+    assert!(started.elapsed() >= Duration::from_millis(250));
+    let seen = fake.lock().unwrap().seen.clone();
+    server.abort();
+    let at = json!(deadline.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+    // Every waiting state says when the installed Nest starts.
+    assert_eq!(
+        seen[0].screen.as_ref().unwrap()["claim"]["state"],
+        "connecting"
+    );
+    assert_eq!(
+        seen[0].screen.as_ref().unwrap()["claim"]["starts_installed_at"],
+        at
+    );
+    assert_eq!(
+        seen[1].screen.as_ref().unwrap()["claim"]["state"],
+        "claimable"
+    );
+    assert_eq!(
+        seen[1].screen.as_ref().unwrap()["claim"]["starts_installed_at"],
+        at
+    );
+    assert_eq!(
+        seen[2].screen.as_ref().unwrap()["claim"]["state"],
+        "backoff"
+    );
+    assert_eq!(
+        seen[2].screen.as_ref().unwrap()["claim"]["starts_installed_at"],
+        at
+    );
+
+    // A network that is down does not stop the clock.
+    let harness = Harness::new("http://127.0.0.1:9".to_string());
+    let deadline = Utc::now() + chrono::Duration::milliseconds(100);
+    assert!(
+        claim_until(&harness.context(), deadline)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn a_claim_before_the_deadline_wins() {
+    let id = Uuid::new_v4();
+    let session = Uuid::new_v4();
+    let bytes = envelope(session, 30);
+    let (origin, _, server) = fake_manage(
+        vec![
+            (StatusCode::CREATED, claimable(id)),
+            (StatusCode::OK, claimed(id, session, &bytes)),
+        ],
+        None,
+    )
+    .await;
+    let harness = Harness::new(origin);
+    let deadline = Utc::now() + chrono::Duration::minutes(10);
+    let mut context = harness.context();
+    context.starts_installed_at = Some(deadline);
+    let claimed = claim_until(&context, deadline).await.unwrap().unwrap();
+    server.abort();
+    assert_eq!(claimed.bytes, bytes);
+    assert_eq!(claimed.verified.envelope.session_id, session);
+    // The claimed screen no longer announces a start.
+    assert!(
+        harness.screen()["claim"]
+            .get("starts_installed_at")
+            .is_none()
+    );
+
+    // A claim this boot already holds wins after a restart, even past the
+    // deadline.
+    let late = Utc::now() - chrono::Duration::seconds(1);
+    let claimed = claim_until(&harness.context(), late)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.bytes, bytes);
+}
+
+/// Not claimed in time, the generic ISO starts the installed Nest exactly as
+/// the completed-install path does: `prepare_verified` with the retained
+/// envelope, which resumes that same session's completed STATE.
+#[test]
+fn the_timer_path_starts_the_installed_nest_with_the_retained_envelope() {
+    let source = include_str!("../setup_claim.rs");
+    let branch = source
+        .split_once("Retained::Installed(installed) => {")
+        .unwrap()
+        .1
+        .split_once("Retained::None =>")
+        .unwrap()
+        .0;
+    let started = branch
+        .split_once("let Some(claimed) = claim_until(&context, deadline).await? else {")
+        .unwrap()
+        .1
+        .split_once("};")
+        .unwrap()
+        .0;
+    assert!(started.contains("super::prepare_verified("));
+    assert!(started.contains("installed.verified,"));
+    assert!(started.contains("Some(&installed.bytes),"));
+    assert!(branch.find("release_state_probe").unwrap() < branch.find("claim_until").unwrap());
 }

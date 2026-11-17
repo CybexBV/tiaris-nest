@@ -203,7 +203,8 @@ pub enum ClaimState {
 
 /// Exactly the fields its state allows: `letters` and `code` only while
 /// `claimable`, `retry_at` only in `backoff`, `organization` only when
-/// `claimed`, `url` whenever Management has answered.
+/// `claimed`, `url` whenever Management has answered, `starts_installed_at`
+/// only while `connecting`, `claimable` or `backoff`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ClaimStatus {
     pub state: ClaimState,
@@ -217,6 +218,10 @@ pub struct ClaimStatus {
     pub retry_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub organization: Option<String>,
+    /// This server already runs a Nest: the ISO starts it at this time
+    /// unless it is claimed. Only while waiting for a claim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub starts_installed_at: Option<String>,
 }
 
 /// What the claim loop knows; `claim_status` drops what the state forbids.
@@ -227,6 +232,7 @@ pub(super) struct ClaimView<'a> {
     pub url: Option<&'a str>,
     pub retry_at: Option<chrono::DateTime<Utc>>,
     pub organization: Option<&'a str>,
+    pub starts_installed_at: Option<chrono::DateTime<Utc>>,
 }
 
 pub(super) fn claim_status(view: &ClaimView<'_>) -> ClaimStatus {
@@ -249,6 +255,15 @@ pub(super) fn claim_status(view: &ClaimView<'_>) -> ClaimStatus {
             .filter(|_| view.state == ClaimState::Backoff)
             .map(timestamp),
         organization: only(ClaimState::Claimed, view.organization),
+        starts_installed_at: view
+            .starts_installed_at
+            .filter(|_| {
+                matches!(
+                    view.state,
+                    ClaimState::Connecting | ClaimState::Claimable | ClaimState::Backoff
+                )
+            })
+            .map(timestamp),
     }
 }
 
