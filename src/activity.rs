@@ -164,9 +164,6 @@ async fn busy_reasons(state: &AppState, now: DateTime<Utc>) -> Vec<&'static str>
         Ok(_) => busy.push("building_apps"),
         Err(_) => busy.push("activity_unknown"),
     }
-    if state.netboot_multicast.transfer_active().await {
-        busy.push("multicast_transfer");
-    }
     busy.dedup();
     busy
 }

@@ -11,12 +11,12 @@ use axum::{
     http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode, Uri, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::get,
 };
 use serde::Deserialize;
 use tower_http::trace::TraceLayer;
 
-use crate::{AppState, netboot, netboot_multicast};
+use crate::{AppState, netboot};
 
 const REQUEST_BODY_LIMIT_BYTES: usize = 1024;
 const CONTENT_SECURITY_POLICY: &str = concat!(
@@ -50,14 +50,6 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/files/*path", get(files::boot_file))
         .route("/cache/*path", get(files::cache_file))
-        .route(
-            "/netboot/:bundle_sha256/nix-store.squashfs/multicast",
-            post(netboot_multicast::discover),
-        )
-        .route(
-            "/netboot/:bundle_sha256/nix-store.squashfs/multicast/result",
-            post(netboot_multicast::record_result),
-        )
         .route(
             "/netboot/:bundle_sha256/:component",
             get(netboot::serve_component),
