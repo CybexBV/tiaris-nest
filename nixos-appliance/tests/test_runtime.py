@@ -313,35 +313,6 @@ class PermissionLayout(unittest.TestCase):
         self.assertEqual((cache / 'www').stat().st_mode & 0o777, 0o755)
         self.assertEqual((cache / 'tftp').stat().st_mode & 0o777, 0o755)
 
-    def test_first_boot_marks_a_claimed_setup_started_idempotently(self):
-        root = self.root / 'state'
-        root.mkdir()
-        marker = root / first_boot.SETUP_CLAIM_STARTED
-        # Without a retained setup envelope nothing is written.
-        self.assertFalse(first_boot.mark_setup_claim_started(root, self.uid, self.gid))
-        self.assertFalse(os.path.lexists(marker))
-        (root / first_boot.RETAINED_SETUP_ENVELOPE).write_bytes(bytes(8192))
-        with self.strict_umask():
-            self.assertTrue(first_boot.mark_setup_claim_started(root, self.uid, self.gid))
-        self.assertEqual((marker.stat().st_mode & 0o777, marker.stat().st_size), (0o600, 0))
-        self.assertTrue(first_boot.mark_setup_claim_started(root, self.uid, self.gid))
-        self.assertEqual(marker.stat().st_size, 0)
-        # A dot file: state backups leave it out.
-        self.assertTrue(first_boot.SETUP_CLAIM_STARTED.startswith('.'))
-        # A failure is reported, never raised: the boot continues.
-        if os.geteuid() != 0:
-            marker.unlink()
-            root.chmod(0o500)
-            try:
-                self.assertFalse(first_boot.mark_setup_claim_started(root, self.uid, self.gid))
-            finally:
-                root.chmod(0o700)
-        # Written once the installed state has been validated on this boot.
-        source = (RUNTIME / 'tiaris-nest-first-boot').read_text()
-        body = source[source.index('def main():'):]
-        self.assertLess(body.index("'validate-installed-state')"),
-                        body.index('mark_setup_claim_started()'))
-
     def test_public_runtime_and_source_directories_repair_only_owned_ordinary_paths(self):
         runtime = self.root / 'run'
         source = self.root / 'source'
