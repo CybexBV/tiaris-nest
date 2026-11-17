@@ -7,7 +7,6 @@ let
   placeholder = pkgs.runCommand "nest-console-evaluation-placeholder" { version = "0.0.0"; } "mkdir -p $out";
   appliance = {
     package = placeholder;
-    udpcast = placeholder;
     sourceArchive = placeholder;
     sourceArchiveFile = placeholder;
     migrations = placeholder;

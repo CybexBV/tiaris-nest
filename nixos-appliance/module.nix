@@ -2,7 +2,7 @@
 let
   cfg = config.services.tiaris-nest;
   a = cfg.appliance;
-  runtime = import ./runtime.nix { inherit pkgs; inherit (a) package udpcast; };
+  runtime = import ./runtime.nix { inherit pkgs; inherit (a) package; };
   ipxe = pkgs.ipxe.override { additionalTargets."bin-x86_64-efi/snponly.efi" = null; };
   command = name: "${runtime}/bin/tiaris-nest-${name}";
   publicKey = pkgs.writeText "nest-release-public-key" (a.releasePublicKey + "\n");
@@ -62,7 +62,7 @@ in {
     networking.useDHCP = false;
     networking.useNetworkd = true;
     networking.networkmanager.enable = lib.mkForce false;
-    networking.firewall.enable = false; # owned atomic nftables SSH policy, PXE/multicast stay reachable
+    networking.firewall.enable = false; # owned atomic nftables SSH policy, PXE stays reachable
     systemd.network.enable = true;
     services.resolved.enable = true;
     services.timesyncd.enable = true;
@@ -111,7 +111,7 @@ in {
     # Include daemon-side builders in diagnostics. No throttling/OOM limits:
     # smaller budgets require the performance qualification gate first.
     systemd.services.nix-daemon.serviceConfig.MemoryAccounting = true;
-    environment.systemPackages = [ a.package runtime a.udpcast pkgs.iproute2 pkgs.iputils pkgs.curl pkgs.jq pkgs.nftables pkgs.dnsmasq pkgs.openssh pkgs.python3 pkgs.tftp-hpa ];
+    environment.systemPackages = [ a.package runtime pkgs.iproute2 pkgs.iputils pkgs.curl pkgs.jq pkgs.nftables pkgs.dnsmasq pkgs.openssh pkgs.python3 pkgs.tftp-hpa ];
     # The privileged supervisor intentionally refuses symlink configuration.
     environment.etc."tiaris-nest/pxe-discovery.json" = { text = ''{"mode":"automatic"}''; mode = "0644"; };
     services.openssh = {
@@ -169,7 +169,8 @@ in {
         ln -sfn ${a.package}/bin/tiaris-nest /usr/bin/tiaris-nest
         ln -sfn ${a.package}/bin/tiaris-nest-bootstrap /usr/lib/tiaris-nest/tiaris-nest-bootstrap
         ln -sfn ${pkgs.nix}/bin/nix /usr/bin/nix
-        ln -sfn ${a.udpcast}/bin/udp-sender /usr/bin/udp-sender
+        # The retired multicast sender; Nests installed before its removal keep the link.
+        rm -f /usr/bin/udp-sender
         ln -sfn ${pkgs.iproute2}/bin/ip /usr/sbin/ip
         ln -sfn ${pkgs.dnsmasq}/bin/dnsmasq /usr/sbin/dnsmasq
         for program in ${runtime}/bin/*; do ln -sfn "$program" "/usr/lib/tiaris-nest/$(basename "$program")"; done
@@ -217,7 +218,7 @@ in {
         // (if (a.usbInstaller or null) != null then { TIARIS_NEST_USB_INSTALLER_DIR = toString a.usbInstaller; } else { });
       # vulnix scans update candidates (src/software_updates/findings.rs); its
       # NVD database is cached in /var/lib/tiaris-nest/state/agent/vulnix.
-      path = [ pkgs.nix pkgs.git pkgs.openssh pkgs.coreutils pkgs.iproute2 pkgs.systemd a.udpcast pkgs.vulnix ];
+      path = [ pkgs.nix pkgs.git pkgs.openssh pkgs.coreutils pkgs.iproute2 pkgs.systemd pkgs.vulnix ];
       serviceConfig = { MemoryAccounting = true; Type = "notify"; NotifyAccess = "all"; WatchdogSec = "30s"; User = "tiaris-nest"; Group = "tiaris-nest"; ExecStart = "${a.package}/bin/tiaris-nest --config /etc/tiaris-nest/config.toml serve"; Restart = "always"; RestartSec = "3s"; UMask = "0077"; NoNewPrivileges = true; PrivateTmp = true; PrivateDevices = true; ProtectSystem = "strict"; ProtectHome = true; ProtectKernelTunables = true; ProtectKernelModules = true; ProtectControlGroups = true; CapabilityBoundingSet = ""; AmbientCapabilities = ""; RestrictAddressFamilies = [ "AF_UNIX" "AF_INET" "AF_INET6" "AF_NETLINK" ]; ReadWritePaths = [ "/var/lib/tiaris-nest/state/agent" "/var/lib/tiaris-nest/state/inbox" "/var/cache/tiaris-nest" "/run/lock/tiaris-nest/maintenance.lock" "/run/tiaris-nest" ];
         # Public console projection (console-status.json, 0644) for the root
         # tty1 kiosk. Preserved across restarts so a stopped daemon leaves a
