@@ -6,8 +6,6 @@ Every operation uses the Owner's live confinement checks and pinned TLS transpor
 from __future__ import annotations
 
 import argparse
-import base64
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -118,29 +116,11 @@ class Server:
             return {'owner': receipt['owner'], 'bridge': receipt['context']['bridge'],
                     'origin': receipt['manage_origin'], 'peer_ipv4': receipt['peer_ipv4'],
                     'certificate_sha256': receipt['certificate_sha256']}
-        if operation == 'installer_transports' and set(value) == {'operation', 'manifest_sha256'}:
-            receipt = self.owner.verify()
-            selected = receipt['selected_release']
-            if value['manifest_sha256'] != receipt['releases'][selected]['manifest_sha256']:
-                raise ValueError('closure request does not match the selected authenticated release')
-            transports = receipt['artifact_transports']['releases'][selected]
-            return {key: transports[key] for key in ('package_transport_url', 'installer_iso_transport_url')}
-        if operation == 'personalize' and set(value) == {'operation', 'path', 'secret'}:
-            import re
-            if not re.fullmatch(r'/v1/nest/provisioning-sessions/[0-9a-f-]{36}/personalization-envelope', value['path']):
-                raise ValueError('invalid personalization endpoint')
-            receipt = self.owner.verify()
-            from isolated_manage_config import read_file
-            token = read_file(self.owner.state / 'session').decode().strip()
-            response_headers = {}
-            body = self.owner.client(receipt).request_bytes(value['path'], token=token,
-                headers={'X-Tiaris-Nest-Provisioning-Secret': value['secret']}, response_headers=response_headers)
-            if len(body) != 8192:
-                raise ValueError('personalization envelope has an invalid length')
-            digest = response_headers.get('x-tiaris-nest-envelope-sha256')
-            if digest != hashlib.sha256(body).hexdigest():
-                raise ValueError('personalization response does not bind its envelope digest')
-            return {'body': base64.b64encode(body).decode(), 'envelope_sha256': digest}
+        if operation == 'claim_setup' and set(value) == {'operation', 'label', 'manifest_sha256'}:
+            # The generic ISO's claim code exists only on the guest's screen and
+            # in the fixture's own database. The Owner reads it there and claims
+            # it; the code never leaves this process.
+            return self.owner.claim_setup(value['label'], value['manifest_sha256'])
         if operation == 'public_origin' and set(value) == {'operation'}:
             # The fixture origin and the name its Manage currently serves as
             # TIARIS_PUBLIC_API_URL (they differ after switch_public_origin).
@@ -171,12 +151,10 @@ class Server:
 def main():
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument('--state-dir', type=Path, required=True)
-    parser.add_argument('operation', choices=('api', 'personalize', 'allow-device', 'installer-transports',
-                                              'verify-artifacts'))
+    parser.add_argument('operation', choices=('api', 'claim-setup', 'allow-device', 'verify-artifacts'))
     parser.add_argument('--path')
     parser.add_argument('--body')
-    parser.add_argument('--output', type=Path)
-    parser.add_argument('--headers-output', type=Path)
+    parser.add_argument('--label')
     parser.add_argument('--session-id')
     parser.add_argument('--manifest-sha256')
     args = parser.parse_args()
@@ -185,16 +163,9 @@ def main():
                                  body=json.loads(args.body) if args.body else None)))
     elif args.operation == 'verify-artifacts':
         request(args.state_dir, 'verify_artifacts')
-    elif args.operation == 'installer-transports':
-        print(json.dumps(request(args.state_dir, 'installer_transports', manifest_sha256=args.manifest_sha256)))
-    elif args.operation == 'personalize':
-        secret = sys.stdin.readline(8193).strip()
-        result = request(args.state_dir, 'personalize', path=args.path, secret=secret)
-        body = base64.b64decode(result['body'], validate=True)
-        with args.output.open('xb') as stream:
-            stream.write(body)
-        with args.headers_output.open('x') as stream:
-            stream.write('x-tiaris-nest-envelope-sha256: ' + result['envelope_sha256'] + '\n')
+    elif args.operation == 'claim-setup':
+        print(json.dumps(request(args.state_dir, 'claim_setup', label=args.label,
+                                 manifest_sha256=args.manifest_sha256)))
     else:
         request(args.state_dir, 'allow_device', session_id=args.session_id)
 

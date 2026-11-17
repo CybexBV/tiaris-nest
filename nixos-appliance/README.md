@@ -241,9 +241,8 @@ shutdown entries are removed; the tty1 screen needs no basic-graphics entry
 because it falls back to text without DRM. `/TIARIS_PROVISIONING.BIN` is an ordinary
 uncompressed ISO9660 file consisting of exactly 8192 zero bytes in one extent.
 Derive its offset from final xorriso LBA metadata, reopen its exact bytes, and
-export slot identity. Customers' servers keep the slot all zeros and are
-claimed; only release qualification still personalizes it, changing only those
-bytes. Test HTTP ranges at both edges and compare the rest of the image. Keep an arping-capable binary
+export slot identity. The slot stays all zeros and every server is claimed,
+release qualification's too. Test HTTP ranges at both edges and compare the rest of the image. Keep an arping-capable binary
 in the live image for static-address safety checks.
 
 New `tiaris.nest.install-plan.v3` preserves every V2 field name, including
@@ -521,7 +520,7 @@ an explicit development Tiaris origin and private untracked evidence. Reject a
 production origin before any VM/API mutation. Existing lab appliances are not
 qualification fixtures. Never use a host reset as evidence of automatic rollback.
 
-Required real scenarios: personalized-media install/identity/Ready; untouched disk
+Required real scenarios: generic-ISO claim, install/identity/Ready; untouched disk
 on preflight failure and same-media retry; interrupted install resume; workstation
 PXE/runtime/install/adoption/Blueprint; window and Update now updates,
 holds/schedules and retention; failing-service, failed-health and nonbooting

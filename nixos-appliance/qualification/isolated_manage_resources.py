@@ -60,6 +60,9 @@ def environment(config, secrets, release, transports, db_password, ssh_ca, proxy
         'TIARIS_NEST_COMPATIBILITY_PROJECTION_SHA256': release['compatibility_sha256'],
         'TIARIS_DEV_NEST_RELEASE_MANIFEST_TRANSPORT_URL': transports['manifest_transport_url'],
         'TIARIS_DEV_NEST_WORKSTATION_TRANSPORT_URL': transports['bundle_transport_url'],
+        # A claimed setup downloads the published closure from the fixture's
+        # private copy; Manage uses it only for that exact signed archive.
+        'TIARIS_DEV_NEST_APPLIANCE_CLOSURE_TRANSPORT_URL': transports['package_transport_url'],
     }
     if proxy_url:
         values.update(HTTPS_PROXY=proxy_url, https_proxy=proxy_url,

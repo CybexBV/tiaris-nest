@@ -166,7 +166,7 @@ isolated Tiaris configuration described in
 [`PRODUCTION.md`](../../nixos-appliance/qualification/PRODUCTION.md). Configure
 its exact production origin, fixture template, private state root and disjoint
 subnet. The runner builds the candidate's committed Tiaris source into disposable
-images and retains the verified Owner for every API and personalization request.
+images and retains the verified Owner for every API request and the setup claim.
 It does not use an external production session or a development admission helper.
 
 The initial V3 qualification requires

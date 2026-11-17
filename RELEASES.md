@@ -265,7 +265,7 @@ cache root are all configured. The wrapper re-resolves published ancestry,
 compares it with `tiaris-nest-build-predecessor.json`, authenticates the signed
 metadata, and runs the existing complete predecessor verifier on every hit and
 miss. It caches immutable transport bytes only. It never caches a successful
-installation, VM disk, database, personalized ISO, session, acceptance receipt
+installation, VM disk, database, session, acceptance receipt
 or cold-download result. Cache outputs are independent read-only copies; the
 publication gate still resolves ancestry again.
 
@@ -277,20 +277,16 @@ supports only the network-enabled `--mode github-warm`; `cache --mode
 candidate-only` remains unsupported. There is no supported offline/no-fetch
 cache execution mode.
 
-The `nixos-appliance/qualification/` harness requires explicit development
-origin, private token file, root-owned state root and a new isolated subnet.
-It creates its own bridge, TAPs and disposable QEMU disks; it refuses existing
-lab adoption. Despite its retained workflow filename,
-`run-production-qualification.py` does not contact production or copy a
-production database. Required environment inputs are
-`TIARIS_NEST_QUALIFICATION_MANAGE_ORIGIN`, `TIARIS_NEST_QUALIFICATION_TOKEN_FILE`,
-`TIARIS_NEST_QUALIFICATION_STATE_ROOT` and `TIARIS_NEST_QUALIFICATION_SUBNET`.
-The workflow also requires `TIARIS_NEST_QUALIFICATION_MANAGE_CHECKOUT` and a
-root-owned `TIARIS_NEST_QUALIFICATION_ALLOW_DEVICE_HELPER`. It captures fresh
-inventory before disk approval, pauses the owned guest, admits only the newly
-reserved fixture ID, then resumes the guest. Cleanup removes only its recorded
-allowlist addition. These six inputs belong to the protected
-`nest-nixos-development-qualification` environment.
+The `nixos-appliance/qualification/` harness installs only against the isolated
+Manage fixture (`--isolated-manage-config`, see
+`nixos-appliance/qualification/PRODUCTION.md`): the guest boots the generic
+ISO and the fixture claims it with the code from its own database, so an
+external development Manage, its token file and device-admission helper can no
+longer install a candidate. It creates its own bridge, TAPs and disposable QEMU
+disks; it refuses existing lab adoption. Despite its retained workflow
+filename, `run-production-qualification.py` does not contact production or copy
+a production database. It captures fresh inventory before disk approval and
+admits only the newly reserved fixture ID.
 
 Acceptance binds closure, toplevel, generation, source, permanent identity and
 observed reboot. Rollback must be appliance-initiated; a host reset never counts.

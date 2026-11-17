@@ -317,57 +317,72 @@ class ProductionTests(unittest.TestCase):
         self.assertEqual(server.dispatch({'operation': 'api', 'path': '/v1/health', 'body': None}), {'status': 'ok'})
         for invalid in ({'operation': 'shell', 'command': 'true'},
                         {'operation': 'api', 'path': '/v1/health', 'body': None, 'token': 'foreign'},
-                        {'operation': 'personalize', 'path': 'https://manage.cybex.net', 'secret': 'test'}):
+                        {'operation': 'personalize', 'path': 'https://manage.cybex.net', 'secret': 'test'},
+                        {'operation': 'installer_transports', 'manifest_sha256': 'a' * 64},
+                        {'operation': 'claim_setup', 'label': 'qualification'}):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 server.dispatch(invalid)
         self.assertEqual(owner.api.call_count, 1)
         owner.client.assert_not_called()
 
-    def test_rpc_personalization_preserves_and_checks_response_digest(self):
-        rpc = load('isolated_manage_rpc')
-        import base64
-        with tempfile.TemporaryDirectory() as temporary:
-            state = Path(temporary)
-            (state / 'session').write_text('fixture-token')
-            (state / 'session').chmod(0o600)
-            owner = Mock(state=state)
-            server = object.__new__(rpc.Server)
-            server.owner = owner
-            body = b'x' * 8192
-            digest = hashlib.sha256(body).hexdigest()
-            response_digest = digest
-            def respond(*args, **kwargs):
-                kwargs['response_headers']['x-tiaris-nest-envelope-sha256'] = response_digest
-                return body
-            owner.client.return_value.request_bytes.side_effect = respond
-            request = {'operation': 'personalize',
-                       'path': '/v1/nest/provisioning-sessions/01234567-89ab-cdef-0123-456789abcdef/personalization-envelope',
-                       'secret': 'media-secret'}
-            with patch.object(sys, 'path', [str(HELPERS), *sys.path]), \
-                    patch('isolated_manage_config.read_file', return_value=b'fixture-token'):
-                result = server.dispatch(request)
-                self.assertEqual(base64.b64decode(result['body']), body)
-                self.assertEqual(result['envelope_sha256'], digest)
-                response_digest = '0' * 64
-                with self.assertRaisesRegex(ValueError, 'digest'):
-                    server.dispatch(request)
-
-    def test_rpc_closure_requires_selected_authenticated_manifest(self):
+    def test_rpc_claim_goes_only_through_the_retained_owner(self):
         rpc = load('isolated_manage_rpc')
         owner = Mock()
-        url = 'http://10.249.217.1:18082/closure.tar.zst'
-        owner.verify.return_value = {
-            'selected_release': 'predecessor',
-            'releases': {'predecessor': {'manifest_sha256': 'a' * 64}},
-            'artifact_transports': {'releases': {'predecessor': {'package_transport_url': url, 'installer_iso_transport_url': url + '.iso'}}},
-        }
+        owner.claim_setup.return_value = {'session': {'id': 'claimed'}}
         server = object.__new__(rpc.Server)
         server.owner = owner
-        self.assertEqual(server.dispatch({'operation': 'installer_transports', 'manifest_sha256': 'a' * 64}),
-                         {'package_transport_url': url, 'installer_iso_transport_url': url + '.iso'})
+        self.assertEqual(server.dispatch({'operation': 'claim_setup', 'label': 'qualification',
+                                          'manifest_sha256': 'a' * 64}), {'session': {'id': 'claimed'}})
+        owner.claim_setup.assert_called_once_with('qualification', 'a' * 64)
         with self.assertRaises(ValueError):
-            server.dispatch({'operation': 'installer_transports', 'manifest_sha256': 'b' * 64})
-        self.assertEqual(owner.verify.call_count, 2)
+            server.dispatch({'operation': 'claim_setup', 'label': 'qualification',
+                             'manifest_sha256': 'a' * 64, 'code': 'KX-4821-QM'})
+        owner.client.assert_not_called()
+
+    def test_owner_claims_the_selected_release_with_the_code_from_its_database(self):
+        manage = load('isolated_manage')
+        owner = object.__new__(manage.Owner)
+        owner.state = Path('/nonexistent-state')
+        owner.verify = Mock(return_value={'selected_release': 'candidate',
+                                          'releases': {'candidate': {'manifest_sha256': 'a' * 64}}})
+        owner.client = Mock()
+        owner.client.return_value.request.return_value = {'session': {'id': 'claimed'}}
+        with patch.object(manage.database, 'claim_code', return_value='KX-4821-QM') as code, \
+                patch.object(manage.inputs, 'read_file', return_value=b'fixture-token\n'):
+            self.assertEqual(owner.claim_setup('qualification', 'a' * 64), {'session': {'id': 'claimed'}})
+            owner.client.return_value.request.assert_called_once_with(
+                '/v1/nest/setup-registrations/claim', {'code': 'KX-4821-QM', 'label': 'qualification'},
+                'fixture-token')
+            # Another release would be installed: refused before reading a code.
+            code.reset_mock()
+            with self.assertRaisesRegex(ValueError, 'another release'):
+                owner.claim_setup('qualification', 'b' * 64)
+            code.assert_not_called()
+            # No guest is waiting yet: nothing is claimed.
+            code.return_value = None
+            owner.client.return_value.request.reset_mock()
+            self.assertIsNone(owner.claim_setup('qualification', 'a' * 64))
+            owner.client.return_value.request.assert_not_called()
+
+    def test_claim_code_reads_exactly_one_waiting_registration(self):
+        database = load('isolated_manage_database')
+        receipt = {'containers': {'db': {'id': 'db-id', 'image': 'db-image', 'uid': 999, 'mounts': [],
+                                         'peer': None}},
+                   'context': {'network_id': 'network'}, 'peer_ipv4': '10.249.217.1'}
+        for output, expected in ((b'', None), (b'KXQM 4821\n', 'KX-4821-QM'), (b'ABCD 10001\n', 'AB-10001-CD')):
+            with self.subTest(output=output):
+                owner = Mock()
+                owner.docker.return_value.call.return_value = output
+                self.assertEqual(database.claim_code(owner, receipt), expected)
+                arguments = owner.docker.return_value.call.call_args
+                self.assertEqual(arguments.args[:4], ('container', 'exec', '-i', 'db-id'))
+                self.assertEqual(arguments.kwargs['data'], database.CLAIMABLE.encode())
+                owner.docker.return_value.verify_container.assert_called_once()
+        for output in (b'KXQM 4821\nABCD 1234\n', b'KXQI 4821\n', b'KXQM 482\n', b'KXQM\n'):
+            with self.subTest(output=output), self.assertRaises(ValueError):
+                owner = Mock()
+                owner.docker.return_value.call.return_value = output
+                database.claim_code(owner, receipt)
 
     def test_rollback_gate_target_comes_from_live_authenticated_owner(self):
         rpc = load('isolated_manage_rpc')
