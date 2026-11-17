@@ -80,7 +80,7 @@ class Transport:
         self.connector = connector
 
     @staticmethod
-    def read(connection, response_headers=None):
+    def read(connection):
         response = connection.getresponse()
         body = response.read(MAXIMUM + 1)
         if (len(body) > MAXIMUM
@@ -89,8 +89,6 @@ class Transport:
             raise ManageHTTPError(response.status, 'response_refused')
         if not 200 <= response.status < 300:
             raise ManageHTTPError.from_response(response.status, body)
-        if response_headers is not None:
-            response_headers.update({key.lower(): value for key, value in response.getheaders()})
         return body
 
     def connection(self):
@@ -124,28 +122,20 @@ class Transport:
             raw.close()
             raise
 
-    def request_bytes(self, path, body=None, token=None, headers=None, response_headers=None):
+    def request_bytes(self, path, body=None, token=None):
         if (not isinstance(path, str) or not path.startswith('/v1/') or '\\' in path
                 or any(ord(c) < 33 or ord(c) > 126 for c in path) or '#' in path):
             raise ValueError('isolated Tiaris API path is invalid')
         connection = self.connection()
         try:
-            extra = headers
             headers = {'Host': self.hostname, 'Content-Type': 'application/json', 'Connection': 'close'}
             if token is not None:
                 if not isinstance(token, str) or not token or any(ord(c) < 33 or ord(c) > 126 for c in token):
                     raise ValueError('invalid isolated fixture session')
                 headers['Authorization'] = 'Bearer ' + token
-            if extra:
-                if set(extra) != {'X-Tiaris-Nest-Provisioning-Secret'} or any(
-                        not isinstance(v, str) or not v or any(ord(c) < 33 or ord(c) > 126 for c in v)
-                        for v in extra.values()):
-                    raise ValueError('invalid isolated personalization header')
-                headers.update(extra)
             connection.request('GET' if body is None else 'POST', path,
                                body=None if body is None else json.dumps(body).encode(), headers=headers)
-            data = self.read(connection, response_headers)
-            return data
+            return self.read(connection)
         finally:
             connection.close()
 

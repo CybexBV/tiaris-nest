@@ -225,7 +225,8 @@ for mode in (0o444, 0o400, 0o600):
                 'encryption_key': 'fresh'}, {'manifest_url': 'https://github.com/exact',
                     'manifest_sha256': 'digest', 'version': '1.2.3', 'compatibility_sha256': 'compat'},
                 {'manifest_transport_url': 'http://10.99.17.1:18081/tiaris-nest-release.json',
-                 'bundle_transport_url': 'http://10.99.16.1:18082/workstation.tar.zst'},
+                 'bundle_transport_url': 'http://10.99.16.1:18082/workstation.tar.zst',
+                 'package_transport_url': 'http://10.99.16.1:18082/closure.tar.zst'},
                 'newpassword', 'newsshca', 'http://10.99.17.1:3128')
         self.assertNotIn('SMTP_PASSWORD', values)
         self.assertEqual(values['TIARIS_DATABASE_URL'], 'postgres://fixture:newpassword@db:5432/fixture')
@@ -235,6 +236,9 @@ for mode in (0o444, 0o400, 0o600):
         self.assertEqual(values['HTTPS_PROXY'], 'http://10.99.17.1:3128')
         self.assertEqual(values['TIARIS_DEV_NEST_RELEASE_MANIFEST_TRANSPORT_URL'],
                          'http://10.99.17.1:18081/tiaris-nest-release.json')
+        # A claimed setup downloads the closure from the fixture's private copy.
+        self.assertEqual(values['TIARIS_DEV_NEST_APPLIANCE_CLOSURE_TRANSPORT_URL'],
+                         'http://10.99.16.1:18082/closure.tar.zst')
 
 
 class GuardTests(unittest.TestCase):
@@ -546,6 +550,7 @@ class GuardTests(unittest.TestCase):
                 'TIARIS_NEST_COMPATIBILITY_PROJECTION_SHA256': 'old-projection',
                 'TIARIS_DEV_NEST_RELEASE_MANIFEST_TRANSPORT_URL': 'old-transport',
                 'TIARIS_DEV_NEST_WORKSTATION_TRANSPORT_URL': 'old-bundle',
+                'TIARIS_DEV_NEST_APPLIANCE_CLOSURE_TRANSPORT_URL': 'old-closure',
             }
             path = owner.directory / 'app.env'
             path.write_bytes(resources.env_body({'UNCHANGED': 'retained', **keys}))
@@ -561,6 +566,7 @@ class GuardTests(unittest.TestCase):
             self.assertIn('TIARIS_NEST_RELEASE_VERSION=1.2.3\n', body)
             self.assertIn('TIARIS_DEV_NEST_RELEASE_MANIFEST_TRANSPORT_URL=http://10.99.17.1:18083/tiaris-nest-release.json\n', body)
             self.assertIn('TIARIS_DEV_NEST_WORKSTATION_TRANSPORT_URL=http://10.99.16.1:18082/candidate-workstation.tar.zst\n', body)
+            self.assertIn('TIARIS_DEV_NEST_APPLIANCE_CLOSURE_TRANSPORT_URL=http://10.99.16.1:18082/candidate-closure.tar.zst\n', body)
             self.assertEqual(saved['files']['app.env']['sha256'], hashlib.sha256(body.encode()).hexdigest())
 
     def test_release_selection_resumes_only_same_durable_role_and_preserves_db(self):

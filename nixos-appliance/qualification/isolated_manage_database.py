@@ -89,3 +89,40 @@ def initialize(owner, receipt, config, resources):
     # APP_START verifies the installed schema and actual runtime role boundary
     # before it can open an API listener. Subsequent starts never migrate.
     docker.call('container', 'start', app)
+
+
+# The generic Nest ISO registers for a claim and shows its code only on the
+# server's screen; Manage stores it for the comparison. Only this disposable
+# fixture's own database is read, as its superuser over `docker exec`: no Manage
+# route or setting exposes a code, so production cannot be asked for one.
+CLAIMABLE = '''SELECT letters || ' ' || lookup_number FROM nest_setup_registrations
+WHERE claimed_at IS NULL AND letters IS NOT NULL AND lookup_number IS NOT NULL
+  AND last_seen_at > now() - interval '5 minutes'
+ORDER BY created_at;
+'''
+CLAIMABLE_ROW = re.compile(r'([ABCDEFGHJKMNPQRTVWXY]{4}) ([1-9][0-9]{3,4})')
+
+
+def claim_code(owner, receipt):
+    """The full code of the one Nest waiting for a claim, or None while none is.
+
+    More than one waiting Nest fails: the fixture owns exactly one guest, so a
+    second registration is not the qualification's server."""
+    docker = owner.docker(receipt)
+    spec = receipt['containers']['db']
+    docker.verify_container('db', spec['id'], spec['image'], spec['uid'],
+        receipt['context']['network_id'], spec['mounts'],
+        dns=receipt['peer_ipv4'], peer=spec['peer'])
+    output = docker.call('container', 'exec', '-i', spec['id'], '/usr/bin/psql', '-XAtq',
+        '-v', 'ON_ERROR_STOP=1', '-U', 'fixture', '-d', 'fixture', data=CLAIMABLE.encode())
+    rows = output.decode('ascii').split()
+    rows = [' '.join(rows[index:index + 2]) for index in range(0, len(rows), 2)]
+    if not rows:
+        return None
+    if len(rows) != 1:
+        raise ValueError('more than one Nest is waiting for a claim in the isolated fixture')
+    match = CLAIMABLE_ROW.fullmatch(rows[0])
+    if not match:
+        raise ValueError('the isolated fixture stored an invalid claim code')
+    letters, number = match.groups()
+    return f'{letters[:2]}-{number}-{letters[2:]}'

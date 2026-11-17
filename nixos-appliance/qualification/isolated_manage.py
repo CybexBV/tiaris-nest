@@ -545,6 +545,7 @@ class Owner:
             'TIARIS_NEST_COMPATIBILITY_PROJECTION_SHA256': release['compatibility_sha256'],
             'TIARIS_DEV_NEST_RELEASE_MANIFEST_TRANSPORT_URL': transports['manifest_transport_url'],
             'TIARIS_DEV_NEST_WORKSTATION_TRANSPORT_URL': transports['bundle_transport_url'],
+            'TIARIS_DEV_NEST_APPLIANCE_CLOSURE_TRANSPORT_URL': transports['package_transport_url'],
         }
         self.rewrite_app_environment(receipt, replacements)
 
@@ -694,6 +695,25 @@ class Owner:
         receipt = self.verify()
         token = inputs.read_file(self.state / 'session', maximum=8192).decode().strip()
         return self.client(receipt).request(path, body, token)
+
+    def claim_setup(self, label, manifest_sha256):
+        """Claim the owned guest's generic ISO with the code on its screen.
+
+        The fixture reads the code from its own database (`database.claim_code`)
+        and claims it with the full code, as an administrator elsewhere would.
+        Returns None while no guest is waiting. The claim installs the release
+        this Manage publishes, so it must be the one the caller qualifies."""
+        receipt = self.verify()
+        if manifest_sha256 != receipt['releases'][receipt['selected_release']]['manifest_sha256']:
+            raise ValueError('the claim would install another release than the one qualified')
+        if not isinstance(label, str) or not 0 < len(label) <= 120:
+            raise ValueError('invalid qualification setup label')
+        code = database.claim_code(self, receipt)
+        if code is None:
+            return None
+        token = inputs.read_file(self.state / 'session', maximum=8192).decode().strip()
+        return self.client(receipt).request('/v1/nest/setup-registrations/claim',
+                                            {'code': code, 'label': label}, token)
 
     def refuse_mounted_state(self):
         # Same-filesystem bind mounts retain st_dev. Check the kernel mount
