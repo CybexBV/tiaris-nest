@@ -233,7 +233,7 @@ mod tests {
             "/netboot/abc/nix-store.squashfs",
             "/cache/nar/x.nar.zst",
             "/files/x",
-            "/usb-installer/tiaris-usb-installer.img",
+            "/usb-installer/v1/boot",
             "/boot-session/x/context.cpio",
         ] {
             assert!(counts(path), "{path}");

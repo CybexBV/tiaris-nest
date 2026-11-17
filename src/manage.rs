@@ -128,6 +128,9 @@ const PEER_CONTRACT_MAX_AGE_SECONDS: i64 = 24 * 60 * 60;
 struct PeerContract {
     supports_scheduling: bool,
     accepts_uploads: bool,
+    /// Retired with the per-Nest USB stick: always false. Still written so
+    /// an older Nest that rolls back can load this saved contract.
+    #[serde(default)]
     accepts_usb_installer: bool,
     #[serde(default)]
     accepts_when_idle: bool,
@@ -224,10 +227,6 @@ struct AgentNestConfigResponse {
     /// so, Nest does not advertise it (an older Manage rejects the report).
     #[serde(default)]
     software_cache_upload_supported: bool,
-    /// Manage accepts `usb_installer_v1` in reports; until it says so, Nest
-    /// does not advertise it (an older Manage rejects the report).
-    #[serde(default)]
-    usb_installer_supported: bool,
     /// Manage accepts chunked state backup uploads
     /// (`POST /v1/agent/nest/state-backups/{id}/upload`); until it says so,
     /// Nest sends every backup in one request.
@@ -1070,7 +1069,7 @@ async fn sync_nest_foundation(
             let peer = PeerContract {
                 supports_scheduling: desired.update_schedule_supported,
                 accepts_uploads: desired.software_cache_upload_supported,
-                accepts_usb_installer: desired.usb_installer_supported,
+                accepts_usb_installer: false,
                 accepts_when_idle: desired.update_when_idle_supported,
                 accepts_state_backup_chunks: desired.state_backup_chunked_upload_supported,
                 accepts_site_check: desired.site_check_supported,
@@ -1107,7 +1106,6 @@ async fn sync_nest_foundation(
         peer.supports_scheduling,
         PeerReportSupport {
             uploads: peer.accepts_uploads,
-            usb_installer: peer.accepts_usb_installer,
             when_idle: peer.accepts_when_idle,
             site_check: peer.accepts_site_check,
             boot_machine_identity: peer.accepts_boot_machine_identity,
@@ -2833,7 +2831,6 @@ fn signed_request_with_digest(
 #[derive(Clone, Copy, Debug, Default)]
 struct PeerReportSupport {
     uploads: bool,
-    usb_installer: bool,
     when_idle: bool,
     site_check: bool,
     boot_machine_identity: bool,
@@ -2851,10 +2848,9 @@ fn nest_capabilities(
         &mut capabilities,
         peer_supports_scheduling && peer_support.when_idle,
     );
-    // The stick protocol always answers; the capability tells Manage that
-    // this Nest also has a stick image to download.
-    let usb_image = peer_support.usb_installer && crate::usb_installer::image_available();
-    push_peer_capabilities(&mut capabilities, peer_support.uploads, usb_image);
+    if peer_support.uploads {
+        capabilities.push(crate::software_cache_upload::CAPABILITY);
+    }
     if peer_support.site_check {
         capabilities.push(crate::site_check::CAPABILITY);
     }
@@ -2868,15 +2864,6 @@ fn nest_capabilities(
 fn push_when_idle_capability(capabilities: &mut Vec<&'static str>, supported: bool) {
     if supported && capabilities.contains(&crate::appliance::schedule::CAPABILITY) {
         capabilities.push(crate::appliance::schedule::WHEN_IDLE_CAPABILITY);
-    }
-}
-
-fn push_peer_capabilities(capabilities: &mut Vec<&'static str>, uploads: bool, usb_image: bool) {
-    if uploads {
-        capabilities.push(crate::software_cache_upload::CAPABILITY);
-    }
-    if usb_image {
-        capabilities.push(crate::usb_installer::CAPABILITY);
     }
 }
 
@@ -5122,7 +5109,6 @@ mod tests {
             serde_json::from_value(json!({"software_cache_upload_supported": true})).unwrap();
         let support = |desired: &AgentNestConfigResponse| PeerReportSupport {
             uploads: desired.software_cache_upload_supported,
-            usb_installer: desired.usb_installer_supported,
             when_idle: false,
             site_check: false,
             boot_machine_identity: false,
@@ -5148,7 +5134,6 @@ mod tests {
         assert!(newer.site_check_supported && newer.site_check.is_some());
         let support = |site_check| PeerReportSupport {
             uploads: false,
-            usb_installer: false,
             when_idle: false,
             site_check,
             boot_machine_identity: false,
@@ -5174,7 +5159,6 @@ mod tests {
         assert!(newer.boot_machine_identity_supported);
         let support = |boot_machine_identity| PeerReportSupport {
             uploads: false,
-            usb_installer: false,
             when_idle: false,
             site_check: false,
             boot_machine_identity,
@@ -5194,43 +5178,18 @@ mod tests {
     }
 
     #[test]
-    fn usb_installer_capability_requires_manage_support_and_an_image() {
-        // A Manage that does not know `usb_installer_v1` rejects the whole
-        // report; a Nest without the stick image has nothing to download.
-        let older: AgentNestConfigResponse = serde_json::from_value(json!({})).unwrap();
-        let newer: AgentNestConfigResponse =
-            serde_json::from_value(json!({"usb_installer_supported": true})).unwrap();
-        assert!(!older.usb_installer_supported);
-        assert!(newer.usb_installer_supported);
-        for (uploads, usb_image, expected) in [
-            (false, false, vec![]),
-            (false, true, vec![crate::usb_installer::CAPABILITY]),
-            (
-                true,
-                true,
-                vec![
-                    crate::software_cache_upload::CAPABILITY,
-                    crate::usb_installer::CAPABILITY,
-                ],
-            ),
-        ] {
-            let mut capabilities = Vec::new();
-            push_peer_capabilities(&mut capabilities, uploads, usb_image);
-            assert_eq!(capabilities, expected);
-        }
-        // This test process has no stick image, so even a supporting Manage
-        // gets no capability.
-        let reported = nest_capabilities(
-            false,
-            PeerReportSupport {
-                uploads: false,
-                usb_installer: true,
-                when_idle: false,
-                site_check: false,
-                boot_machine_identity: false,
-            },
-        );
-        assert!(!reported.contains(&crate::usb_installer::CAPABILITY));
+    fn the_retired_usb_installer_field_stays_in_the_saved_contract() {
+        // An older Nest that rolls back requires the field; a contract saved
+        // without it still loads.
+        let contract = peer_contract_after_failed_fetch(None, None, 0);
+        let saved = serde_json::to_value(contract).unwrap();
+        assert_eq!(saved["accepts_usb_installer"], json!(false));
+        let stored: PeerContract = serde_json::from_value(json!({
+            "supports_scheduling": true, "accepts_uploads": true,
+            "runtime_epoch": true, "report_protocol": 1
+        }))
+        .unwrap();
+        assert!(!stored.accepts_usb_installer);
     }
 
     #[test]

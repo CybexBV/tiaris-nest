@@ -3,8 +3,8 @@
 # Tiaris Nest
 
 Tiaris Nest is a managed NixOS appliance that builds and serves Tiaris
-workstation netboot releases. The only supported installation route is a
-personalized Nest appliance ISO created by Tiaris hands-off provisioning.
+workstation netboot releases. The only supported installation route is the
+generic Nest ISO, claimed in Tiaris with the code it shows on its screen.
 
 ## Naming transition
 
@@ -23,12 +23,13 @@ renamed release.
 
 ## Installation
 
-In Tiaris, open Nests and start a new Nest setup. Download the
-personalized ISO and boot the target appliance from it. When the appliance
-appears in Tiaris, select its target disk and network configuration, review
-the destructive installation warning, and approve the installation there.
+Download the Nest ISO from Tiaris (Settings → Downloads or
+downloads.tiaris.com) and boot the target appliance from it. In Tiaris, open
+Nests and claim it with the code on its screen. When the appliance appears,
+select its target disk and network configuration, review the destructive
+installation warning, and approve the installation there.
 
-The media contains a signed, single-use provisioning envelope. The bootstrap
+The claim hands the server a signed, single-use provisioning envelope. The bootstrap
 verifies the envelope before installation, activates the reserved device
 identity, imports the independently verified signed NixOS closure, and writes the
 activated device key and ID into the installed state partition. The signed
@@ -45,9 +46,8 @@ that never expires. Booted, it registers with Tiaris
 only in memory and in `/run/tiaris-nest-claim`, mode 0700/0600), polls over
 IPv4 and, with a global IPv6 route, also IPv6, and shows four letters and a
 full code (`KX-4821-QM`) on its screen. An administrator claims it in the
-Console; Tiaris then hands over the same signed envelope it would have stamped
-into a personalized ISO. The bootstrap verifies those bytes exactly as it
-verifies the slot and runs the existing flow: session claim, disk approval,
+Console; Tiaris then hands over the session's signed envelope. The bootstrap
+verifies those bytes exactly as it verifies a filled slot and runs the existing flow: session claim, disk approval,
 installation. The envelope is kept in `/run` until STATE exists and on STATE
 (`.setup-claim-envelope.bin`, root 0600, left out of state backups) from then
 on, so resuming after a power cut never needs the ISO. Booted on a server
@@ -75,7 +75,9 @@ wins. The organization name is display text only (control characters
 removed, cut to 80) and never refuses a claim; "Claimed by" shows only after
 the envelope verified, and without a name the setup goes straight on; `410 nest_installer_outdated` shows "too old"
 and retries hourly; network failures retry quietly. Any other slot content
-takes the personalized path unchanged. `tiaris-nest-bootstrap
+takes the personalized path unchanged. Tiaris stopped making personalized ISOs
+in November 2026; only release qualification still stamps an envelope into
+the slot. `tiaris-nest-bootstrap
 setup-claim-protocol` prints the protocol (`1`), signed into the ISO template
 as `setup_claim_protocol`.
 
@@ -344,14 +346,12 @@ reinstall on a shared MAC only for such a Nest.
 
 Computers that cannot network-boot (no PXE through their USB Ethernet adapter,
 Chromebooks with MrChromebox UEFI firmware, Wi-Fi-only laptops) start from a
-USB stick instead (Tiaris `docs/design/usb-installer.md`). The stick image is
-built from the pinned Tiaris source with the appliance and served read-only:
+USB stick instead (Tiaris `docs/design/usb-installer.md`). There is one
+generic stick for every Nest, downloaded from Tiaris. It finds its Nest on the
+network, or uses the Nest address file the administrator saves on it from the
+Console. The Nest does not serve or personalize the stick (it did until
+November 2026); it answers the stick protocol:
 
-- `GET /usb-installer/` is a plain page with the download link, opened from
-  the school network; `GET /usb-installer/tiaris-usb-installer.img` streams
-  the image with this Nest's `tiaris/site.json` (public boot URL, device ID,
-  organization slug) written into its 4 KiB placeholder. A damaged or
-  missing image is not served.
 - `GET /usb-installer/v1/boot?mac=&serial_hex=` answers what `/boot/<mac>`
   would start, with the same identification, selection, one-time consumption
   and boot events: a `launch` (the `tiaris.nest.kexec.v1` session plus the
@@ -361,16 +361,14 @@ built from the pinned Tiaris source with the appliance and served read-only:
   runtime without creating a session. A stick older than
   `MINIMUM_STICK_PROTOCOL` gets `410`.
 
-Nest advertises `usb_installer_v1` only when it has the image and Manage
-says it accepts the capability (`usb_installer_supported`). The stick
-starts the runtime with `kexec`; the grant, enrollment and approval are those
-of network boot, and its Wi-Fi password never reaches Nest.
+The stick starts the runtime with `kexec`; the grant, enrollment and approval
+are those of network boot, and its Wi-Fi password never reaches Nest.
 
-`build-template.sh` also writes the unpersonalized image beside the template
-ISO, as `tiaris-usb-installer.img` and its build record
-`tiaris-usb-installer.json` (checked against each other), when the pinned
-Tiaris revision builds a stick. Tiaris publishes that copy as a public download
-(Tiaris `docs/downloads.md`). It is not a release asset and nothing signed
+`build-template.sh` writes the stick image beside the template ISO, as
+`tiaris-usb-installer.img` and its build record `tiaris-usb-installer.json`
+(checked against each other), when the pinned Tiaris revision builds a stick.
+Tiaris publishes that copy as a public download (Tiaris `docs/downloads.md`).
+It is not a release asset, not part of the installed Nest, and nothing signed
 changes: the release manifest keeps its exact keys.
 
 ## Retired rootfs multicast

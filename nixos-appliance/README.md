@@ -83,7 +83,8 @@ python3 tools/pack-system-closure.py \
 `$ISO_OUTPUT` receives the template ISO and its JSON record, and, when the pinned
 Tiaris revision builds a USB installer stick, `tiaris-usb-installer.img` and
 `tiaris-usb-installer.json` copied from the `usbInstaller` store path (unsigned,
-not release assets; Tiaris publishes them as public downloads).
+not release assets, not in the installed system; Tiaris publishes them as
+public downloads and the Nest does not serve them).
 
 ## Disk and state contract
 
@@ -240,8 +241,9 @@ shutdown entries are removed; the tty1 screen needs no basic-graphics entry
 because it falls back to text without DRM. `/TIARIS_PROVISIONING.BIN` is an ordinary
 uncompressed ISO9660 file consisting of exactly 8192 zero bytes in one extent.
 Derive its offset from final xorriso LBA metadata, reopen its exact bytes, and
-export slot identity. Personalization changes only those bytes; test HTTP ranges
-at both edges and compare the rest of the image. Keep an arping-capable binary
+export slot identity. Customers' servers keep the slot all zeros and are
+claimed; only release qualification still personalizes it, changing only those
+bytes. Test HTTP ranges at both edges and compare the rest of the image. Keep an arping-capable binary
 in the live image for static-address safety checks.
 
 New `tiaris.nest.install-plan.v3` preserves every V2 field name, including
