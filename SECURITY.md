@@ -2,7 +2,7 @@
 
 ## Supported platform
 
-The NixOS appliance installed from a personalized current Nest ISO is the
+The NixOS appliance installed from a current Nest ISO is the
 replacement platform. Ubuntu state-schema V1/V2 appliances receive no in-place
 NixOS update and must be reinstalled by a human. The old pre-provisioning NixOS
 and Proxmox/LXC implementations are unsupported. This branch's qualification
@@ -14,8 +14,10 @@ ledger determines release readiness; a source change is not a published update.
   release key. The template signature binds the canonical Management origin;
   build, signing, qualification, and verification compare it with an explicit
   governed expectation rather than trusting artifact URLs or bootstrap output.
-- The fixed personalization slot contains a bounded, signed, single-use V2
-  provisioning envelope.
+- A server gets its bounded, signed, single-use V2 provisioning envelope when
+  an administrator claims its generic ISO with the code on its screen. The
+  bootstrap verifies the claimed envelope as it verifies the fixed
+  personalization slot, which only release qualification still fills.
 - Provisioning activates the reserved device identity before the installed
   service starts; the service does not accept install codes or pairing codes.
 - Agent requests are signed by the activated device key.
