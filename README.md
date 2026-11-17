@@ -335,6 +335,13 @@ says it accepts the capability (`usb_installer_supported`). The stick
 starts the runtime with `kexec`; the grant, enrollment and approval are those
 of network boot, and its Wi-Fi password never reaches Nest.
 
+`build-template.sh` also writes the unpersonalized image beside the template
+ISO, as `tiaris-usb-installer.img` and its build record
+`tiaris-usb-installer.json` (checked against each other), when the pinned
+Tiaris revision builds a stick. Tiaris publishes that copy as a public download
+(Tiaris `docs/downloads.md`). It is not a release asset and nothing signed
+changes: the release manifest keeps its exact keys.
+
 ## Classroom rootfs multicast
 
 Nest can advertise `workstation_rootfs_multicast_v1` and coalesce live boot

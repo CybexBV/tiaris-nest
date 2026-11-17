@@ -124,6 +124,36 @@ class ProductionTests(unittest.TestCase):
                     self.assertRaisesRegex(ValueError, 'production rename'):
                 build['require_legacy_origin'](compiled, origin)
 
+    def test_usb_installer_export_copies_the_stick_beside_the_template(self):
+        build = runpy.run_path(str(HELPERS.parent / 'build.py'))
+        with tempfile.TemporaryDirectory() as temporary:
+            stick, output = Path(temporary) / 'stick', Path(temporary) / 'out'
+            stick.mkdir()
+            output.mkdir()
+            image = b'stick image bytes'
+            (stick / 'tiaris-usb-installer.img').write_bytes(image)
+            record = {'schema': 'tiaris.usb-installer.image.v1', 'image': 'tiaris-usb-installer.img',
+                      'size_bytes': len(image), 'sha256': hashlib.sha256(image).hexdigest()}
+            (stick / 'tiaris-usb-installer.json').write_text(json.dumps(record))
+            build['export_usb_installer'](stick, output)
+            self.assertEqual((output / 'tiaris-usb-installer.img').read_bytes(), image)
+            self.assertEqual(json.loads((output / 'tiaris-usb-installer.json').read_text()), record)
+            self.assertEqual((output / 'tiaris-usb-installer.img').stat().st_mode & 0o777, 0o444)
+            with self.assertRaises(FileExistsError):
+                build['export_usb_installer'](stick, output)
+            other = Path(temporary) / 'other'
+            other.mkdir()
+            (stick / 'tiaris-usb-installer.json').write_text(json.dumps({**record, 'size_bytes': 1}))
+            with self.assertRaisesRegex(ValueError, 'differs from its image'):
+                build['export_usb_installer'](stick, other)
+            self.assertEqual(list(other.iterdir()), [])
+
+    def test_template_build_exports_the_stick_only_when_tiaris_builds_one(self):
+        source = (HELPERS.parent / 'build.py').read_text()
+        self.assertIn("'-A', 'usbInstallerAvailable'", source)
+        nix = (HELPERS.parent / 'default.nix').read_text()
+        self.assertIn('usbInstallerAvailable = common.usbInstaller != null;', nix)
+
     def test_signed_appliance_cache_requires_exact_workstation_agent(self):
         build = runpy.run_path(str(HELPERS.parent / 'build.py'))
         agent = Path('/nix/store/' + 'a' * 32 + '-tiaris-agent-0.1.0')

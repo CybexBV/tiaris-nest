@@ -112,6 +112,10 @@ assert builtins.length publicKeys >= 1 && builtins.length publicKeys <= 8;
 assert publicKeys == lib.sort builtins.lessThan (lib.unique publicKeys);
 {
   inherit package unsignedCache buildMetadata workstationAgent workstationCacheSeeds installerKiosk;
+  # The stick image, exported beside the template ISO for public downloads
+  # (Tiaris docs/downloads.md); null when the pinned Tiaris revision has none.
+  inherit (common) usbInstaller;
+  usbInstallerAvailable = common.usbInstaller != null;
   workstationCacheSeedPaths = map toString workstationCacheSeeds.packages;
   system = installed.config.system.build.toplevel;
   iso = live.config.system.build.isoImage;
