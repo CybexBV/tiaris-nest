@@ -572,11 +572,7 @@ fn materialize_state(
     let key_projection = target.join("usr/share/tiaris-nest/release-public-key");
     storage::atomic_write(&key_projection, &fs::read(key_path)?, 0o644)?;
     let config = storage::nest_config(target, state, &storage::public_base_url(&state.plan))?
-        .replace("/usr/bin/nix", "/run/current-system/sw/bin/nix")
-        .replace(
-            "/usr/bin/udp-sender",
-            "/run/current-system/sw/bin/udp-sender",
-        );
+        .replace("/usr/bin/nix", "/run/current-system/sw/bin/nix");
     for (name, body) in [
         ("config.toml", config),
         (

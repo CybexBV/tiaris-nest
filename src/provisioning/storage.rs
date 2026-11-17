@@ -1375,7 +1375,7 @@ pub(super) fn nest_config(
          [[build.targets]]\nartifact_type = {}\ntarget = {}\nsystem = {}\nflake = {}\nattr = {}\n\n\
          [cache]\nroot_dir = \"/var/cache/tiaris-nest/www/cache\"\nprivate_key_path = \"/var/lib/tiaris-nest/state/agent/cache-private.pem\"\npublic_key_path = \"/var/lib/tiaris-nest/state/agent/cache-public.pem\"\n\n\
          [update]\ntrusted_public_key = {}\n\n\
-         [workstation_netboot]\nallow_private_release_urls = false\nmulticast_emergency_disabled = false\nudp_sender_path = \"/usr/bin/udp-sender\"\n\n\
+         [workstation_netboot]\nallow_private_release_urls = false\n\n\
          [manage]\nenabled = true\napi_url = {}\norganization_id = {}\norganization_slug = {}\nstate_path = \"/var/lib/tiaris-nest/state/agent/manage-state.json\"\nsync_interval_seconds = 30\nhttp_timeout_seconds = 30\n",
         toml_string(public_base_url),
         toml_string(&admin_token),
@@ -1732,6 +1732,22 @@ mod tests {
         )
         .unwrap();
         loaded.validate_appliance_config().unwrap();
+        // Nests installed while multicast existed keep its retired keys in
+        // their config.toml; those files must still load.
+        let installed_with_multicast_keys = body.replace(
+            "[workstation_netboot]\nallow_private_release_urls = false\n",
+            "[workstation_netboot]\nallow_private_release_urls = false\n\
+             multicast_emergency_disabled = false\n\
+             udp_sender_path = \"/run/current-system/sw/bin/udp-sender\"\n",
+        );
+        assert_ne!(installed_with_multicast_keys, body);
+        crate::config::AppConfig::from_toml_str(
+            &installed_with_multicast_keys,
+            &root.join("etc/tiaris-nest/config.toml"),
+        )
+        .unwrap()
+        .validate_appliance_config()
+        .unwrap();
         assert_eq!(loaded.manage.organization_slug, "acme-control");
         assert_eq!(
             loaded.build.manage_source_url_template,
