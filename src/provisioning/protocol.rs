@@ -240,7 +240,14 @@ pub(crate) fn verify_envelope_bytes(
     let body = bytes[..end].strip_suffix(b"\n").unwrap_or(&bytes[..end]);
     let envelope: ProvisioningEnvelope =
         serde_json::from_slice(body).context("parse provisioning envelope")?;
-    validate_envelope_fields(&envelope, required_manage_origin)?;
+    // A clock that is behind is only told once the signature is trusted.
+    let issued_in_future = match validate_envelope_fields(&envelope, required_manage_origin) {
+        Err(error) if error.is::<EnvelopeIssuedInFuture>() => true,
+        result => {
+            result?;
+            false
+        }
+    };
     let signature = canonical_url_base64(&envelope.signature, 64)?;
     let signature = Signature::from_bytes(
         signature
@@ -267,6 +274,9 @@ pub(crate) fn verify_envelope_bytes(
         .find(|key| key.verify(&payload, &signature).is_ok())
         .copied()
         .ok_or_else(|| anyhow!("provisioning envelope signature is not trusted"))?;
+    if issued_in_future {
+        return Err(EnvelopeIssuedInFuture.into());
+    }
     Ok(VerifiedEnvelope {
         envelope,
         signing_key,
@@ -302,16 +312,25 @@ fn validate_envelope_fields(
     if envelope.release_version.is_empty() || envelope.release_version.len() > 128 {
         bail!("provisioning release version is invalid")
     }
-    let now = Utc::now();
-    if envelope.issued_at > now + chrono::Duration::minutes(5)
-        || envelope.expires_at <= envelope.issued_at
+    if envelope.expires_at <= envelope.issued_at
         || envelope.expires_at - envelope.issued_at
             > chrono::Duration::hours(MAX_ENVELOPE_VALIDITY_HOURS)
     {
         bail!("provisioning envelope has invalid validity")
     }
+    if envelope.issued_at > Utc::now() + chrono::Duration::minutes(5) {
+        return Err(EnvelopeIssuedInFuture.into());
+    }
     Ok(())
 }
+
+/// The envelope's only fault is that it looks issued more than five minutes
+/// from now: this server's clock is behind. From `verify_envelope_bytes`
+/// only for an envelope whose signature, origin and fields are otherwise
+/// valid.
+#[derive(Debug, thiserror::Error)]
+#[error("provisioning envelope has invalid validity: it looks issued in the future")]
+pub(crate) struct EnvelopeIssuedInFuture;
 
 pub(super) fn require_current_envelope(verified: &VerifiedEnvelope) -> Result<()> {
     if verified.envelope.expires_at <= Utc::now() {

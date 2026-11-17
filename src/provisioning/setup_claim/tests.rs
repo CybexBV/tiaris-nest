@@ -1610,3 +1610,71 @@ async fn a_poll_refused_as_too_fast_never_reads_as_a_registration_still_there() 
         [StatusCode::TOO_MANY_REQUESTS, StatusCode::NOT_FOUND]
     );
 }
+
+#[test]
+fn a_retained_envelope_from_the_future_waits_for_the_clock_instead_of_claiming() {
+    let keys = [provisioning_key().verifying_key()];
+    let session = Uuid::new_v4();
+    let now = Utc::now();
+    let signed = |key: &SigningKey, origin: &str, issued, expires| {
+        protocol::tests::signed_envelope_bytes(key, session, origin, issued, expires)
+    };
+    let not_yet = |result: Result<Option<VerifiedEnvelope>>| match result {
+        Err(error) => error.is::<protocol::EnvelopeIssuedInFuture>(),
+        Ok(_) => false,
+    };
+    // Issued more than five minutes ahead of this clock (it is behind): the
+    // run fails and the service retries; nothing is claimed again.
+    let ahead = now + chrono::Duration::hours(2);
+    let future = signed(
+        &provisioning_key(),
+        ORIGIN,
+        ahead,
+        ahead + chrono::Duration::days(30),
+    );
+    assert!(not_yet(verify_retained(&future, &keys, ORIGIN)));
+    // Within the five-minute allowance it verifies.
+    let soon = now + chrono::Duration::minutes(4);
+    let allowed = signed(
+        &provisioning_key(),
+        ORIGIN,
+        soon,
+        soon + chrono::Duration::days(30),
+    );
+    assert!(verify_retained(&allowed, &keys, ORIGIN).unwrap().is_some());
+    // Any other fault keeps today's answer: ignored, claimed again.
+    let other = SigningKey::from_bytes(&[4; 32]);
+    let untrusted = signed(&other, ORIGIN, ahead, ahead + chrono::Duration::days(30));
+    assert!(
+        verify_retained(&untrusted, &keys, ORIGIN)
+            .unwrap()
+            .is_none()
+    );
+    let elsewhere = "https://other.example.test";
+    let foreign = signed(
+        &provisioning_key(),
+        elsewhere,
+        ahead,
+        ahead + chrono::Duration::days(30),
+    );
+    assert!(verify_retained(&foreign, &keys, ORIGIN).unwrap().is_none());
+    let mut tampered = future.clone();
+    let at = tampered
+        .windows(7)
+        .position(|window| window == b"0.2.141")
+        .unwrap();
+    tampered[at + 6] = b'2';
+    assert!(verify_retained(&tampered, &keys, ORIGIN).unwrap().is_none());
+    let too_long = signed(
+        &provisioning_key(),
+        ORIGIN,
+        ahead,
+        ahead + chrono::Duration::days(60),
+    );
+    assert!(verify_retained(&too_long, &keys, ORIGIN).unwrap().is_none());
+    // An ended window (or a clock far ahead) verifies; `retained_choice`
+    // decides, exactly as before.
+    let ended = envelope(session, 0);
+    let verified = verify_retained(&ended, &keys, ORIGIN).unwrap().unwrap();
+    assert!(protocol::require_current_envelope(&verified).is_err());
+}

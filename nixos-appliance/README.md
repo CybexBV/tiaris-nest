@@ -289,7 +289,11 @@ nothing written on disk). When that fails, the claim screen stays without
 registration continues (a claimed envelope kept there is reused); otherwise it
 registers. An expired, unverifiable or orphaned retained copy is a setup that
 ended: STATE is released and the server is claimed again, after which that STATE
-is a different session's and needs a new exact-disk approval. If power fails
+is a different session's and needs a new exact-disk approval. A retained copy
+that is valid except that it looks issued more than 5 minutes in the future
+(this server's clock is behind, for example before NTP answered) is not one:
+the run fails as the slot path does and the service retries every 15 seconds
+until the clock is right. If power fails
 between GPT erasure and the STATE copy, the generic ISO is claimed again too.
 
 A setup Management closed before this run changed the disk leads back to the

@@ -302,18 +302,18 @@ fn retained_from_state(
 ) -> Result<Retained> {
     let mut found = None;
     if let Some(bytes) = storage::retained_setup_envelope(&options.state_mount)? {
-        match protocol::verify_envelope_bytes(&bytes, trusted_keys, &options.required_manage_origin)
-        {
-            Ok(verified) => {
+        match verify_retained(&bytes, trusted_keys, &options.required_manage_origin) {
+            Ok(Some(verified)) => {
                 let probe = storage::existing_state_for_session(
                     &options.state_mount,
                     verified.envelope.session_id,
                 )?;
                 found = Some((Claimed { bytes, verified }, probe.map(|probe| probe.state)));
             }
+            Ok(None) => storage::release_state_probe(&options.state_mount)?,
             Err(error) => {
-                warn!(error = %error, "ignoring a retained setup envelope that does not verify");
                 storage::release_state_probe(&options.state_mount)?;
+                return Err(error);
             }
         }
     }
@@ -346,6 +346,30 @@ fn retained_from_state(
             }
             storage::release_state_probe(&options.state_mount)?;
             Ok(Retained::None)
+        }
+    }
+}
+
+/// Verify STATE's retained envelope. One that does not verify is ignored
+/// (`None`: this server is claimed again). One that is fine except that it
+/// looks issued in the future (this server's clock is behind, for example
+/// before NTP answered) is "not yet", never a reason to claim again: the run
+/// fails like the slot path's and the service retries until the clock is
+/// right. Whether its window is still open is `require_current_envelope`'s.
+pub(super) fn verify_retained(
+    bytes: &[u8],
+    trusted_keys: &[VerifyingKey],
+    required_origin: &str,
+) -> Result<Option<VerifiedEnvelope>> {
+    match protocol::verify_envelope_bytes(bytes, trusted_keys, required_origin) {
+        Ok(verified) => Ok(Some(verified)),
+        Err(error) if error.is::<protocol::EnvelopeIssuedInFuture>() => Err(error.context(
+            "the retained setup envelope looks issued in the future; \
+             waiting for this server's clock",
+        )),
+        Err(error) => {
+            warn!(error = %error, "ignoring a retained setup envelope that does not verify");
+            Ok(None)
         }
     }
 }
