@@ -174,37 +174,45 @@ pub(super) fn ended_if_closed(generic: bool, error: anyhow::Error) -> anyhow::Er
 }
 
 /// Before an interrupted installation resumes from its retained envelope:
-/// did Management close that setup? Asked without changing anything: while
-/// the media key is the session's identity, by its plan poll; afterwards by
-/// replaying event 3, which Management answers unchanged, as a duplicate,
-/// while the session is open. Only Management's refusal of a closed session
-/// counts; a network failure or any other answer resumes as before.
+/// did Management close that setup? Asked without changing anything, and
+/// decided by Management's answers, not by the saved `identity_active` flag
+/// alone (power may fail after Management activated the device identity but
+/// before the flag was saved). Unless the flag says the identity is active,
+/// the media key's plan poll asks first: `409` means closed, a session state
+/// is read as it is, and `403` means Management retired the media identity
+/// (it says so before it looks at revocation), so the device key asks again.
+/// The device key asks by replaying event 3, which Management answers
+/// unchanged, as a duplicate, while the session is open and with `409` once
+/// it is closed. Only Management's refusal of a closed session counts; a
+/// network failure or any other answer resumes as before.
 pub(super) async fn resumed_setup_closed(
     client: &protocol::ProvisioningClient,
     verified: &VerifiedEnvelope,
     durable: Option<&DurableProvisioningState>,
 ) -> bool {
-    let refused = match durable.filter(|durable| durable.identity_active) {
-        None => {
-            let Ok(key) = protocol::derive_provisioning_key(&verified.envelope.media_secret) else {
-                return false;
-            };
-            match client.poll_plan(&key).await {
-                Ok(session) => return matches!(session.state.as_str(), "revoked" | "expired"),
-                Err(error) => error,
-            }
+    if !durable.is_some_and(|durable| durable.identity_active) {
+        let Ok(key) = protocol::derive_provisioning_key(&verified.envelope.media_secret) else {
+            return false;
+        };
+        match client.poll_plan(&key).await {
+            Ok(session) => return matches!(session.state.as_str(), "revoked" | "expired"),
+            Err(error)
+                if protocol::http_refusal(&error)
+                    .is_some_and(|(status, _)| status == StatusCode::FORBIDDEN) => {}
+            Err(error) => return protocol::closed_session_refusal(&error),
         }
-        Some(durable) => {
-            let Ok(key) = durable.signing_key() else {
-                return false;
-            };
-            match super::report_state_created(client, &key, &durable.plan).await {
-                Ok(()) => return false,
-                Err(error) => error,
-            }
-        }
+    }
+    // Without durable state no device identity was ever activated.
+    let Some(durable) = durable else {
+        return false;
     };
-    protocol::closed_session_refusal(&refused)
+    let Ok(key) = durable.signing_key() else {
+        return false;
+    };
+    match super::report_state_created(client, &key, &durable.plan).await {
+        Ok(()) => false,
+        Err(error) => protocol::closed_session_refusal(&error),
+    }
 }
 
 pub(super) struct Claimed {

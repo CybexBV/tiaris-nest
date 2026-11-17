@@ -422,6 +422,51 @@ async fn a_resumed_generic_setup_asks_whether_management_closed_it() {
     let (client, handle) = server(state, verified.envelope.session_id).await;
     assert!(resumed_setup_closed(&client, &verified, Some(&durable)).await);
     handle.abort();
+
+    // Power failed after Management activated the identity but before the
+    // flag was saved. Manage answers the media key's plan poll with 403
+    // (retired identity) before it looks at revocation, so the device key
+    // asks again: 409 is a closed setup, a duplicate is an open one.
+    let mut stale = durable.clone();
+    stale.identity_active = false;
+    let retired = (
+        StatusCode::FORBIDDEN,
+        json!({"error":"the media-derived provisioning identity has been retired","error_code":"forbidden"}),
+    );
+    for (replies, closed) in [
+        (vec![retired.clone(), manage_refusal(None)], true),
+        (vec![retired.clone()], false),
+        (
+            vec![
+                retired,
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    json!({"error_code":"service_unavailable"}),
+                ),
+            ],
+            false,
+        ),
+        // Before activation the plan poll alone decides.
+        (vec![manage_refusal(None)], true),
+        (vec![session("awaiting_approval")], false),
+    ] {
+        let state = Arc::new(Mutex::new(Server {
+            replies: VecDeque::from(replies),
+            ..Default::default()
+        }));
+        let (client, handle) = server(state.clone(), verified.envelope.session_id).await;
+        assert_eq!(
+            resumed_setup_closed(&client, &verified, Some(&stale)).await,
+            closed
+        );
+        let state = state.lock().unwrap();
+        assert_eq!(state.requests[0].0, Method::GET);
+        if state.requests.len() > 1 {
+            assert_eq!(state.requests[1].0, Method::POST);
+            assert_eq!(state.requests[1].1["sequence"], 3);
+        }
+        handle.abort();
+    }
 }
 
 #[tokio::test]
