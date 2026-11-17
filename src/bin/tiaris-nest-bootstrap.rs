@@ -3,10 +3,10 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tiaris_nest::provisioning::{
     FinalizeOptions, LEGACY_MANAGE_ORIGIN, MAX_ENVELOPE_VALIDITY_HOURS, NetworkRuntimeOptions,
-    PrepareOptions, REQUIRED_MANAGE_ORIGIN, SETUP_STATUS_PATH, commit_network_change,
-    effective_manage_origin, finalize_target, prepare, reconcile_network_runtime,
-    report_install_stage, validate_installed_state, validate_legacy_state_promotion,
-    verify_committed_network_change,
+    PrepareOptions, REQUIRED_MANAGE_ORIGIN, SETUP_CLAIM_PROTOCOL, SETUP_STATUS_PATH,
+    commit_network_change, effective_manage_origin, finalize_target, prepare,
+    reconcile_network_runtime, report_install_stage, validate_installed_state,
+    validate_legacy_state_promotion, verify_committed_network_change,
 };
 
 #[derive(Debug, Parser)]
@@ -32,7 +32,10 @@ enum Command {
     EffectiveManageOrigin { stored: String },
     /// Print the longest setup-ISO validity, in hours, this bootstrap accepts.
     EnvelopeMaxValidityHours,
-    /// Claim this provisioned ISO, wait for approval, and prepare Autoinstall.
+    /// Print the setup claim protocol a generic (all-zero slot) ISO speaks.
+    SetupClaimProtocol,
+    /// Claim this provisioned ISO (or, from an all-zero slot, register and wait
+    /// to be claimed), wait for approval, and install.
     Prepare {
         #[arg(long, default_value = "/cdrom/TIARIS_PROVISIONING.BIN")]
         envelope: PathBuf,
@@ -138,6 +141,10 @@ async fn main() -> Result<()> {
         },
         Command::EnvelopeMaxValidityHours => {
             println!("{MAX_ENVELOPE_VALIDITY_HOURS}");
+            Ok(())
+        }
+        Command::SetupClaimProtocol => {
+            println!("{SETUP_CLAIM_PROTOCOL}");
             Ok(())
         }
         Command::Prepare {

@@ -104,6 +104,21 @@ pub(crate) async fn collect_inventory() -> Result<NestProvisioningInventory> {
     })
 }
 
+/// Manufacturer, model and virtualization, the only hardware a generic ISO
+/// names before it is claimed (no serial number). `none` on bare metal.
+pub(crate) async fn registration_hardware() -> (String, String, String) {
+    let virtualization = command_text("systemd-detect-virt", &["--vm"]).await;
+    (
+        read_trimmed("/sys/class/dmi/id/sys_vendor"),
+        read_trimmed("/sys/class/dmi/id/product_name"),
+        if virtualization.is_empty() {
+            "none".to_string()
+        } else {
+            virtualization
+        },
+    )
+}
+
 pub(crate) fn inventory_sha256(inventory: &NestProvisioningInventory) -> Result<String> {
     let bytes = serde_json::to_vec(inventory).context("serialize hardware inventory")?;
     Ok(hex::encode(Sha256::digest(bytes)))

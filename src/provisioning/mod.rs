@@ -11,6 +11,7 @@ mod nixos_install;
 mod packages;
 pub(crate) mod protocol;
 mod recovery;
+mod setup_claim;
 mod setup_status;
 mod storage;
 
@@ -33,6 +34,7 @@ pub use network_runtime::{
     reconcile_network_runtime,
 };
 pub use protocol::{MAX_ENVELOPE_VALIDITY_HOURS, ProvisioningEnvelope, SignedInstallPlan};
+pub use setup_claim::{DEFAULT_SETUP_CLAIM_DIR, SETUP_CLAIM_PROTOCOL};
 use setup_status::{InstallStep, SetupStatusReporter};
 pub use setup_status::{SETUP_STATUS_PATH, SETUP_STATUS_SCHEMA};
 
@@ -146,6 +148,9 @@ pub struct PrepareOptions {
     pub required_manage_origin: String,
     /// Public kiosk projection; `None` disables it (tests and tooling).
     pub setup_status_path: Option<PathBuf>,
+    /// Private `/run` directory of a generic ISO's registration and claimed
+    /// envelope (survives a service restart, not a reboot).
+    pub setup_claim_dir: PathBuf,
 }
 
 impl Default for PrepareOptions {
@@ -158,6 +163,7 @@ impl Default for PrepareOptions {
             state_mount: PathBuf::from(DEFAULT_STATE_MOUNT),
             required_manage_origin: REQUIRED_MANAGE_ORIGIN.to_string(),
             setup_status_path: Some(PathBuf::from(SETUP_STATUS_PATH)),
+            setup_claim_dir: PathBuf::from(DEFAULT_SETUP_CLAIM_DIR),
         }
     }
 }
@@ -422,11 +428,32 @@ pub async fn prepare(options: PrepareOptions) -> Result<()> {
 async fn prepare_with_status(options: &PrepareOptions, status: &SetupStatusReporter) -> Result<()> {
     let media_layout = packages::inspect_media_layout()?;
     let trusted_keys = protocol::load_trusted_provisioning_keys(&options.provisioning_keys_path)?;
+    // An all-zero slot is the generic ISO: it obtains the same envelope by
+    // registering and being claimed, then continues below.
+    if setup_claim::slot_is_generic(&options.envelope_path)? {
+        return setup_claim::prepare_generic(options, status, media_layout, &trusted_keys).await;
+    }
     let verified = protocol::load_and_verify_envelope(
         &options.envelope_path,
         &trusted_keys,
         &options.required_manage_origin,
     )?;
+    prepare_verified(options, status, media_layout, verified, None).await
+}
+
+/// The setup flow for one verified envelope. `retain` is the envelope's exact
+/// bytes when no ISO slot holds them (generic ISO): they are written to STATE
+/// right after it exists, so every later run recovers without the ISO.
+async fn prepare_verified(
+    options: &PrepareOptions,
+    status: &SetupStatusReporter,
+    media_layout: packages::MediaLayout,
+    verified: protocol::VerifiedEnvelope,
+    retain: Option<&[u8]>,
+) -> Result<()> {
+    // Only a generic ISO (it retains its envelope) claims again when
+    // Management closed the session; the personalized path is unchanged.
+    let generic = retain.is_some();
     if let Some(probe) =
         storage::existing_state_for_session(&options.state_mount, verified.envelope.session_id)?
     {
@@ -456,7 +483,8 @@ async fn prepare_with_status(options: &PrepareOptions, status: &SetupStatusRepor
         &inventory,
         &hardware_digest,
     )
-    .await?;
+    .await
+    .map_err(|error| setup_claim::ended_if_closed(generic, error))?;
     status.session_claimed(&inventory);
     let mut signed_plan = if recovering {
         let plan = recovery::active_plan(&session, &verified, &inventory)?;
@@ -473,7 +501,8 @@ async fn prepare_with_status(options: &PrepareOptions, status: &SetupStatusRepor
             &mut session,
             None,
         )
-        .await?;
+        .await
+        .map_err(|error| setup_claim::ended_if_closed(generic, error))?;
         status.plan_approved(&plan, &inventory);
         plan
     };
@@ -502,6 +531,7 @@ async fn prepare_with_status(options: &PrepareOptions, status: &SetupStatusRepor
                     &inventory,
                     &signed_plan,
                     failure,
+                    generic,
                 )
                 .await?;
                 status.plan_approved(&signed_plan, &inventory);
@@ -520,6 +550,9 @@ async fn prepare_with_status(options: &PrepareOptions, status: &SetupStatusRepor
     let prepared =
         storage::create_state_partition_first(&signed_plan, &fresh_inventory, &options.state_mount)
             .await?;
+    if let Some(envelope) = retain {
+        storage::retain_setup_envelope(&prepared.state_mount, envelope)?;
+    }
     let device_key = SigningKey::generate(&mut OsRng);
     let mut durable = DurableProvisioningState {
         schema: "tiaris.nest.provisioning-state.v1".to_string(),
@@ -539,17 +572,7 @@ async fn prepare_with_status(options: &PrepareOptions, status: &SetupStatusRepor
     };
     storage::save_durable_state(&prepared.state_mount, &durable)?;
 
-    client
-        .send_event(
-            &provisioning_key,
-            &signed_plan,
-            3,
-            "state_partition_created",
-            "succeeded",
-            Some(20),
-            "Persistent appliance state created",
-        )
-        .await?;
+    report_state_created(&client, &provisioning_key, &signed_plan).await?;
     durable.next_event_sequence = 4;
     storage::save_durable_state(&prepared.state_mount, &durable)?;
     client
@@ -718,6 +741,7 @@ async fn report_failure_and_wait_for_retry(
     inventory: &NestProvisioningInventory,
     failed_plan: &SignedInstallPlan,
     failure: PreDestructiveFailure,
+    generic: bool,
 ) -> Result<SignedInstallPlan> {
     warn!(
         failure_code = failure.code,
@@ -758,6 +782,10 @@ async fn report_failure_and_wait_for_retry(
                     reported = true;
                 }
                 next
+            }
+            // A generic ISO whose setup Management closed claims again.
+            Err(error) if generic && protocol::closed_session_refusal(&error) => {
+                return Err(setup_claim::ended_if_closed(generic, error));
             }
             Err(error) => {
                 warn!(
@@ -878,17 +906,7 @@ async fn resume_prepare(
         verified.envelope.session_id,
     )?;
     if durable.next_event_sequence == 3 {
-        client
-            .send_event(
-                &provisioning_key,
-                &signed_plan,
-                3,
-                "state_partition_created",
-                "succeeded",
-                Some(20),
-                "Persistent appliance state created",
-            )
-            .await?;
+        report_state_created(&client, &provisioning_key, &signed_plan).await?;
         durable.next_event_sequence = 4;
         storage::save_durable_state(&prepared.state_mount, &durable)?;
     }
@@ -940,6 +958,26 @@ async fn resume_prepare(
         &signed_plan,
         package_delivery,
     )
+}
+
+/// Event 3: STATE exists. Its exact bytes are replayed, unchanged, to ask
+/// whether a resumed generic setup is still open (`setup_claim`).
+async fn report_state_created(
+    client: &protocol::ProvisioningClient,
+    key: &SigningKey,
+    plan: &SignedInstallPlan,
+) -> Result<()> {
+    client
+        .send_event(
+            key,
+            plan,
+            3,
+            "state_partition_created",
+            "succeeded",
+            Some(20),
+            "Persistent appliance state created",
+        )
+        .await
 }
 
 /// Send one late-install event using the device key on TIARIS_STATE.

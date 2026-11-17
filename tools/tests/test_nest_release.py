@@ -559,6 +559,49 @@ class NestReleaseToolTests(unittest.TestCase):
         )
         self.assertEqual(extended, {**legacy, "envelope_max_validity_hours": 744})
 
+    def test_nixos_verification_inspection_carries_the_signed_setup_claim_protocol(
+        self,
+    ) -> None:
+        api = runpy.run_path(str(TOOL))
+        version = "0.2.141"
+        url = (
+            "https://releases.example.test/v0.2.141/"
+            f"tiaris-nest-appliance-template-{version}-x86_64-linux.iso"
+        )
+        inputs = (
+            self.template,
+            url,
+            self.personalization_offset,
+            [self.provisioning_key],
+            "system-closure-v1",
+            self.manage_origin,
+            None,
+        )
+        validity = api["_inspect_installer_iso_template"](
+            inputs, version, envelope_max_validity_hours=744
+        )
+        self.assertNotIn("setup_claim_protocol", validity)
+        claimable = api["_inspect_installer_iso_template"](
+            inputs, version, envelope_max_validity_hours=744, setup_claim_protocol=1
+        )
+        self.assertEqual(claimable, {**validity, "setup_claim_protocol": 1})
+        message = api["_installer_iso_template_message"](claimable)
+        self.assertEqual(message, api["_installer_iso_template_message"](validity) + b"1\n")
+        # The protocol is never signed without the validity line before it.
+        with self.assertRaises(ValueError):
+            api["_inspect_installer_iso_template"](inputs, version, setup_claim_protocol=1)
+
+    def test_build_metadata_setup_claim_protocol_must_match_the_template(self) -> None:
+        output = self.directory / "claim-release.json"
+        metadata = json.loads(self.template_metadata.read_text(encoding="utf-8"))
+        metadata["setup_claim_protocol"] = 1
+        self.template_metadata.write_text(json.dumps(metadata), encoding="utf-8")
+
+        rejected = self.run_tool(*self.manifest_arguments(output))
+        self.assertEqual(rejected.returncode, 2)
+        self.assertIn(b"setup claim protocol does not match", rejected.stderr)
+        self.assertFalse(output.exists())
+
     def test_only_nixos_templates_may_declare_a_longer_envelope_validity(self) -> None:
         output = self.directory / "validity-release.json"
         metadata = json.loads(self.template_metadata.read_text(encoding="utf-8"))

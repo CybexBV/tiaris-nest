@@ -41,6 +41,11 @@ TEMPLATE_ORDER = (
 # validity the bootstrap accepts. Older templates omit it and accept 24 hours.
 TEMPLATE_ENVELOPE_VALIDITY = "envelope_max_validity_hours"
 ENVELOPE_VALIDITY_HOURS = (24, 744)
+# Optional, signed as the last line after envelope_max_validity_hours (and
+# only with it, so no two integer lines can trade places): the setup claim
+# protocol of a bootstrap whose ISO can stay generic and be claimed.
+TEMPLATE_SETUP_CLAIM = "setup_claim_protocol"
+SETUP_CLAIM_PROTOCOLS = (1, 2**31 - 1)
 
 
 class ContractError(ValueError):
@@ -170,12 +175,17 @@ def descriptor_message(value):
 
 
 def validate_template(value, version=None, *, signed=True):
-    optional = {TEMPLATE_ENVELOPE_VALIDITY} & set(value)
+    optional = {TEMPLATE_ENVELOPE_VALIDITY, TEMPLATE_SETUP_CLAIM} & set(value)
     exact(value, set(TEMPLATE_ORDER) | optional | ({"signature"} if signed else set()),
           "NixOS ISO template")
-    if optional:
+    if TEMPLATE_ENVELOPE_VALIDITY in optional:
         integer(value[TEMPLATE_ENVELOPE_VALIDITY], *ENVELOPE_VALIDITY_HOURS,
                 "NixOS ISO envelope validity")
+    if TEMPLATE_SETUP_CLAIM in optional:
+        if TEMPLATE_ENVELOPE_VALIDITY not in optional:
+            fail("NixOS ISO setup claim protocol requires the envelope validity")
+        integer(value[TEMPLATE_SETUP_CLAIM], *SETUP_CLAIM_PROTOCOLS,
+                "NixOS ISO setup claim protocol")
     if (not isinstance(value["version"], str) or VERSION.fullmatch(value["version"]) is None
             or version is not None and value["version"] != version
             or value["architecture"] != "x86_64-linux" or value["base_os"] != "nixos"
@@ -216,4 +226,6 @@ def template_message(value):
         lines.append(",".join(item) if field == "provisioning_public_keys" else str(item))
     if TEMPLATE_ENVELOPE_VALIDITY in unsigned:
         lines.append(str(unsigned[TEMPLATE_ENVELOPE_VALIDITY]))
+    if TEMPLATE_SETUP_CLAIM in unsigned:
+        lines.append(str(unsigned[TEMPLATE_SETUP_CLAIM]))
     return ("\n".join(lines) + "\n").encode()

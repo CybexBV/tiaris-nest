@@ -86,6 +86,31 @@ class ApplianceV3Tests(unittest.TestCase):
                 V3.validate_template({**FIXTURE["installer_iso_template"],
                                       "envelope_max_validity_hours": value})
 
+    def test_setup_claim_protocol_is_optional_bounded_and_signed_after_validity(self):
+        unsigned = {key: value for key, value in FIXTURE["installer_iso_template"].items()
+                    if key != "signature"}
+        validity = V3.template_message({**unsigned, "envelope_max_validity_hours": 744})
+        claimable = {**unsigned, "envelope_max_validity_hours": 744, "setup_claim_protocol": 1}
+        self.assertEqual(V3.template_message(claimable), validity + b"1\n")
+        V3.validate_template({**FIXTURE["installer_iso_template"],
+                              "envelope_max_validity_hours": 744, "setup_claim_protocol": 7})
+        for value in (0, -1, True, "1", 1.0, None, 2**31):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                V3.validate_template({**FIXTURE["installer_iso_template"],
+                                      "envelope_max_validity_hours": 744,
+                                      "setup_claim_protocol": value})
+        # Two optional integer lines must never trade places in the message.
+        with self.assertRaises(ValueError):
+            V3.validate_template({**FIXTURE["installer_iso_template"], "setup_claim_protocol": 1})
+
+    def test_setup_claim_cannot_reuse_a_signature_without_it(self):
+        original = {**FIXTURE["installer_iso_template"], "envelope_max_validity_hours": 744}
+        public = API["ED25519_PUBLIC_DER_PREFIX"] + base64.b64decode(FIXTURE["public_key"])
+        claimable = {**original, "setup_claim_protocol": 1}
+        with self.assertRaises(API["ReleaseError"]):
+            API["_self_verify"](public, base64.b64decode(original["signature"]),
+                                V3.template_message(claimable))
+
     def test_thirty_and_thirty_one_day_limits_cannot_reuse_a_legacy_signature(self):
         original = FIXTURE["installer_iso_template"]
         public = API["ED25519_PUBLIC_DER_PREFIX"] + base64.b64decode(FIXTURE["public_key"])

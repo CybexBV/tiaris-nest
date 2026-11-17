@@ -730,9 +730,15 @@ async fn send_handoff_event<Sent: std::future::Future<Output = Result<()>>>(
 
 fn select_installed_boot_next(state: &DurableProvisioningState) -> Result<()> {
     let esp = storage::partition_path(Path::new(&state.plan.target_disk.path), 2)?;
+    select_esp_boot_next(&esp)
+}
+
+/// The number of the one UEFI entry that starts systemd-boot from this ESP,
+/// found by the ESP's GPT partition GUID. Reads only.
+pub(super) fn installed_boot_entry(esp: &Path) -> Result<String> {
     let output = Command::new("blkid")
         .args(["-s", "PARTUUID", "-o", "value"])
-        .arg(&esp)
+        .arg(esp)
         .output()?;
     ensure!(
         output.status.success(),
@@ -747,7 +753,12 @@ fn select_installed_boot_next(state: &DurableProvisioningState) -> Result<()> {
         output.status.success(),
         "cannot inspect installed UEFI entries"
     );
-    let entries = String::from_utf8(output.stdout)?;
+    boot_entry_for_esp(&String::from_utf8(output.stdout)?, &guid)
+}
+
+/// Exactly one `efibootmgr -v` entry may load systemd-boot from partition 2
+/// with this GPT partition GUID; its four hex digits.
+fn boot_entry_for_esp(entries: &str, guid: &str) -> Result<String> {
     let binding = format!("hd(2,gpt,{guid},");
     let candidates: Vec<_> = entries
         .lines()
@@ -766,9 +777,14 @@ fn select_installed_boot_next(state: &DurableProvisioningState) -> Result<()> {
         .get(4..8)
         .ok_or_else(|| anyhow!("UEFI entry number"))?;
     let _ = u16::from_str_radix(number, 16)?;
+    Ok(number.to_string())
+}
+
+fn select_esp_boot_next(esp: &Path) -> Result<()> {
+    let number = installed_boot_entry(esp)?;
     ensure!(
         Command::new("efibootmgr")
-            .args(["-n", number])
+            .args(["-n", &number])
             .status()?
             .success(),
         "set exact installed BootNext failed"
@@ -782,6 +798,14 @@ fn select_installed_boot_next(state: &DurableProvisioningState) -> Result<()> {
         "installed BootNext verification failed"
     );
     Ok(())
+}
+
+/// Start an installed NixOS Nest found without its provisioning state: select
+/// its entry on this ESP for the next boot and restart. Only the UEFI BootNext
+/// variable is written; nothing is mounted or written on a disk.
+pub(super) fn boot_installed_esp(esp: &Path) -> Result<()> {
+    select_esp_boot_next(esp)?;
+    reboot_installed()
 }
 
 fn reboot_installed() -> Result<()> {
@@ -809,6 +833,30 @@ mod tests {
             sha256: "a".repeat(64),
             size_bytes: 1024,
         }
+    }
+
+    #[test]
+    fn the_installed_entry_is_the_one_systemd_boot_on_that_exact_esp() {
+        let esp = "1b4e28ba-2fa1-11d2-883f-0016d3cca427";
+        let entries = format!(
+            "BootCurrent: 0003\nBootOrder: 0003,0001,0002,0000\n\
+             Boot0000* UEFI: SanDisk Cruzer\tPciRoot(0x0)/USB(0x1,0x0)/CDROM(0x1,0x9dc,0x2000)\n\
+             Boot0001* Linux Boot Manager\tHD(2,GPT,{esp},0x800,0x100000)/File(\\EFI\\systemd\\systemd-bootx64.efi)\n\
+             Boot0002* Windows Boot Manager\tHD(1,GPT,9a3c0e3e-0000-4000-8000-000000000001,0x800,0x32000)/File(\\EFI\\Microsoft\\Boot\\bootmgfw.efi)\n\
+             Boot0003* Linux Boot Manager\tHD(2,GPT,5c0e1a2b-0000-4000-8000-000000000002,0x800,0x100000)/File(\\EFI\\systemd\\systemd-bootx64.efi)\n"
+        );
+        // The setup media, another system, and systemd-boot on another ESP
+        // are never selected.
+        assert_eq!(boot_entry_for_esp(&entries, esp).unwrap(), "0001");
+        assert!(boot_entry_for_esp(&entries, "0f0e0d0c-0000-4000-8000-000000000003").is_err());
+        let twice = format!(
+            "{entries}Boot0004* Copy\tHD(2,GPT,{esp},0x800,0x100000)/File(\\EFI\\systemd\\systemd-bootx64.efi)\n"
+        );
+        assert!(boot_entry_for_esp(&twice, esp).is_err());
+        let grub = format!(
+            "Boot0005* ubuntu\tHD(2,GPT,{esp},0x800,0x100000)/File(\\EFI\\ubuntu\\shimx64.efi)\n"
+        );
+        assert!(boot_entry_for_esp(&grub, esp).is_err());
     }
 
     #[test]

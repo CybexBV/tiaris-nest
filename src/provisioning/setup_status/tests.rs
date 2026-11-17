@@ -728,3 +728,185 @@ fn only_valid_stopped_or_failed_screens_are_preserved() {
     fs::write(&path, vec![b' '; MAX_STATUS_BYTES + 1]).unwrap();
     assert!(!SetupStatusReporter::with_boot_mode(Some(path), None).holding());
 }
+
+fn claim_view<'a>(state: ClaimState) -> ClaimView<'a> {
+    ClaimView {
+        state,
+        letters: Some("KXQM"),
+        code: Some("KX-4821-QM"),
+        url: Some("dev.tiaris.com/nest"),
+        retry_at: Some(chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap()),
+        organization: Some("Greenfield School"),
+        starts_installed_at: None,
+    }
+}
+
+#[test]
+fn claim_states_carry_only_the_fields_the_contract_allows() {
+    let cases = [
+        (
+            ClaimState::Connecting,
+            json!({"state":"connecting","url":"dev.tiaris.com/nest"}),
+        ),
+        (
+            ClaimState::Claimable,
+            json!({"state":"claimable","letters":"KXQM","code":"KX-4821-QM","url":"dev.tiaris.com/nest"}),
+        ),
+        (
+            ClaimState::Backoff,
+            json!({"state":"backoff","url":"dev.tiaris.com/nest","retry_at":"2027-01-15T08:00:00Z"}),
+        ),
+        (
+            ClaimState::Claimed,
+            json!({"state":"claimed","url":"dev.tiaris.com/nest","organization":"Greenfield School"}),
+        ),
+        (
+            ClaimState::Outdated,
+            json!({"state":"outdated","url":"dev.tiaris.com/nest"}),
+        ),
+    ];
+    for (state, expected) in cases {
+        assert_eq!(
+            serde_json::to_value(claim_status(&claim_view(state))).unwrap(),
+            expected
+        );
+    }
+    // Before Management answered there is no URL.
+    let mut view = claim_view(ClaimState::Connecting);
+    view.url = None;
+    assert_eq!(
+        serde_json::to_value(claim_status(&view)).unwrap(),
+        json!({"state":"connecting"})
+    );
+    // A URL longer than 80 characters is left out, never cut.
+    let longest = format!("dev.tiaris.com/{}", "n".repeat(65));
+    let longer = format!("{longest}x");
+    view.url = Some(&longest);
+    assert_eq!(
+        serde_json::to_value(claim_status(&view)).unwrap()["url"],
+        json!(longest)
+    );
+    view.url = Some(&longer);
+    assert_eq!(
+        serde_json::to_value(claim_status(&view)).unwrap(),
+        json!({"state":"connecting"})
+    );
+    // A server that already runs a Nest says when the ISO starts it, but only
+    // while it waits for a claim.
+    for state in [
+        ClaimState::Connecting,
+        ClaimState::Claimable,
+        ClaimState::Backoff,
+        ClaimState::Claimed,
+        ClaimState::Outdated,
+    ] {
+        let mut view = claim_view(state);
+        view.starts_installed_at = chrono::DateTime::from_timestamp(1_800_000_600, 0);
+        let status = serde_json::to_value(claim_status(&view)).unwrap();
+        let waiting = matches!(
+            state,
+            ClaimState::Connecting | ClaimState::Claimable | ClaimState::Backoff
+        );
+        assert_eq!(
+            status.get("starts_installed_at"),
+            waiting.then(|| json!("2027-01-15T08:10:00Z")).as_ref(),
+            "{state:?}"
+        );
+    }
+    // Single-line, bounded public text.
+    let mut view = claim_view(ClaimState::Claimed);
+    let long = format!("Green\nfield {}", "x".repeat(200));
+    view.organization = Some(&long);
+    let organization = claim_status(&view).organization.unwrap();
+    assert!(!organization.contains('\n'));
+    assert_eq!(organization.chars().count(), MAX_VALUE_CHARS);
+}
+
+#[test]
+fn claim_screen_replaces_a_preserved_stop_and_hands_over_to_checking() {
+    let (dir, path, _) = restarted_after(|status| {
+        status.media_verified("https://manage.cybex.net");
+        status.process_failed();
+    });
+    let (status, _) = reporter(&dir);
+    status.begin();
+    assert_eq!(published(&path)["state"], "stopped");
+    status.claim(
+        "https://manage.tiaris.com",
+        &claim_view(ClaimState::Claimable),
+    );
+    assert!(!status.holding());
+    let shown = published(&path);
+    let mut keys = shown
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.sort();
+    assert_eq!(
+        keys,
+        ["claim", "schema", "state", "tiaris_host", "updated_at"]
+    );
+    assert_eq!(shown["schema"], SETUP_STATUS_SCHEMA);
+    assert_eq!(shown["state"], "claim");
+    assert_eq!(shown["tiaris_host"], "manage.tiaris.com");
+    assert_eq!(shown["claim"]["letters"], "KXQM");
+
+    status.claim(
+        "https://manage.tiaris.com",
+        &claim_view(ClaimState::Claimed),
+    );
+    assert!(published(&path)["claim"].get("letters").is_none());
+    assert!(!status.disk_may_be_changed());
+
+    // The verified envelope moves on to the existing screens.
+    status.media_verified("https://manage.tiaris.com");
+    let shown = published(&path);
+    assert_eq!(shown["state"], "checking");
+    assert_eq!(shown["boot_mode"], "uefi");
+    assert!(shown.get("claim").is_none());
+    assert_eq!(shown["checks"].as_array().unwrap().len(), 6);
+
+    // A failure after the claim but before any disk write is an untouched stop.
+    status.process_failed();
+    let shown = published(&path);
+    assert_eq!(shown["state"], "stopped");
+    assert_eq!(shown["stop"]["disk_untouched"], true);
+    assert!(shown.get("claim").is_none());
+}
+
+#[test]
+fn a_new_claim_after_an_ended_setup_starts_from_a_clean_screen() {
+    let (plan, inventory) = fixture();
+    let dir = tempdir::TempDir::new();
+    let (status, path) = reporter(&dir);
+    status.claim(
+        "https://manage.tiaris.com",
+        &claim_view(ClaimState::Claimed),
+    );
+    status.media_verified("https://manage.tiaris.com");
+    status.inventory_collected(&inventory);
+    status.session_claimed(&inventory);
+    status.plan_approved(&plan, &inventory);
+    assert!(!status.disk_may_be_changed());
+    status.claim(
+        "https://manage.tiaris.com",
+        &claim_view(ClaimState::Connecting),
+    );
+    let shown = published(&path);
+    assert_eq!(shown["state"], "claim");
+    for stale in [
+        "organization",
+        "name",
+        "disk",
+        "network",
+        "step",
+        "approved_at",
+        "checks",
+    ] {
+        assert!(shown.get(stale).is_none(), "{stale}");
+    }
+    status.disk_write_started();
+    assert!(status.disk_may_be_changed());
+}
