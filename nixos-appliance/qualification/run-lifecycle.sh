@@ -3,7 +3,7 @@ set -Eeuo pipefail
 umask 077
 
 usage() {
-  echo "usage: $0 --template ISO --manifest JSON --manage-origin URL --token-file FILE --output FILE [--published-predecessor-inputs JSON] [--retain-fixture DIRECTORY] [--require-candidate-runtime | --prepublication-candidate] [--induce-preflight-retry] [--proxmox-reinstall-over FIXTURE_DIRECTORY]" >&2
+  echo "usage: $0 --template ISO --manifest JSON --manage-origin URL --token-file FILE --output FILE [--published-predecessor-inputs JSON] [--retain-fixture DIRECTORY] [--require-candidate-runtime | --prepublication-candidate] [--proxmox-reinstall-over FIXTURE_DIRECTORY]" >&2
   exit 2
 }
 
@@ -18,7 +18,6 @@ predecessor_identity=""
 fixture_dir=""
 require_candidate_runtime=false
 prepublication_candidate=false
-induce_preflight_retry=false
 proxmox_reinstall_over=""
 while (($#)); do
   case "$1" in
@@ -31,7 +30,6 @@ while (($#)); do
     --retain-fixture) fixture_dir="${2:-}"; shift 2 ;;
     --require-candidate-runtime) require_candidate_runtime=true; shift ;;
     --prepublication-candidate) prepublication_candidate=true; shift ;;
-    --induce-preflight-retry) induce_preflight_retry=true; shift ;;
     --proxmox-reinstall-over) proxmox_reinstall_over="${2:-}"; shift 2 ;;
     --output) output="${2:-}"; shift 2 ;;
     *) usage ;;
@@ -58,11 +56,18 @@ if [[ -n "$proxmox_reinstall_over" ]]; then
   test "$(jq -er '.schema' "$proxmox_reinstall_over/fixture.json")" = tiaris.nest.qualification-fixture.v1
   test -f "$proxmox_reinstall_over/appliance.raw" && test -f "$proxmox_reinstall_over/OVMF_VARS.fd"
 fi
+# The generic ISO is claimed with the code on its screen. Only the isolated
+# fixture can read that code (from its own database), so qualification installs
+# only against the fixture's Manage, reached through its root-private socket.
+test -S "${TIARIS_NEST_QUALIFICATION_STATE:?set the owned development fixture directory}/manage.sock" || {
+  echo 'error: qualification claims the generic ISO through the isolated Manage fixture only' >&2
+  exit 1
+}
 python3 -B "$repository_root/nixos-appliance/qualification/development-scope.py" verify \
   --state-dir "${TIARIS_NEST_QUALIFICATION_STATE:?set the owned development fixture directory}" \
   --manage-origin "$manage_origin" \
   --bridge "${TIARIS_NEST_QUALIFICATION_BRIDGE:?set the owned development bridge}"
-for command_name in curl git ip jq python3 qemu-system-x86_64 truncate sha256sum openssl ssh-keygen ssh rg; do
+for command_name in cmp git jq python3 qemu-system-x86_64 truncate sha256sum ssh-keygen ssh rg; do
   command -v "$command_name" >/dev/null || { echo "error: missing $command_name" >&2; exit 1; }
 done
 python3 -B "$repository_root/tools/nest-release.py" validate-manage-origin \
@@ -99,8 +104,7 @@ appliance_uuid="$(jq -er '.uuid' <<<"$hardware")"
 management_cidr="${TIARIS_NEST_QUALIFICATION_MANAGEMENT_CIDR:?set the qualification Management CIDR}"
 memory_mib="${TIARIS_NEST_QUALIFICATION_MEMORY_MIB:-18432}"
 [[ "$memory_mib" =~ ^[0-9]+$ ]] && ((memory_mib >= 16384 && memory_mib <= 65536))
-token="$(tr -d '\r\n' < "$token_file")"
-test -n "$token"
+test -n "$(tr -d '\r\n' < "$token_file")"
 release_version="$(jq -er '.version' "$manifest")"
 system_closure_sha256="$(jq -er '.appliance_release_v1.system_closure.sha256' "$manifest")"
 has_predecessor="${TIARIS_NEST_HAS_PREDECESSOR:?set the governed predecessor state}"
@@ -109,17 +113,11 @@ case "$has_predecessor" in
   *) echo 'error: invalid governed predecessor state' >&2; exit 1 ;;
 esac
 
-if [[ "$induce_preflight_retry" = true ]]; then
-  test ! -e "$TIARIS_NEST_QUALIFICATION_STATE/q03-diagnostics"
-  test ! -e "$TIARIS_NEST_QUALIFICATION_STATE/q03-preflight-retry.json"
-fi
 work_dir="$(mktemp -d)"
 qemu_pid=""
 tap_name=""
-package_server_pid=""
 session_id=""
 lifecycle_succeeded=false
-personalized="$work_dir/personalized.iso"
 cleanup() {
   if [[ -n "$qemu_pid" ]] && kill -0 "$qemu_pid" 2>/dev/null; then
     kill "$qemu_pid" 2>/dev/null || true
@@ -130,21 +128,14 @@ cleanup() {
       --state-dir "$TIARIS_NEST_QUALIFICATION_STATE" --manage-origin "$manage_origin" \
       --bridge "$bridge" --role appliance
   fi
-  if [[ -n "$package_server_pid" ]] && kill -0 "$package_server_pid" 2>/dev/null; then
-    kill "$package_server_pid" 2>/dev/null || true
-    wait "$package_server_pid" 2>/dev/null || true
-  fi
   if [[ -n "$session_id" && "$lifecycle_succeeded" != true ]]; then
     cleanup_session="$work_dir/cleanup-session.json"
     if api GET "/v1/nest/provisioning-sessions/$session_id" > "$cleanup_session" 2>/dev/null \
       && [[ "$(jq -r '.destructive_started_at // ""' "$cleanup_session")" = "" ]] \
       && [[ "$(jq -r '.state' "$cleanup_session")" =~ ^(created|claimed|awaiting_approval|approved|failed)$ ]]
     then
-      api POST "/v1/nest/provisioning-sessions/$session_id/revoke" >/dev/null 2>&1 || true
+      api POST "/v1/nest/provisioning-sessions/$session_id/revoke" '{}' >/dev/null 2>&1 || true
     fi
-  fi
-  if [[ -f "$personalized" ]]; then
-    shred -u -n 1 -z -- "$personalized" 2>/dev/null || rm -f -- "$personalized"
   fi
   if [[ "$lifecycle_succeeded" = true && -n "$fixture_dir" ]]; then
     # Stop the VM before handing off its disk. The update wrapper owns the next
@@ -168,68 +159,16 @@ cleanup() {
     cp -- "$work_dir/serial.log" "$(dirname -- "$output")/serial-$session_id.log"
     chmod 0600 "$(dirname -- "$output")/serial-$session_id.log"
   fi
-  if [[ "$induce_preflight_retry" = true ]]; then
-    diagnostics="$TIARIS_NEST_QUALIFICATION_STATE/q03-diagnostics"
-    mkdir -m 0700 -- "$diagnostics"
-    for name in fault-responses.jsonl retry-attempt.json initial-approved.json initial-approval.json reapproved.json preflight-failed-serial.log; do
-      if [[ -f "$work_dir/$name" ]]; then cp -- "$work_dir/$name" "$diagnostics/$name"; fi
-    done
-  fi
   rm -rf -- "$work_dir"
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
 api() {
-  local method="$1" path="$2" body="${3:-}"
-  if [[ -S "$TIARIS_NEST_QUALIFICATION_STATE/manage.sock" ]]; then
-    local rpc_args=(--state-dir "$TIARIS_NEST_QUALIFICATION_STATE" api --path "$path")
-    if [[ -n "$body" ]]; then rpc_args+=(--body "$body"); fi
-    python3 -B "$repository_root/nixos-appliance/qualification/isolated_manage_rpc.py" "${rpc_args[@]}"
-    return
-  fi
-  PYTHONPATH="$repository_root/nixos-appliance/qualification" python3 -B -c 'import sys; from isolated_fixture import SCOPE; SCOPE["development_origin"](sys.argv[1])' "$manage_origin"
-  local response="$work_dir/api-response.json"
-  local attempt=1 max_attempts=1 status http_code
-  local curl_args=(-4 --fail --silent --show-error --proto '=https' --tlsv1.2
-    --noproxy '*' --connect-timeout 15 --max-time 120 --output "$response"
-    --write-out '%{http_code}' --request "$method"
-    --header "Authorization: Bearer $token")
-  # Read-only polling can tolerate a gateway disconnect. Never retry mutations:
-  # their response may have been lost after the server accepted the operation.
-  if [[ "$method" = GET ]]; then
-    max_attempts=4
-  fi
-  if [[ -n "$body" ]]; then
-    curl_args+=(--header 'Content-Type: application/json' --data-binary "$body")
-  fi
-  while ((attempt <= max_attempts)); do
-    rm -f -- "$response"
-    if http_code="$(curl "${curl_args[@]}" "$manage_origin$path")"; then
-      status=0
-    else
-      status=$?
-    fi
-    if ((status == 0)) && [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
-      cat -- "$response"
-      rm -f -- "$response"
-      return 0
-    fi
-    # Curl 22 identifies an HTTP failure; all other listed codes are bounded
-    # connection, timeout, incomplete-response, or TLS-handshake failures.
-    if ((attempt == max_attempts)) || {
-      [[ "$status" = 22 ]] && [[ ! "$http_code" =~ ^(408|429|502|503|504|525)$ ]]
-    } || {
-      [[ "$status" != 22 ]] && [[ ! "$status" =~ ^(6|7|18|28|35|52|55|56|92)$ ]]
-    }; then
-      rm -f -- "$response"
-      ((status == 0)) && status=22 # Redirects are refused rather than followed.
-      return "$status"
-    fi
-    rm -f -- "$response"
-    sleep 1
-    ((attempt += 1))
-  done
+  local path="$2" body="${3:-}"
+  local rpc_args=(--state-dir "$TIARIS_NEST_QUALIFICATION_STATE" api --path "$path")
+  if [[ -n "$body" ]]; then rpc_args+=(--body "$body"); fi
+  python3 -B "$repository_root/nixos-appliance/qualification/isolated_manage_rpc.py" "${rpc_args[@]}"
 }
 
 check_delivery_policy() {
@@ -248,145 +187,27 @@ python3 -B "$repository_root/nixos-appliance/qualification/blueprint-catalog.py"
   --fixture-blueprint "${TIARIS_NEST_QUALIFICATION_FIXTURE_BLUEPRINT:-qualification_dock}" \
   > "$blueprints"
 
-package_delivery="$(jq -er '.installer_iso_template_v3.package_delivery // "embedded"' "$manifest")"
-package_transport_url=""
-installer_iso_transport_url=""
-case "$package_delivery" in
-  embedded) ;;
-  system-closure-v1)
-    package_filename="tiaris-nest-appliance-closure-$release_version-x86_64-linux.tar.zst"
-    signed_package_url="$(jq -er '.appliance_release_v1.system_closure.url' "$manifest")"
-    [[ "$signed_package_url" = */"$package_filename" ]]
-    manifest_directory="$(cd -- "$(dirname -- "$manifest")" && pwd -P)"
-    package_snapshot="$manifest_directory/$package_filename"
-    test -f "$package_snapshot" && test ! -L "$package_snapshot"
-    test "$(stat -c '%s' "$package_snapshot")" = \
-      "$(jq -er '.appliance_release_v1.system_closure.size_bytes' "$manifest")"
-    test "$(sha256sum "$package_snapshot" | awk '{print $1}')" = \
-      "$(jq -er '.appliance_release_v1.system_closure.sha256' "$manifest")"
+# The fixture serves the release's closure privately and its Manage hands that
+# copy to the claimed setup (TIARIS_DEV_NEST_APPLIANCE_CLOSURE_TRANSPORT_URL).
+test "$(jq -er '.installer_iso_template_v3.package_delivery' "$manifest")" = system-closure-v1
 
-    if [[ -S "$TIARIS_NEST_QUALIFICATION_STATE/manage.sock" ]]; then
-      [[ "$induce_preflight_retry" = false ]] || {
-        echo 'error: isolated artifact transport does not support fault injection' >&2
-        exit 1
-      }
-      installer_transports="$(python3 -B "$repository_root/nixos-appliance/qualification/isolated_manage_rpc.py" \
-        --state-dir "$TIARIS_NEST_QUALIFICATION_STATE" installer-transports \
-        --manifest-sha256 "$(sha256sum "$manifest" | awk '{print $1}')")"
-      package_transport_url="$(jq -er .package_transport_url <<<"$installer_transports")"
-      installer_iso_transport_url="$(jq -er .installer_iso_transport_url <<<"$installer_transports")"
-    else
-    mapfile -t bridge_addresses < <(
-      ip -4 -o address show dev "$bridge" scope global \
-        | awk '{sub(/\/.*/, "", $4); print $4}'
-    )
-    bridge_ipv4="${TIARIS_NEST_QUALIFICATION_PACKAGE_BIND_ADDRESS:-}"
-    if [[ -n "$bridge_ipv4" ]]; then
-      printf '%s\n' "${bridge_addresses[@]}" | grep -Fx "$bridge_ipv4" >/dev/null
-    else
-      for candidate in "${bridge_addresses[@]}"; do
-        if python3 -B -c \
-          'import ipaddress,sys; a=ipaddress.ip_address(sys.argv[1]); raise SystemExit(not (a.version == 4 and a.is_private and not a.is_loopback))' \
-          "$candidate"
-        then
-          bridge_ipv4="$candidate"
-          break
-        fi
-      done
-    fi
-    test -n "$bridge_ipv4" || {
-      echo "error: qualification bridge $bridge has no private IPv4 address" >&2
-      exit 1
-    }
-    python3 -B -c \
-      'import ipaddress,sys; a=ipaddress.ip_address(sys.argv[1]); raise SystemExit(not (a.version == 4 and a.is_private and not a.is_loopback))' \
-      "$bridge_ipv4"
-
-    package_port_file="$work_dir/package-server.port"
-    if [[ "$induce_preflight_retry" = true ]]; then
-      printf 'corrupt\n' > "$work_dir/fault-control"
-      python3 -B "$repository_root/nixos-appliance/qualification/serve-faulted-closure.py" \
-        --bind "$bridge_ipv4" --file "$package_snapshot" --sha256 "$system_closure_sha256" \
-        --size "$(stat -c '%s' "$package_snapshot")" --port-file "$package_port_file" \
-        --control "$work_dir/fault-control" --receipts "$work_dir/fault-responses.jsonl" &
-    else
-      python3 -B "$repository_root/nixos-appliance/qualification/serve-system-closure.py" \
-        --bind "$bridge_ipv4" --file "$package_snapshot" --port-file "$package_port_file" &
-    fi
-    package_server_pid=$!
-    for _attempt in $(seq 1 100); do
-      [[ -s "$package_port_file" ]] && break
-      kill -0 "$package_server_pid"
-      sleep 0.1
-    done
-    package_port="$(tr -d '\r\n' < "$package_port_file")"
-    [[ "$package_port" =~ ^[1-9][0-9]{0,4}$ ]] && ((package_port <= 65535))
-    package_transport_url="http://$bridge_ipv4:$package_port/$package_filename"
-    curl --fail --silent --show-error --proto '=http' --head \
-      "$package_transport_url" >/dev/null
-    fi
-    ;;
-  *)
-    echo "error: unsupported installer package delivery contract: $package_delivery" >&2
-    exit 1
-    ;;
-esac
-
-create_response="$work_dir/create.json"
-if [[ -n "$package_transport_url" ]]; then
-  create_body="$(jq -c --arg package_transport_url "$package_transport_url" \
-    '{label:"release qualification",qualification_candidate:{release_version:.version,installer_iso_template_v3:.installer_iso_template_v3,appliance_release_v1:.appliance_release_v1,package_transport_url:$package_transport_url}}' \
-    "$manifest")"
-else
-  create_body="$(jq -c '
-    . as $manifest
-    | {label:"release qualification",qualification_candidate:{release_version:$manifest.version,installer_iso_template_v3:$manifest.installer_iso_template_v3}}
-    | if ($manifest | has("appliance_release_v1"))
-      then .qualification_candidate.appliance_release_v1 = $manifest.appliance_release_v1
-      else .
-      end' "$manifest")"
-fi
-if [[ -n "$installer_iso_transport_url" ]]; then
-  create_body="$(jq -c --arg url "$installer_iso_transport_url" \
-    '.qualification_candidate.installer_iso_transport_url = $url' <<<"$create_body")"
-fi
-api POST /v1/nest/provisioning-sessions "$create_body" > "$create_response"
-session_id="$(jq -er '.session.id' "$create_response")"
-if [[ -n "${TIARIS_NEST_QUALIFICATION_SESSION_RECEIPT:-}" ]]; then
-  test ! -e "$TIARIS_NEST_QUALIFICATION_SESSION_RECEIPT"
-  jq -n --arg session_id "$session_id" '{session_id:$session_id}' > "$TIARIS_NEST_QUALIFICATION_SESSION_RECEIPT"
-  chmod 0600 "$TIARIS_NEST_QUALIFICATION_SESSION_RECEIPT"
-fi
-media_secret="$(jq -er '.media_secret' "$create_response")"
-download_path="$(jq -er '.download_path' "$create_response")"
-[[ "$download_path" = "/v1/nest/provisioning-sessions/$session_id/appliance-iso" ]]
-personalization_path="$(jq -er '.personalization_path' "$create_response")"
-[[ "$personalization_path" = "/v1/nest/provisioning-sessions/$session_id/personalization-envelope" ]]
-
-headers="$work_dir/download.headers"
-envelope="$work_dir/personalization-envelope.bin"
-if [[ -S "$TIARIS_NEST_QUALIFICATION_STATE/manage.sock" ]]; then
-  printf '%s\n' "$media_secret" | python3 -B "$repository_root/nixos-appliance/qualification/isolated_manage_rpc.py" \
-    --state-dir "$TIARIS_NEST_QUALIFICATION_STATE" personalize --path "$personalization_path" --output "$envelope" --headers-output "$headers"
-else
-curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
-  --header "Authorization: Bearer $token" \
-  --header "X-Tiaris-Nest-Provisioning-Secret: $media_secret" \
-  --dump-header "$headers" --output "$envelope" "$manage_origin$personalization_path"
-fi
-test "$(stat -c '%s' "$envelope")" -eq 8192
-cp --reflink=auto -- "$template" "$personalized"
-chmod 0600 "$personalized"
-personalization_offset="$(jq -er '.installer_iso_template_v3.personalization_offset' "$manifest")"
-dd if="$envelope" of="$personalized" bs=1 seek="$personalization_offset" conv=notrunc status=none
-rm -f -- "$envelope"
-verification="$work_dir/media-verification.json"
-TIARIS_NEST_MEDIA_SECRET="$media_secret" \
-  python3 -B "$repository_root/nixos-appliance/qualification/verify-personalized-media.py" \
-    --iso "$personalized" --manifest "$manifest" --headers "$headers" \
-    --session-id "$session_id" > "$verification"
-unset media_secret
-rm -f "$create_response"
+# Boot the release's generic ISO itself, read-only: the same bytes every
+# administrator downloads. Its signed template declares the claim protocol and
+# its slot is all zeros, so the bootstrap registers for a claim.
+manifest_sha256="$(sha256sum "$manifest" | awk '{print $1}')"
+template_sha256="$(jq -er '.installer_iso_template_v3.template_sha256' "$manifest")"
+test "$(stat -c '%s' "$template")" = "$(jq -er '.installer_iso_template_v3.size_bytes' "$manifest")"
+test "$(sha256sum "$template" | awk '{print $1}')" = "$template_sha256"
+jq -e '.installer_iso_template_v3.setup_claim_protocol | type == "number" and . >= 1' "$manifest" >/dev/null || {
+  echo 'error: the release ISO does not support the setup claim' >&2
+  exit 1
+}
+slot_offset="$(jq -er '.installer_iso_template_v3.personalization_offset' "$manifest")"
+test "$(jq -er '.installer_iso_template_v3.personalization_size' "$manifest")" = 8192
+cmp -s -n 8192 -i "$slot_offset:0" -- "$template" /dev/zero || {
+  echo 'error: the release ISO is not generic: its setup slot is not empty' >&2
+  exit 1
+}
 
 disk="$work_dir/appliance.raw"
 if [[ -n "$proxmox_reinstall_over" ]]; then
@@ -417,7 +238,7 @@ start_qemu() {
     -drive "if=pflash,format=raw,unit=1,file=$work_dir/OVMF_VARS.fd" \
     -drive "if=none,id=system,format=raw,file=$disk,cache=none" \
     -device virtio-scsi-pci,id=scsi0 -device "scsi-hd,drive=system,serial=$appliance_serial" \
-    -drive "if=none,id=installer,media=cdrom,readonly=on,format=raw,file=$personalized" \
+    -drive "if=none,id=installer,media=cdrom,readonly=on,format=raw,file=$template" \
     -device ide-cd,drive=installer \
     -netdev "tap,id=net0,ifname=$tap_name,script=no,downscript=no" -device "virtio-net-pci,netdev=net0,id=nic0,mac=$appliance_mac,bus=pcie.0,addr=0x3" \
     -device i6300esb,bus=pcie.0,addr=0x4 -watchdog-action reset \
@@ -435,7 +256,7 @@ start_proxmox_like_qemu() {
     -drive "if=pflash,format=raw,unit=1,file=$work_dir/OVMF_VARS.fd" \
     -drive "if=none,id=system,format=raw,file=$disk,cache=none" \
     -device virtio-scsi-pci,id=scsi0,bus=pci.0,addr=0x5 -device "scsi-hd,drive=system,serial=$appliance_serial" \
-    -drive "if=none,id=installer,media=cdrom,readonly=on,format=raw,file=$personalized" \
+    -drive "if=none,id=installer,media=cdrom,readonly=on,format=raw,file=$template" \
     -device ide-cd,drive=installer \
     -netdev "tap,id=net0,ifname=$tap_name,script=no,downscript=no" -device "virtio-net-pci,netdev=net0,id=nic0,mac=$appliance_mac,bus=pci.0,addr=0x3" \
     -device i6300esb,bus=pci.0,addr=0x4 -watchdog-action reset \
@@ -445,6 +266,28 @@ start_proxmox_like_qemu() {
 }
 
 start_qemu
+
+# Claim the guest with the code on its screen, which the fixture reads from its
+# own database. The claim installs the release the fixture's Manage publishes;
+# the fixture refuses unless that is this manifest.
+claim="$work_dir/claim.json"
+for _attempt in $(seq 1 180); do
+  python3 -B "$repository_root/nixos-appliance/qualification/isolated_manage_rpc.py" \
+    --state-dir "$TIARIS_NEST_QUALIFICATION_STATE" claim-setup \
+    --label "Nest release qualification $release_version" --manifest-sha256 "$manifest_sha256" > "$claim"
+  if [[ "$(jq -r 'type' "$claim")" = object ]]; then break; fi
+  kill -0 "$qemu_pid"
+  sleep 5
+done
+session_id="$(jq -er '.session.id' "$claim")"
+test "$(jq -er '.session.created_by_setup_claim' "$claim")" = true
+test "$(jq -er '.session.release_version' "$claim")" = "$release_version"
+test "$(jq -er '.session.template_sha256' "$claim")" = "$template_sha256"
+if [[ -n "${TIARIS_NEST_QUALIFICATION_SESSION_RECEIPT:-}" ]]; then
+  test ! -e "$TIARIS_NEST_QUALIFICATION_SESSION_RECEIPT"
+  jq -n --arg session_id "$session_id" '{session_id:$session_id}' > "$TIARIS_NEST_QUALIFICATION_SESSION_RECEIPT"
+  chmod 0600 "$TIARIS_NEST_QUALIFICATION_SESSION_RECEIPT"
+fi
 
 session="$work_dir/session.json"
 claimed=false
@@ -461,30 +304,12 @@ test "$(jq -r '.inventory.secure_boot' "$session")" = false
 test "$(jq -er '.inventory.boot_mode' "$session")" = uefi
 test "$(jq -er '.blockers | length' "$session")" = 0
 test "$(jq -er '[.inventory.disks[] | select(.eligible == true)] | length' "$session")" = 1
+# The claimed server is the owned guest: its own disk serial and NIC address.
+test "$(jq -er '.inventory.disks[] | select(.eligible == true) | .serial' "$session")" = "$appliance_serial"
+jq -e --arg mac "$appliance_mac" \
+  '[.inventory.ethernet_interfaces[] | select((.mac | ascii_downcase) == ($mac | ascii_downcase))] | length == 1' \
+  "$session" >/dev/null
 test "$(python3 -B "$repository_root/nixos-appliance/qualification/disk-fingerprint.py" "$disk")" = "$preapproval_digest"
-
-# Suspend the owned guest before recording fresh inventory and approving its
-# disk. It cannot consume the plan while the development allowlist is refreshed.
-qualification_guest_control() {
-  python3 -B - "$repository_root/nixos-appliance/qualification" "$work_dir/qmp.sock" "$1" <<'PY'
-import sys
-sys.path.insert(0, sys.argv[1])
-from isolated_fixture import QMP
-monitor = QMP(sys.argv[2])
-try:
-    monitor.call(sys.argv[3])
-    status = monitor.call('query-status')
-    if status['running'] != (sys.argv[3] == 'cont'):
-        raise ValueError('Owned guest did not enter the requested approval boundary')
-finally:
-    monitor.socket.close()
-PY
-}
-if [[ -n "${TIARIS_NEST_QUALIFICATION_ALLOW_DEVICE_HELPER:-}" ]]; then
-  qualification_guest_control stop
-  "$TIARIS_NEST_QUALIFICATION_ALLOW_DEVICE_HELPER" --prepare \
-    --state-dir "$TIARIS_NEST_QUALIFICATION_STATE" --session-id "$session_id"
-fi
 
 revision="$(jq -er '.session_revision' "$session")"
 inventory_sha="$(jq -er '.inventory_sha256' "$session")"
@@ -499,44 +324,8 @@ approve_body="$(jq -cn \
   '{session_revision:$revision,inventory_sha256:$inventory,display_name:$display_name,target_disk_id:$disk,network:{mode:"dhcp",interface_id:$interface,address_cidr:null,gateway:null,dns_servers:[]},maintenance_window:{timezone:"UTC",weekday:$weekday,start:$start,duration_minutes:240},management_cidrs:[$cidr]}')"
 printf '%s\n' "$approve_body" > "$work_dir/initial-approval.json"
 api POST "/v1/nest/provisioning-sessions/$session_id/approve" "$approve_body" > "$work_dir/initial-approved.json"
-if [[ -S "$TIARIS_NEST_QUALIFICATION_STATE/manage.sock" ]]; then
-  python3 -B "$repository_root/nixos-appliance/qualification/isolated_manage_rpc.py" \
-    --state-dir "$TIARIS_NEST_QUALIFICATION_STATE" allow-device --session-id "$session_id"
-fi
-if [[ -n "${TIARIS_NEST_QUALIFICATION_ALLOW_DEVICE_HELPER:-}" ]]; then
-  "$TIARIS_NEST_QUALIFICATION_ALLOW_DEVICE_HELPER" \
-    --state-dir "$TIARIS_NEST_QUALIFICATION_STATE" --session-id "$session_id"
-  qualification_guest_control cont
-fi
-
-if [[ "$induce_preflight_retry" = true ]]; then
-  # The ordinary installer must reject altered response bytes before seq1/seq2
-  # authorize any target write. Only this owned guest and transport are affected.
-  python3 -B "$repository_root/nixos-appliance/qualification/preflight_retry.py" begin \
-    --state-dir "$TIARIS_NEST_QUALIFICATION_STATE" --session-id "$session_id" \
-    --initial "$work_dir/initial-approved.json" --qmp "$work_dir/qmp.sock" \
-    --disk "$disk" --disk-digest "$preapproval_digest" --iso "$personalized" \
-    --responses "$work_dir/fault-responses.jsonl" --receipt "$work_dir/retry-attempt.json"
-  # This is an actual same-media cold restart, not a new ISO or replacement disk.
-  # begin left the exact guest paused; no graceful flush can hide a disk write.
-  kill -KILL "$qemu_pid"
-  wait "$qemu_pid" 2>/dev/null || [[ "$?" = 137 ]]
-  qemu_pid=""
-  python3 -B "$repository_root/nixos-appliance/qualification/development-scope.py" tap-delete \
-    --state-dir "$TIARIS_NEST_QUALIFICATION_STATE" --manage-origin "$manage_origin" \
-    --bridge "$bridge" --role appliance
-  tap_name=""
-  mv "$work_dir/serial.log" "$work_dir/preflight-failed-serial.log"
-  rm -f "$work_dir/qmp.sock"
-  restarted_at="$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')"
-  start_qemu
-  python3 -B "$repository_root/nixos-appliance/qualification/preflight_retry.py" approve \
-    --state-dir "$TIARIS_NEST_QUALIFICATION_STATE" --session-id "$session_id" \
-    --initial "$work_dir/initial-approved.json" --qmp "$work_dir/qmp.sock" \
-    --disk "$disk" --iso "$personalized" --receipt "$work_dir/retry-attempt.json" \
-    --approval "$work_dir/initial-approval.json" --reapproved "$work_dir/reapproved.json" \
-    --control "$work_dir/fault-control" --restarted-at "$restarted_at"
-fi
+python3 -B "$repository_root/nixos-appliance/qualification/isolated_manage_rpc.py" \
+  --state-dir "$TIARIS_NEST_QUALIFICATION_STATE" allow-device --session-id "$session_id"
 
 ready=false
 reboot_deadline=0
@@ -824,18 +613,14 @@ python3 -B "$repository_root/nixos-appliance/qualification/blueprint-catalog.py"
   --fixture-blueprint "${TIARIS_NEST_QUALIFICATION_FIXTURE_BLUEPRINT:-qualification_dock}" \
   --baseline "$blueprints" >/dev/null
 
-template_sha="$(jq -er '.template_sha256' "$verification")"
-personalized_sha="$(jq -er '.personalized_sha256' "$verification")"
-if [[ -S "$TIARIS_NEST_QUALIFICATION_STATE/manage.sock" ]]; then
-  # Routine fixture requests compare sealed identities; rehash every staged
-  # artifact byte once before this lifecycle receipt is written.
-  python3 -B "$repository_root/nixos-appliance/qualification/isolated_manage_rpc.py" \
-    --state-dir "$TIARIS_NEST_QUALIFICATION_STATE" verify-artifacts
-fi
+# Routine fixture requests compare sealed identities; rehash every staged
+# artifact byte once before this lifecycle receipt is written.
+python3 -B "$repository_root/nixos-appliance/qualification/isolated_manage_rpc.py" \
+  --state-dir "$TIARIS_NEST_QUALIFICATION_STATE" verify-artifacts
 jq -n \
   --slurpfile qualified_blueprints "$blueprints" \
   --arg qualification_kind "$qualification_kind" \
-  --arg qualified_manifest_sha256 "$(sha256sum "$manifest" | awk '{print $1}')" \
+  --arg qualified_manifest_sha256 "$manifest_sha256" \
   --arg harness_revision "$source_revision" \
   --arg schema 'tiaris.nest.nixos-appliance-qualification.v1' \
   --arg release_version "$release_version" \
@@ -844,10 +629,9 @@ jq -n \
   --arg nixpkgs_revision "$(jq -er '.nixpkgs_revision' "$node")" \
   --arg manage_source_revision "$(jq -er '.appliance_release_v1.manage_source_revision' "$manifest")" \
   --arg system_generation "$(jq -er '.system_generation | tostring' "$node")" \
-  --arg session_id "$session_id" --arg template_sha256 "$template_sha" \
+  --arg session_id "$session_id" --arg template_sha256 "$template_sha256" \
   --arg device_id "$device_id" \
   --argjson candidate_runtime_required "$require_candidate_runtime" \
-  --arg personalized_sha256 "$personalized_sha" \
   --argjson workstation_runtime_operational "$runtime_operational" \
   --argjson workstation_runtime_converged "$runtime_converged" \
   --argjson workstation_runtime_prepublication_deferred "$runtime_prepublication_deferred" \
@@ -864,7 +648,8 @@ jq -n \
     system_closure_sha256:$system_closure_sha256,system_generation:$system_generation,
     session_id:$session_id,device_id:$device_id,template_sha256:$template_sha256,
     candidate_runtime_required:$candidate_runtime_required,
-    personalized_sha256:$personalized_sha256,secure_boot:false,
+    installer_iso_sha256:$template_sha256,installed_from_generic_iso:true,
+    setup_claimed_with_code:true,secure_boot:false,
     no_disk_write_before_approval:true,identity_rotation:true,
     installed_media_left_attached:true,appliance_projection_healthy:true,
     workstation_runtime_operational:$workstation_runtime_operational,
@@ -880,11 +665,4 @@ jq -n \
     final_state:"ready",completed_at:$completed_at}' \
   > "$output"
 chmod 0600 "$output"
-if [[ "$induce_preflight_retry" = true ]]; then
-  python3 -B "$repository_root/nixos-appliance/qualification/preflight_retry.py" complete \
-    --state-dir "$TIARIS_NEST_QUALIFICATION_STATE" --session-id "$session_id" \
-    --receipt "$work_dir/retry-attempt.json" --reapproved "$work_dir/reapproved.json" \
-    --lifecycle "$output" --responses "$work_dir/fault-responses.jsonl" \
-    --output "$TIARIS_NEST_QUALIFICATION_STATE/q03-preflight-retry.json"
-fi
 lifecycle_succeeded=true
