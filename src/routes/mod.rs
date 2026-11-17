@@ -171,6 +171,7 @@ mod tests {
     };
     use tower::ServiceExt;
 
+    use crate::boot_identity::uuid_fingerprint;
     use crate::models::{BootProfileType, CreateBootProfileRequest, CreateDeviceRequest};
     use crate::{AppState, config::AppConfig, db};
 
@@ -578,6 +579,215 @@ mod tests {
         let events = db::list_boot_events(&state.db, 10).await.unwrap();
         assert_eq!(events[0].device_id, None);
         assert_eq!(events[0].selected_profile_id, Some(tools.id));
+    }
+
+    const UUID_A: &str = "4c4c4544-0042-3510-8051-b4c04f4e3732";
+    const UUID_B: &str = "6a1e2f3c-9b8d-4e7f-a1b2-c3d4e5f60718";
+    const UUID_INSTALLED: &str = "8f2d4c6a-1b3e-4d5f-9a7b-0c1d2e3f4a5b";
+    const UUID_INSTALLING: &str = "2b4d6f8a-0c1e-4a3b-8d5f-7e9a1b2c3d4e";
+
+    /// The dock's MAC is registered to laptop L1 (the first one through it);
+    /// Manage armed a reinstall of laptop A on it and names A's UUID.
+    async fn reinstall_armed_on_a_shared_dock(state: &AppState) -> (i64, i64) {
+        let laptop_l1 = default_enrollment_and_laptop(state, "5CG1234AAA").await;
+        let reinstall = db::create_profile(
+            &state.db,
+            CreateBootProfileRequest {
+                name: "Tiaris workstation installer".to_string(),
+                description: None,
+                profile_type: BootProfileType::CustomIpxe,
+                enabled: Some(true),
+                is_default: Some(false),
+                one_time: Some(true),
+                raw_script: Some("#!ipxe\necho reinstall laptop A\n".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE devices SET one_time_profile_id = ?, managed_device_id = 'dev_laptop_a',
+                    reinstall_request_id = 'req-a'
+             WHERE id = ?",
+        )
+        .bind(reinstall.id)
+        .bind(laptop_l1)
+        .execute(&state.db)
+        .await
+        .unwrap();
+        let record = crate::boot_machines::Record {
+            reinstalls: [(
+                "req-a".to_string(),
+                crate::boot_machines::ReinstallMachine {
+                    fingerprints: vec![uuid_fingerprint(UUID_A)],
+                    required: true,
+                },
+            )]
+            .into(),
+            machines: [
+                (uuid_fingerprint(UUID_INSTALLED), true),
+                (uuid_fingerprint(UUID_INSTALLING), false),
+            ]
+            .into(),
+        };
+        crate::boot_machines::save(&state.config.paths.data_dir, &record)
+            .await
+            .unwrap();
+        (laptop_l1, reinstall.id)
+    }
+
+    #[tokio::test]
+    async fn a_reinstall_on_a_shared_dock_starts_only_on_the_laptop_it_is_for() {
+        let state = test_state().await;
+        let (row, reinstall) = reinstall_armed_on_a_shared_dock(&state).await;
+
+        // Laptop B, and a boot without a UUID even with the row's serial,
+        // are not laptop A: the menu, and the reinstall stays armed.
+        for uri in [
+            format!("/boot/aa-bb-cc-dd-ee-ff?serial=5CG1234BBB&uuid={UUID_B}"),
+            "/boot/aa-bb-cc-dd-ee-ff?serial=5CG1234AAA&uuid=".to_string(),
+            "/boot/aa-bb-cc-dd-ee-ff?serial=5CG1234AAA".to_string(),
+        ] {
+            let (status, body) = boot_body(router(state.clone()), &uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert!(!body.contains("reinstall laptop A"), "{uri}");
+            assert!(!body.contains("assigned to laptop A"), "{uri}");
+            assert!(body.contains("item profile_"), "{uri}");
+            let device = db::get_device(&state.db, row).await.unwrap();
+            assert_eq!(device.one_time_profile_id, Some(reinstall), "{uri}");
+            assert_eq!(device.serial_number.as_deref(), Some("5CG1234AAA"));
+        }
+
+        // Laptop A gets its reinstall although the dock is registered to L1.
+        let (status, body) = boot_body(
+            router(state.clone()),
+            &format!(
+                "/boot/aa-bb-cc-dd-ee-ff?serial=5CG1234CCC&uuid={}",
+                UUID_A.to_uppercase()
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("reinstall laptop A"));
+        let device = db::get_device(&state.db, row).await.unwrap();
+        assert_eq!(device.one_time_profile_id, None);
+        assert_eq!(device.last_selected_profile_id, Some(reinstall));
+        assert_eq!(device.serial_number.as_deref(), Some("5CG1234AAA"));
+
+        // Its next start never gets laptop L1's own assignment.
+        let (_, again) = boot_body(
+            router(state.clone()),
+            &format!("/boot/aa-bb-cc-dd-ee-ff?serial=5CG1234CCC&uuid={UUID_A}"),
+        )
+        .await;
+        assert!(!again.contains("assigned to laptop A"));
+        assert!(again.contains("known_local"));
+        // Nor does a request without a MAC that names L1's serial alone get
+        // the reinstall.
+        sqlx::query("UPDATE devices SET one_time_profile_id = ? WHERE id = ?")
+            .bind(reinstall)
+            .bind(row)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let (_, macless) = boot_body(router(state.clone()), "/boot.ipxe?serial=5CG1234AAA").await;
+        assert!(!macless.contains("reinstall laptop A"));
+        let device = db::get_device(&state.db, row).await.unwrap();
+        assert_eq!(device.one_time_profile_id, Some(reinstall));
+    }
+
+    #[tokio::test]
+    async fn a_reinstall_menu_choice_by_another_laptop_is_not_recorded_on_the_dock() {
+        let state = test_state().await;
+        let (row, _) = reinstall_armed_on_a_shared_dock(&state).await;
+        let enrollment = db::list_profiles(&state.db)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|profile| profile.name == "Assigned Script")
+            .unwrap();
+
+        let (status, _) = boot_body(
+            router(state.clone()),
+            &format!(
+                "/boot/select/{}?mac=aa%3Abb%3Acc%3Add%3Aee%3Aff&serial=5CG1234AAA&uuid={UUID_B}",
+                enrollment.id
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let device = db::get_device(&state.db, row).await.unwrap();
+        assert_eq!(device.last_selected_profile_id, None);
+        let events = db::list_boot_events(&state.db, 10).await.unwrap();
+        assert_eq!(events[0].device_id, None);
+    }
+
+    #[tokio::test]
+    async fn laptops_tiaris_knows_on_a_shared_dock_get_no_registered_to_another_notice() {
+        let state = test_state().await;
+        reinstall_armed_on_a_shared_dock(&state).await;
+        let notice = "This network adapter is registered to another computer";
+
+        // Installed: its local disk first, as on its own adapter.
+        let (_, installed) = boot_body(
+            router(state.clone()),
+            &format!("/boot/aa-bb-cc-dd-ee-ff?serial=5CG1234DDD&uuid={UUID_INSTALLED}"),
+        )
+        .await;
+        assert!(installed.contains("known_local"));
+        assert!(!installed.contains(notice));
+        assert!(!installed.contains("reinstall laptop A"));
+
+        // Being installed: the menu, no local-disk probe, and a menu that
+        // would wait for a key starts the local disk after 15 seconds.
+        let (_, installing) = boot_body(
+            router(state.clone()),
+            &format!("/boot/aa-bb-cc-dd-ee-ff?serial=5CG1234EEE&uuid={UUID_INSTALLING}"),
+        )
+        .await;
+        assert!(!installing.contains("known_local"));
+        assert!(!installing.contains(notice));
+        assert!(installing.contains("set menu-timeout 15000"));
+        assert!(installing.contains(&format!("&uuid={UUID_INSTALLING} ||")));
+
+        // Nothing known: the notice.
+        let (_, unknown) = boot_body(
+            router(state.clone()),
+            "/boot/aa-bb-cc-dd-ee-ff?serial=5CG1234FFF",
+        )
+        .await;
+        assert!(unknown.contains(notice));
+        assert!(unknown.contains("&uuid=${uuid} ||"));
+    }
+
+    #[tokio::test]
+    async fn a_laptop_this_nest_knows_from_another_adapter_gets_no_notice() {
+        let state = test_state().await;
+        default_enrollment_and_laptop(&state, "5CG1234AAA").await;
+        db::create_device(
+            &state.db,
+            CreateDeviceRequest {
+                mac: "aa:bb:cc:dd:ee:01".to_string(),
+                hostname: None,
+                serial_number: Some("5CG1234BBB".to_string()),
+                notes: None,
+                tags: None,
+                default_profile_id: None,
+                one_time_profile_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let (status, body) = boot_body(
+            router(state.clone()),
+            "/boot/aa-bb-cc-dd-ee-ff?serial=5cg1234bbb",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!body.contains("This network adapter is registered to another computer"));
+        assert!(!body.contains("assigned to laptop A"));
+        assert!(!body.contains("known_local"));
+        assert!(body.contains("set menu-timeout 15000"));
     }
 
     #[tokio::test]

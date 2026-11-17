@@ -627,6 +627,32 @@ pub async fn get_device_by_serial(pool: &SqlitePool, serial: &str) -> AppResult<
     Ok(row.map(Device::from))
 }
 
+/// The network reinstall Manage bound to this MAC's row, if any.
+pub async fn reinstall_request_for_mac(pool: &SqlitePool, mac: &str) -> AppResult<Option<String>> {
+    let mac = normalize_mac(mac)?;
+    let request_id: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT reinstall_request_id FROM devices
+         WHERE mac = ? AND managed_device_id IS NOT NULL",
+    )
+    .bind(mac)
+    .fetch_optional(pool)
+    .await?;
+    Ok(request_id.flatten())
+}
+
+/// Some row holds this usable serial number: this Nest has seen the
+/// computer, through whichever adapter. Case is ignored as in
+/// `boot_identity::same_serial`.
+pub async fn serial_is_registered(pool: &SqlitePool, serial: &str) -> AppResult<bool> {
+    let registered: i64 = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM devices WHERE lower(serial_number) = lower(?))",
+    )
+    .bind(serial)
+    .fetch_one(pool)
+    .await?;
+    Ok(registered != 0)
+}
+
 /// How a network boot request that carries a MAC address resolved.
 #[derive(Debug)]
 pub enum SeenDevice {

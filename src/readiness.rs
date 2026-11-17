@@ -772,7 +772,7 @@ mod tests {
         assert_eq!(
             script
                 .matches(
-                    "chain --autofree http://${tiaris-boot-server}/boot/${net0/mac:hexhyp}?serial_hex=${serial:hexraw} || goto "
+                    "chain --autofree http://${tiaris-boot-server}/boot/${net0/mac:hexhyp}?serial_hex=${serial:hexraw}&uuid=${uuid} || goto "
                 )
                 .count(),
             2

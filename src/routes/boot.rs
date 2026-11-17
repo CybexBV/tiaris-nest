@@ -10,6 +10,7 @@ use serde::Deserialize;
 use crate::{
     AppState, boot as boot_logic,
     boot_identity::{serial_from_hex, usable_serial},
+    boot_machines::{self, BootIdentity, ReinstallCheck},
     db,
     error::{AppError, AppResult},
     models::{BootProfile, BootProfileType, Device, NewBootEvent, normalize_mac},
@@ -25,6 +26,8 @@ pub struct BootQuery {
     /// `${serial:hexraw}` from `autoexec.ipxe` and menu links rendered before
     /// the serial was known.
     pub serial_hex: Option<String>,
+    /// `${uuid}`, the SMBIOS system UUID, from `autoexec.ipxe` and menu links.
+    pub uuid: Option<String>,
     pub tiaris_check: Option<String>,
 }
 
@@ -37,6 +40,11 @@ impl BootQuery {
             .filter(|serial| !serial.trim().is_empty())
             .or_else(|| self.serial_hex.as_deref().and_then(serial_from_hex))
     }
+
+    /// Everything the request says about its own computer.
+    pub(super) fn reported_identity(&self) -> BootIdentity {
+        BootIdentity::from_reported(self.uuid.as_deref(), self.reported_serial())
+    }
 }
 
 pub async fn boot_root(
@@ -46,11 +54,11 @@ pub async fn boot_root(
     connect: Option<ConnectInfo<SocketAddr>>,
 ) -> AppResult<Response> {
     let checker = is_local_checker_request(&query, &headers, connect.as_ref().map(|value| value.0));
-    let serial = query.reported_serial();
+    let identity = query.reported_identity();
     let script = build_boot_script(
         &state,
         query.mac,
-        serial,
+        identity,
         &headers,
         connect.map(|value| value.0),
         checker,
@@ -67,11 +75,11 @@ pub async fn boot_mac(
     connect: Option<ConnectInfo<SocketAddr>>,
 ) -> AppResult<Response> {
     let checker = is_local_checker_request(&query, &headers, connect.as_ref().map(|value| value.0));
-    let serial = query.reported_serial();
+    let identity = query.reported_identity();
     let script = build_boot_script(
         &state,
         Some(mac),
-        serial,
+        identity,
         &headers,
         connect.map(|value| value.0),
         checker,
@@ -88,10 +96,11 @@ pub async fn boot_serial(
     connect: Option<ConnectInfo<SocketAddr>>,
 ) -> AppResult<Response> {
     let checker = is_local_checker_request(&query, &headers, connect.as_ref().map(|value| value.0));
+    let identity = BootIdentity::from_reported(query.uuid.as_deref(), Some(serial));
     let script = build_boot_script(
         &state,
         query.mac,
-        Some(serial),
+        identity,
         &headers,
         connect.map(|value| value.0),
         checker,
@@ -114,25 +123,26 @@ pub async fn boot_select_profile(
     }
 
     let checker = is_local_checker_request(&query, &headers, connect.as_ref().map(|value| value.0));
-    let reported_serial = query.reported_serial();
+    let identity = query.reported_identity();
     let mac = normalized_optional_mac(query.mac)?;
-    let serial = clean_optional(reported_serial.clone());
+    let serial = clean_optional(identity.serial.clone());
     let (device, known_device) = if checker {
         (None, false)
     } else {
-        identify_selecting_client(
-            &state,
-            mac.as_deref(),
-            reported_serial.as_deref(),
-            profile.id,
-        )
-        .await?
+        identify_selecting_client(&state, mac.as_deref(), &identity, profile.id).await?
     };
 
     let selected_mac = mac
         .as_deref()
         .or_else(|| device.as_ref().map(|device| device.mac.as_str()));
-    let script = render_selected_profile(&state, &profile, selected_mac, device.as_ref()).await?;
+    let script = render_selected_profile(
+        &state,
+        &profile,
+        selected_mac,
+        device.as_ref(),
+        Some(&identity),
+    )
+    .await?;
 
     if !checker {
         record_boot_event(
@@ -154,28 +164,24 @@ pub async fn boot_select_profile(
 }
 
 /// The computer that chose `profile_id` from a menu, and whether it was
-/// known. The choice is recorded on its row. On a serial conflict the choice
-/// belongs to another computer than the MAC's row: it is not recorded on that
-/// row, and the installer grant carries no reinstall binding.
+/// known. The choice is recorded on its row. When another computer boots
+/// through the MAC's adapter, the choice is not recorded on that row, and the
+/// installer grant carries no reinstall binding.
 pub(super) async fn identify_selecting_client(
     state: &AppState,
     mac: Option<&str>,
-    reported_serial: Option<&str>,
+    identity: &BootIdentity,
     profile_id: i64,
 ) -> AppResult<(Option<Device>, bool)> {
     if let Some(mac) = mac {
-        if let Some((seen_device, was_known)) =
-            resolve_mac_request(&state.db, mac, reported_serial).await?
-        {
-            db::set_device_last_selected(&state.db, seen_device.id, profile_id).await?;
-            return Ok((Some(seen_device), was_known));
+        if let Some((device, known)) = resolve_mac_request(state, mac, identity).await? {
+            db::set_device_last_selected(&state.db, device.id, profile_id).await?;
+            return Ok((Some(device), known));
         }
-    } else if let Some(serial) = reported_serial.and_then(usable_serial) {
-        if let Some(found) = db::get_device_by_serial(&state.db, &serial).await? {
-            let touched = db::touch_device_seen(&state.db, found.id).await?;
-            db::set_device_last_selected(&state.db, touched.id, profile_id).await?;
-            return Ok((Some(touched), true));
-        }
+    } else if let Some(found) = device_by_serial_alone(state, identity).await? {
+        let touched = db::touch_device_seen(&state.db, found.id).await?;
+        db::set_device_last_selected(&state.db, touched.id, profile_id).await?;
+        return Ok((Some(touched), true));
     }
     Ok((None, false))
 }
@@ -193,7 +199,10 @@ pub async fn boot_kexec(
     if !profile.enabled || profile.profile_type != BootProfileType::NestInstaller {
         return Err(AppError::NotFound);
     }
-    let launch = create_installer_launch(&state, &profile, &device.mac, Some(&device)).await?;
+    // The computer's own agent asks, on Manage's signed command: there is no
+    // network boot whose identity could be checked.
+    let launch =
+        create_installer_launch(&state, &profile, &device.mac, Some(&device), None).await?;
     Ok((
         [
             (header::CONTENT_TYPE, "application/json"),
@@ -208,20 +217,20 @@ pub async fn boot_kexec(
 async fn build_boot_script(
     state: &AppState,
     mac: Option<String>,
-    serial: Option<String>,
+    identity: BootIdentity,
     headers: &HeaderMap,
     connect: Option<SocketAddr>,
     checker: bool,
 ) -> AppResult<String> {
     let mac = normalized_optional_mac(mac)?;
-    let client = identify_boot_client(state, mac, serial, checker).await?;
+    let client = identify_boot_client(state, mac, identity, checker).await?;
     let BootClient {
         mac,
-        reported_serial,
+        identity,
         serial,
         device,
         known_device,
-        serial_conflict,
+        other_computer,
     } = client;
 
     let profiles = db::list_enabled_profiles(&state.db).await?;
@@ -229,7 +238,7 @@ async fn build_boot_script(
         &profiles,
         device.as_ref(),
         known_device,
-        serial_conflict,
+        other_computer.is_some(),
         mac.as_deref(),
         checker,
     );
@@ -239,7 +248,15 @@ async fn build_boot_script(
         let selected_mac = mac
             .as_deref()
             .or_else(|| device.as_ref().map(|device| device.mac.as_str()));
-        match render_selected_profile(state, profile, selected_mac, device.as_ref()).await {
+        match render_selected_profile(
+            state,
+            profile,
+            selected_mac,
+            device.as_ref(),
+            Some(&identity),
+        )
+        .await
+        {
             Ok(script) => Some(script),
             Err(error) => {
                 if selection.source == boot_logic::SelectionSource::AutomaticEnrollment {
@@ -287,23 +304,30 @@ async fn build_boot_script(
         // BootOrder entry if direct chaining fails, while legacy BIOS falls
         // through to the menu. Health checks and MAC-less requests never hand
         // off automatically. Neither does a computer booting through another
-        // computer's adapter: on UEFI the handoff would leave a blank laptop
-        // in firmware without ever showing it the menu.
-        let context = if serial_conflict {
-            boot_logic::MenuContext::AdapterOfAnotherComputer
-        } else if automatic_local_handoff_allowed(checker, known_device, mac.as_deref()) {
-            boot_logic::MenuContext::KnownComputer
-        } else {
-            boot_logic::MenuContext::Unrecognized
+        // computer's adapter, unless Tiaris knows it as installed: on UEFI the
+        // handoff would leave a blank laptop in firmware without ever showing
+        // it the menu.
+        let context = match other_computer {
+            Some(OtherComputer::Installed) => boot_logic::MenuContext::KnownComputer,
+            Some(OtherComputer::Known) => boot_logic::MenuContext::KnownOnSharedAdapter,
+            Some(OtherComputer::Unknown) => boot_logic::MenuContext::AdapterOfAnotherComputer,
+            None if automatic_local_handoff_allowed(checker, known_device, mac.as_deref()) => {
+                boot_logic::MenuContext::KnownComputer
+            }
+            None => boot_logic::MenuContext::Unrecognized,
         };
-        // Menu links carry only a usable serial; otherwise iPXE re-sends its
-        // own, so a truncated or placeholder value never reaches selection.
-        let link_serial = reported_serial.as_deref().and_then(usable_serial);
+        // Menu links carry only a usable serial and UUID; otherwise iPXE
+        // re-sends its own, so a truncated or placeholder value never reaches
+        // selection.
+        let link_serial = identity.serial.as_deref().and_then(usable_serial);
         Ok(boot_logic::render_menu(
             &runtime.public_base_url,
             &profiles,
-            mac.as_deref(),
-            link_serial.as_deref(),
+            boot_logic::MenuIdentity {
+                mac: mac.as_deref(),
+                serial: link_serial.as_deref(),
+                uuid: identity.uuid.as_deref(),
+            },
             runtime.menu_timeout_ms,
             context,
         ))
@@ -313,60 +337,92 @@ async fn build_boot_script(
 /// What the Nest knows about the computer behind one boot request.
 pub(super) struct BootClient {
     pub mac: Option<String>,
-    /// The serial as reported, untruncated: identity uses it.
-    pub reported_serial: Option<String>,
+    /// What the request said about its computer; identity uses the
+    /// untruncated serial.
+    pub identity: BootIdentity,
     /// The bounded serial for boot events and menu links.
     pub serial: Option<String>,
     pub device: Option<Device>,
     pub known_device: bool,
-    /// The serial differs from the one stored for the MAC: another computer
-    /// boots through this network adapter.
-    pub serial_conflict: bool,
+    /// Another computer boots through this MAC's network adapter.
+    pub other_computer: Option<OtherComputer>,
+}
+
+/// Who boots through another computer's network adapter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum OtherComputer {
+    /// Tiaris knows it as an installed computer.
+    Installed,
+    /// Tiaris knows it while it is being installed, or this Nest knows its
+    /// serial from another adapter.
+    Known,
+    /// Nothing says which computer it is.
+    Unknown,
 }
 
 pub(super) async fn identify_boot_client(
     state: &AppState,
     mac: Option<String>,
-    reported_serial: Option<String>,
+    identity: BootIdentity,
     checker: bool,
 ) -> AppResult<BootClient> {
     // Identity uses the untruncated value; the event and menu links the
     // bounded one.
-    let serial = clean_optional(reported_serial.clone());
+    let serial = clean_optional(identity.serial.clone());
     let mut client = BootClient {
         mac,
-        reported_serial,
+        identity,
         serial,
         device: None,
         known_device: false,
-        serial_conflict: false,
+        other_computer: None,
     };
     if checker {
         return Ok(client);
     }
     if let Some(mac) = client.mac.as_deref() {
-        match resolve_mac_request(&state.db, mac, client.reported_serial.as_deref()).await? {
-            Some((seen_device, was_known)) => {
-                client.known_device = was_known;
-                client.device = Some(seen_device);
+        match resolve_mac_request(state, mac, &client.identity).await? {
+            Some((device, known)) => {
+                client.known_device = known;
+                client.device = Some(device);
             }
-            None => client.serial_conflict = true,
+            None => {
+                client.other_computer = Some(other_computer(state, &client.identity).await?);
+            }
         }
-    } else if let Some(serial) = client.reported_serial.as_deref().and_then(usable_serial) {
-        if let Some(found) = db::get_device_by_serial(&state.db, &serial).await? {
-            let touched = db::touch_device_seen(&state.db, found.id).await?;
-            client.known_device = true;
-            client.device = Some(touched);
-        }
+    } else if let Some(found) = device_by_serial_alone(state, &client.identity).await? {
+        client.known_device = true;
+        client.device = Some(db::touch_device_seen(&state.db, found.id).await?);
     }
     Ok(client)
+}
+
+/// A request without a MAC address names its computer by serial alone; a
+/// reinstall armed on that row still goes only to the computer Manage names.
+async fn device_by_serial_alone(
+    state: &AppState,
+    identity: &BootIdentity,
+) -> AppResult<Option<Device>> {
+    let Some(serial) = identity.serial.as_deref().and_then(usable_serial) else {
+        return Ok(None);
+    };
+    let Some(found) = db::get_device_by_serial(&state.db, &serial).await? else {
+        return Ok(None);
+    };
+    if let Some(request_id) = db::reinstall_request_for_mac(&state.db, &found.mac).await? {
+        let record = boot_machines::load(&state.config.paths.data_dir);
+        if record.reinstall_check(&request_id, identity) == ReinstallCheck::NotThisComputer {
+            return Ok(None);
+        }
+    }
+    Ok(Some(found))
 }
 
 pub(super) fn choose_boot_profile<'a>(
     profiles: &'a [BootProfile],
     device: Option<&Device>,
     known_device: bool,
-    serial_conflict: bool,
+    other_computer: bool,
     mac: Option<&str>,
     checker: bool,
 ) -> boot_logic::ProfileSelection<'a> {
@@ -374,12 +430,12 @@ pub(super) fn choose_boot_profile<'a>(
     // A first request from a new MAC may enter the sole default enrollment
     // profile automatically. This only starts the signed installer runtime;
     // destructive installation still requires explicit approval in Tiaris.
-    // A computer whose serial differs from the one stored for its MAC is
-    // booting through another computer's network adapter. It is neither that
+    // A computer that is not the one registered for its MAC is booting
+    // through another computer's network adapter. It is neither that
     // computer nor provably new: it gets the menu, so an installed laptop
     // passing through a shared adapter never enters the installer by itself.
     let allow_automatic_enrollment =
-        automatic_enrollment_allowed(checker, known_device, serial_conflict, mac);
+        automatic_enrollment_allowed(checker, known_device, other_computer, mac);
     boot_logic::choose_profile(selection_device, profiles, allow_automatic_enrollment)
 }
 
@@ -444,20 +500,54 @@ pub(super) async fn record_boot_event(
 fn automatic_enrollment_allowed(
     checker: bool,
     known_device: bool,
-    serial_conflict: bool,
+    other_computer: bool,
     mac: Option<&str>,
 ) -> bool {
-    !checker && !known_device && !serial_conflict && mac.is_some()
+    !checker && !known_device && !other_computer && mac.is_some()
 }
 
-/// The MAC's row and whether it was known, or `None` when the request's
-/// usable serial differs from the row's: another computer is booting through
-/// that network adapter.
+/// Which computer a request with a MAC address is: the MAC's row and
+/// whether it existed, or `None` when another computer is booting through
+/// that network adapter (the row is left untouched). A network reinstall armed
+/// on the MAC goes only to the computer Manage says it is for: its system
+/// UUID decides when the boot reports one, even when the serial stored for
+/// the MAC is another laptop's; on a shared MAC a boot that cannot prove it
+/// never gets it. Otherwise a usable serial that differs from the row's means
+/// another computer, as before.
 async fn resolve_mac_request(
-    pool: &sqlx::SqlitePool,
+    state: &AppState,
     mac: &str,
-    serial: Option<&str>,
+    identity: &BootIdentity,
 ) -> AppResult<Option<(Device, bool)>> {
+    let pool = &state.db;
+    let serial = identity.serial.as_deref();
+    if let Some(request_id) = db::reinstall_request_for_mac(pool, mac).await? {
+        let record = boot_machines::load(&state.config.paths.data_dir);
+        match record.reinstall_check(&request_id, identity) {
+            ReinstallCheck::Proven => {
+                return Ok(Some(
+                    match db::upsert_seen_device(pool, mac, serial).await? {
+                        db::SeenDevice::Device { device, known } => (device, known),
+                        // The row holds another laptop's serial: its reinstall
+                        // is this computer's, the row's own assignment is not.
+                        db::SeenDevice::SerialConflict { registered } => {
+                            let mut device = db::touch_device_seen(pool, registered.id).await?;
+                            device.default_profile_id = None;
+                            (device, true)
+                        }
+                    },
+                ));
+            }
+            ReinstallCheck::NotThisComputer => {
+                tracing::warn!(
+                    mac,
+                    "another computer than the one this MAC's reinstall is for is booting through it; showing the menu without the reinstall"
+                );
+                return Ok(None);
+            }
+            ReinstallCheck::Unnamed => {}
+        }
+    }
     match db::upsert_seen_device(pool, mac, serial).await? {
         db::SeenDevice::Device { device, known } => Ok(Some((device, known))),
         db::SeenDevice::SerialConflict { .. } => {
@@ -472,6 +562,24 @@ async fn resolve_mac_request(
     }
 }
 
+/// Who boots through another computer's adapter: a computer Tiaris knows by
+/// its system UUID, one whose serial this Nest knows from another adapter,
+/// or nobody known.
+async fn other_computer(state: &AppState, identity: &BootIdentity) -> AppResult<OtherComputer> {
+    let record = boot_machines::load(&state.config.paths.data_dir);
+    match record.known_machine(identity) {
+        Some(true) => return Ok(OtherComputer::Installed),
+        Some(false) => return Ok(OtherComputer::Known),
+        None => {}
+    }
+    if let Some(serial) = identity.serial.as_deref().and_then(usable_serial) {
+        if db::serial_is_registered(&state.db, &serial).await? {
+            return Ok(OtherComputer::Known);
+        }
+    }
+    Ok(OtherComputer::Unknown)
+}
+
 fn automatic_local_handoff_allowed(checker: bool, known_device: bool, mac: Option<&str>) -> bool {
     !checker && known_device && mac.is_some()
 }
@@ -481,6 +589,7 @@ async fn render_selected_profile(
     profile: &BootProfile,
     mac: Option<&str>,
     device: Option<&Device>,
+    identity: Option<&BootIdentity>,
 ) -> AppResult<String> {
     if profile.profile_type != BootProfileType::NestInstaller {
         let runtime = state.runtime_settings();
@@ -489,7 +598,7 @@ async fn render_selected_profile(
     let mac = mac.ok_or_else(|| {
         AppError::Validation("a normalized MAC is required for Nest installer boot".to_string())
     })?;
-    let launch = create_installer_launch(state, profile, mac, device).await?;
+    let launch = create_installer_launch(state, profile, mac, device, identity).await?;
     Ok(crate::netboot::render_ipxe_launch(&launch))
 }
 
@@ -498,20 +607,24 @@ async fn create_installer_launch(
     profile: &BootProfile,
     mac: &str,
     device: Option<&Device>,
+    identity: Option<&BootIdentity>,
 ) -> AppResult<crate::netboot::BootSessionLaunch> {
-    create_installer_launch_for_runtime(state, profile, mac, device)
+    create_installer_launch_for_runtime(state, profile, mac, device, identity)
         .await
         .map(|(launch, _)| launch)
 }
 
 /// The signed installer session for `profile`, bound to the device row's
 /// managed identity and reinstall request exactly as the iPXE path binds it,
-/// with the identity of the runtime it launches.
+/// with the identity of the runtime it launches. A network boot (`identity`)
+/// that is not the computer Manage named for the reinstall gets no binding,
+/// whatever chose the row.
 pub(super) async fn create_installer_launch_for_runtime(
     state: &AppState,
     profile: &BootProfile,
     mac: &str,
     device: Option<&Device>,
+    identity: Option<&BootIdentity>,
 ) -> AppResult<(
     crate::netboot::BootSessionLaunch,
     crate::netboot::ActiveRuntimeIdentity,
@@ -527,6 +640,13 @@ pub(super) async fn create_installer_launch_for_runtime(
     } else {
         None
     };
+    let binding = binding.filter(|(_, request_id)| {
+        let (Some(identity), Some(request_id)) = (identity, request_id.as_deref()) else {
+            return true;
+        };
+        boot_machines::load(&state.config.paths.data_dir).reinstall_check(request_id, identity)
+            != ReinstallCheck::NotThisComputer
+    });
     crate::netboot::create_boot_session_for_runtime(
         state,
         mac,
@@ -762,6 +882,7 @@ mod tests {
             mac: None,
             serial: None,
             serial_hex: None,
+            uuid: None,
             tiaris_check: Some("1".to_string()),
         };
         let mut headers = HeaderMap::new();
@@ -787,6 +908,7 @@ mod tests {
             mac: None,
             serial: serial.map(str::to_string),
             serial_hex: serial_hex.map(str::to_string),
+            uuid: None,
             tiaris_check: None,
         };
 
@@ -811,6 +933,7 @@ mod tests {
             mac: None,
             serial: None,
             serial_hex: None,
+            uuid: None,
             tiaris_check: Some("true".to_string()),
         };
         let headers = HeaderMap::new();

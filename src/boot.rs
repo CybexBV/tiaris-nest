@@ -21,12 +21,26 @@ pub enum MenuContext {
     Unrecognized,
     /// A known computer: try its local disk before showing the menu.
     KnownComputer,
-    /// Its serial number differs from the computer registered for this MAC,
-    /// so it boots through another computer's network adapter: show the menu
-    /// with a notice, without probing the local disk first. A menu that would
-    /// wait indefinitely boots the local disk after 15 seconds instead, so an
-    /// installed laptop on a shared adapter still starts unattended.
+    /// It is not the computer registered for this MAC, so it boots through
+    /// another computer's network adapter, and nothing says which computer it
+    /// is: show the menu with a notice, without probing the local disk first.
+    /// A menu that would wait indefinitely boots the local disk after 15
+    /// seconds instead, so an installed laptop on a shared adapter still
+    /// starts unattended.
     AdapterOfAnotherComputer,
+    /// Another computer's network adapter, but a computer Tiaris knows (while
+    /// it is installed) or this Nest knows from another adapter: the same
+    /// menu without the notice.
+    KnownOnSharedAdapter,
+}
+
+/// What menu links send back about the computer: the values the request
+/// reported, or iPXE's own when it reported none usable.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MenuIdentity<'a> {
+    pub mac: Option<&'a str>,
+    pub serial: Option<&'a str>,
+    pub uuid: Option<&'a str>,
 }
 
 #[derive(Debug)]
@@ -109,12 +123,15 @@ fn unambiguous_default_enrollment(profiles: &[BootProfile]) -> Option<&BootProfi
 pub fn render_menu(
     public_base_url: &str,
     profiles: &[BootProfile],
-    mac: Option<&str>,
-    serial: Option<&str>,
+    identity: MenuIdentity<'_>,
     timeout_ms: u32,
     context: MenuContext,
 ) -> String {
-    let timeout_ms = if context == MenuContext::AdapterOfAnotherComputer && timeout_ms == 0 {
+    let shared_adapter = matches!(
+        context,
+        MenuContext::AdapterOfAnotherComputer | MenuContext::KnownOnSharedAdapter
+    );
+    let timeout_ms = if shared_adapter && timeout_ms == 0 {
         SHARED_ADAPTER_MENU_TIMEOUT_MS
     } else {
         timeout_ms
@@ -171,11 +188,12 @@ pub fn render_menu(
         let _ = writeln!(script, ":profile_{}", profile.id);
         let _ = writeln!(
             script,
-            "chain --autofree {}/boot/select/{}?mac={}&{} || goto failed",
+            "chain --autofree {}/boot/select/{}?mac={}&{}&uuid={} || goto failed",
             public_base_url.trim_end_matches('/'),
             profile.id,
-            query_value(mac, "${mac}"),
-            serial_query(serial)
+            query_value(identity.mac, "${mac}"),
+            serial_query(identity.serial),
+            query_value(identity.uuid, "${uuid}")
         );
         script.push_str("goto end\n\n");
     }
@@ -376,7 +394,7 @@ fn query_value(value: Option<&str>, fallback: &str) -> String {
 mod tests {
     use crate::models::{BootProfile, BootProfileType, Device};
 
-    use super::{MenuContext, SelectionSource, choose_profile, render_menu};
+    use super::{MenuContext, MenuIdentity, SelectionSource, choose_profile, render_menu};
 
     fn profile(id: i64, profile_type: BootProfileType) -> BootProfile {
         BootProfile {
@@ -514,8 +532,11 @@ mod tests {
         let menu = render_menu(
             "http://nest.local",
             &profiles,
-            None,
-            None,
+            MenuIdentity {
+                mac: None,
+                serial: None,
+                uuid: None,
+            },
             10_000,
             MenuContext::Unrecognized,
         );
@@ -591,8 +612,11 @@ mod tests {
         let script = render_menu(
             "http://boot.local:8080",
             &profiles,
-            Some("aa:bb:cc:dd:ee:ff"),
-            None,
+            MenuIdentity {
+                mac: Some("aa:bb:cc:dd:ee:ff"),
+                serial: None,
+                uuid: None,
+            },
             0,
             MenuContext::Unrecognized,
         );
@@ -621,8 +645,11 @@ mod tests {
         let script = render_menu(
             "http://boot.local:8080",
             &profiles,
-            None,
-            None,
+            MenuIdentity {
+                mac: None,
+                serial: None,
+                uuid: None,
+            },
             0,
             MenuContext::Unrecognized,
         );
@@ -651,8 +678,11 @@ mod tests {
         let script = render_menu(
             "http://boot.local:8080",
             &profiles,
-            None,
-            None,
+            MenuIdentity {
+                mac: None,
+                serial: None,
+                uuid: None,
+            },
             8000,
             MenuContext::Unrecognized,
         );
@@ -680,8 +710,11 @@ mod tests {
         let script = render_menu(
             "http://boot.local:8080",
             &profiles,
-            None,
-            None,
+            MenuIdentity {
+                mac: None,
+                serial: None,
+                uuid: None,
+            },
             0,
             MenuContext::Unrecognized,
         );
@@ -713,8 +746,11 @@ mod tests {
         let script = render_menu(
             "http://boot.local:8080",
             &profiles,
-            None,
-            None,
+            MenuIdentity {
+                mac: None,
+                serial: None,
+                uuid: None,
+            },
             0,
             MenuContext::Unrecognized,
         );
@@ -733,8 +769,11 @@ mod tests {
         let script = render_menu(
             "http://boot.local:8080",
             &profiles,
-            Some("aa:bb:cc:dd:ee:ff"),
-            None,
+            MenuIdentity {
+                mac: Some("aa:bb:cc:dd:ee:ff"),
+                serial: None,
+                uuid: None,
+            },
             0,
             MenuContext::KnownComputer,
         );
@@ -764,8 +803,11 @@ mod tests {
         let script = render_menu(
             "http://boot.local:8080",
             &profiles,
-            Some("aa:bb:cc:dd:ee:ff"),
-            Some("5CG 1234/B"),
+            MenuIdentity {
+                mac: Some("aa:bb:cc:dd:ee:ff"),
+                serial: Some("5CG 1234/B"),
+                uuid: Some("4c4c4544-0042-3510-8051-b4c04f4e3732"),
+            },
             0,
             MenuContext::AdapterOfAnotherComputer,
         );
@@ -775,7 +817,7 @@ mod tests {
             script.contains("item --gap This network adapter is registered to another computer\n")
         );
         assert!(script.contains(
-            "/boot/select/2?mac=aa%3Abb%3Acc%3Add%3Aee%3Aff&serial=5CG%201234%2FB || goto failed"
+            "/boot/select/2?mac=aa%3Abb%3Acc%3Add%3Aee%3Aff&serial=5CG%201234%2FB&uuid=4c4c4544-0042-3510-8051-b4c04f4e3732 || goto failed"
         ));
         assert!(script.contains("set menu-timeout 15000\n"));
         assert!(
@@ -787,8 +829,11 @@ mod tests {
         let configured = render_menu(
             "http://boot.local:8080",
             &profiles,
-            Some("aa:bb:cc:dd:ee:ff"),
-            None,
+            MenuIdentity {
+                mac: Some("aa:bb:cc:dd:ee:ff"),
+                serial: None,
+                uuid: None,
+            },
             5000,
             MenuContext::AdapterOfAnotherComputer,
         );
@@ -804,14 +849,38 @@ mod tests {
         let script = render_menu(
             "http://boot.local:8080",
             &profiles,
-            None,
-            None,
+            MenuIdentity {
+                mac: None,
+                serial: None,
+                uuid: None,
+            },
             0,
             MenuContext::Unrecognized,
         );
 
-        assert!(script.contains("?mac=${mac}&serial_hex=${serial:hexraw} || goto failed"));
+        assert!(
+            script.contains("?mac=${mac}&serial_hex=${serial:hexraw}&uuid=${uuid} || goto failed")
+        );
         assert!(!script.contains("item --gap This network adapter"));
+    }
+
+    #[test]
+    fn a_known_laptop_on_a_shared_adapter_gets_the_menu_without_the_notice() {
+        let mut installer = profile(2, BootProfileType::NestInstaller);
+        installer.name = "Default Enrollment".to_string();
+        let profiles = vec![installer];
+
+        let script = render_menu(
+            "http://boot.local:8080",
+            &profiles,
+            MenuIdentity::default(),
+            0,
+            MenuContext::KnownOnSharedAdapter,
+        );
+
+        assert!(!script.contains("known_local"));
+        assert!(!script.contains("item --gap This network adapter"));
+        assert!(script.contains("set menu-timeout 15000\n"));
     }
 
     #[test]
@@ -821,8 +890,11 @@ mod tests {
         let script = render_menu(
             "http://boot.local:8080",
             &profiles,
-            None,
-            Some("serial-only"),
+            MenuIdentity {
+                mac: None,
+                serial: Some("serial-only"),
+                uuid: None,
+            },
             0,
             MenuContext::Unrecognized,
         );
