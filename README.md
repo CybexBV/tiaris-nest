@@ -55,7 +55,8 @@ that already holds an installed Nest (a completed installation with that
 envelope, or a STATE partition whose NixOS Nest has its systemd-boot UEFI
 entry, as every Nest a personalized ISO installed), the ISO shows the claim
 screen with `starts_installed_at` and starts the installed Nest after 10
-minutes unless it is claimed (with the envelope as the completed-install path
+minutes unless it is claimed (it polls once more at the deadline, so a claim
+that landed since the last poll wins; with the envelope as the completed-install path
 does, without one by selecting that UEFI entry and restarting, changing
 nothing on disk), so the generic ISO can always reinstall or recover it (a new
 claim treats the old STATE as another session's). A Nest that cannot be
@@ -63,7 +64,15 @@ started that way leaves the claim screen up without a deadline. A vanished
 registration (`404`), or a setup Management closed (revoked, superseded,
 expired or failed) before this run changed the disk, also while waiting for
 approval or for a retry, or when resuming from STATE after "Start over",
-registers again with a new code; `410 nest_installer_outdated` shows "too old"
+registers again with a new code, also without a reboot (this boot's claim of
+that setup in `/run` is forgotten too). Whether the setup STATE would resume
+is still open is decided from Tiaris's answers, not from the saved
+`identity_active` flag alone: the media key's plan poll and, when Tiaris
+answers it `403` (identity already activated), a replay of event 3 with the
+device key; only a `409` refusal counts as closed. When IPv4 and IPv6 disagree in one poll, `claimed`
+wins. The organization name is display text only (control characters
+removed, cut to 80) and never refuses a claim; "Claimed by" shows only after
+the envelope verified, and without a name the setup goes straight on; `410 nest_installer_outdated` shows "too old"
 and retries hourly; network failures retry quietly. Any other slot content
 takes the personalized path unchanged. `tiaris-nest-bootstrap
 setup-claim-protocol` prints the protocol (`1`), signed into the ISO template

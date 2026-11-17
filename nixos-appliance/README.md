@@ -345,7 +345,9 @@ secrets, keys, tokens, serials, raw errors or URLs with paths.
 provisioning. `state` is `claim` on a generic ISO before its envelope is
 verified: only `schema`, `state`, `updated_at`, `tiaris_host` and `claim`, whose
 `state` is `connecting`, `claimable` (`letters`, `code`), `backoff`
-(`retry_at`), `claimed` (`organization`) or `outdated`, plus `url` once Tiaris
+(`retry_at`), `claimed` (`organization`, cleaned and cut to 80; written only
+after the handed-over envelope verified, and skipped when Tiaris sent no
+name) or `outdated`, plus `url` once Tiaris
 answered (left out, never cut, when longer than 80 characters), and `starts_installed_at` (RFC 3339, only in `connecting`, `claimable`
 and `backoff`) when this server already runs a Nest that the ISO starts at that
 time unless it is claimed; letters and code appear in no other state and never in a log. A claim
