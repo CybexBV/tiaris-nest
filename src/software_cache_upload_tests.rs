@@ -56,7 +56,6 @@ struct Fixture {
     data_dir: PathBuf,
     uploader: Uploader,
     paths: Vec<CachedPath>,
-    source: (String, u64),
 }
 
 impl Drop for Fixture {
@@ -115,7 +114,6 @@ fn fixture(name: &str) -> Fixture {
     let cache = root.join("cache");
     fs::create_dir_all(cache.join("nar")).unwrap();
     fs::create_dir_all(root.join("data")).unwrap();
-    fs::create_dir_all(root.join("source")).unwrap();
     let app = cached_path(&cache, 'a', "tiaris-agent-0.2", &[]);
     let units = cached_path(
         &cache,
@@ -125,19 +123,15 @@ fn fixture(name: &str) -> Fixture {
     );
     // Built and cached, but not granted: never uploaded.
     let other = cached_path(&cache, 'c', "ungranted", &[]);
-    let source = b"manage source archive".repeat(100);
-    fs::write(root.join("source").join(format!("{REVISION}.tar")), &source).unwrap();
     Fixture {
         uploader: Uploader {
             cache_root: cache,
-            source_dir: root.join("source"),
             bytes_per_second: 64 * 1024 * 1024,
             allow_loopback_http: true,
         },
         data_dir: root.join("data"),
         root,
         paths: vec![app, units, other],
-        source: (hex::encode(Sha256::digest(&source)), source.len() as u64),
     }
 }
 
@@ -173,7 +167,7 @@ fn sign_grant(payload: &Value) -> (String, String) {
     (format!("tug1.{encoded}.{mac}"), id)
 }
 
-fn grant(fixture: &Fixture, scope: &str, expires: i64, files: Value) -> (String, String) {
+fn grant(fixture: &Fixture, scope: &str, expires: i64) -> (String, String) {
     let now = Utc::now().timestamp();
     sign_grant(&json!({
         "schema": GRANT_SCHEMA,
@@ -184,13 +178,8 @@ fn grant(fixture: &Fixture, scope: &str, expires: i64, files: Value) -> (String,
         "expires": expires,
         "manifest_id": "11111111-2222-4333-8444-555555555555",
         "paths": grant_paths(&[&fixture.paths[0], &fixture.paths[1]]),
-        "files": files,
+        "files": [],
     }))
-}
-
-fn source_file(fixture: &Fixture) -> Value {
-    json!([{"path": format!("manage-source/{REVISION}.tar"),
-            "sha256": fixture.source.0, "size": fixture.source.1}])
 }
 
 fn upload_config(url: &str, token: &str, grants: &[(String, String)]) -> Value {
@@ -296,12 +285,11 @@ async fn grant_state(fixture: &Fixture) -> (String, String, i64) {
 async fn apply_keeps_the_token_private_and_records_grants() {
     let fixture = fixture("apply");
     let url = format!("https://cache.tiaris.com/o/dev/{SCOPE}");
-    let good = grant(&fixture, SCOPE, 4_102_444_800, json!([]));
+    let good = grant(&fixture, SCOPE, 4_102_444_800);
     let other_tree = grant(
         &fixture,
         "o-ffffffffffffffffffffffffffffffff",
         4_102_444_800,
-        json!([]),
     );
     let wrong_id = (good.0.clone(), "0".repeat(32));
     let config = upload_config(&url, TOKEN, &[good.clone(), other_tree, wrong_id]);
@@ -381,11 +369,11 @@ async fn apply_keeps_the_token_private_and_records_grants() {
 }
 
 #[tokio::test]
-async fn uploads_granted_paths_nar_before_narinfo_and_files() {
+async fn uploads_granted_paths_nar_before_narinfo() {
     let fixture = fixture("upload");
     let server = Arc::new(Mutex::new(Server::default()));
     let url = serve(server.clone()).await;
-    let granted = grant(&fixture, SCOPE, 4_102_444_800, source_file(&fixture));
+    let granted = grant(&fixture, SCOPE, 4_102_444_800);
     apply_with(
         &fixture.data_dir,
         Some(&upload_config(&url, TOKEN, &[granted.clone()])),
@@ -413,7 +401,6 @@ async fn uploads_granted_paths_nar_before_narinfo_and_files() {
             format!("GET {prefix}/{}", narinfo(units)),
             format!("PUT {prefix}/{}", units.nar_url),
             format!("PUT {prefix}/{}", narinfo(units)),
-            format!("PUT {prefix}/manage-source/{REVISION}.tar"),
         ]
     );
     {
@@ -431,15 +418,7 @@ async fn uploads_granted_paths_nar_before_narinfo_and_files() {
     let entry = &report[0];
     assert_eq!(entry.grant_id, granted.1);
     assert_eq!(entry.state, "uploaded");
-    assert_eq!(
-        (
-            entry.paths_total,
-            entry.paths_uploaded,
-            entry.files_total,
-            entry.files_uploaded
-        ),
-        (2, 2, 1, 1)
-    );
+    assert_eq!((entry.paths_total, entry.paths_uploaded), (2, 2));
     assert_eq!(entry.items_failed, 0);
     assert!(entry.bytes_uploaded > (app.file_size + units.file_size) as i64);
     assert_eq!(
@@ -464,7 +443,7 @@ async fn transient_failures_back_off_and_resume_where_they_stopped() {
     let fixture = fixture("retry");
     let server = Arc::new(Mutex::new(Server::default()));
     let url = serve(server.clone()).await;
-    let granted = grant(&fixture, SCOPE, 4_102_444_800, json!([]));
+    let granted = grant(&fixture, SCOPE, 4_102_444_800);
     apply_with(
         &fixture.data_dir,
         Some(&upload_config(&url, TOKEN, &[granted])),
@@ -522,7 +501,7 @@ async fn backoff_counts_from_the_failure_not_from_the_start_of_the_pass() {
     let fixture = fixture("backoff");
     let server = Arc::new(Mutex::new(Server::default()));
     let url = serve(server.clone()).await;
-    let granted = grant(&fixture, SCOPE, 4_102_444_800, json!([]));
+    let granted = grant(&fixture, SCOPE, 4_102_444_800);
     apply_with(
         &fixture.data_dir,
         Some(&upload_config(&url, TOKEN, &[granted])),
@@ -571,8 +550,8 @@ async fn a_corrupted_nar_is_never_sent_and_a_broken_grant_fails_alone() {
     let mut bytes = fs::read(&nar).unwrap();
     bytes[0] ^= 0xff;
     fs::write(&nar, bytes).unwrap();
-    let broken = grant(&fixture, SCOPE, 4_102_444_800, json!([]));
-    let good = grant(&fixture, SCOPE, 4_102_444_801, source_file(&fixture));
+    let broken = grant(&fixture, SCOPE, 4_102_444_800);
+    let good = grant(&fixture, SCOPE, 4_102_444_801);
     let config = upload_config(&url, TOKEN, &[broken.clone(), good.clone()]);
     apply_with(&fixture.data_dir, Some(&config), true)
         .await
@@ -596,11 +575,6 @@ async fn a_corrupted_nar_is_never_sent_and_a_broken_grant_fails_alone() {
             .iter()
             .any(|request| request.contains(&fixture.paths[1].nar_url))
     );
-    assert!(
-        requests
-            .iter()
-            .any(|request| request.contains("manage-source"))
-    );
     let reports = report(&fixture.data_dir).unwrap();
     let entry = |id: &str| reports.iter().find(|entry| entry.grant_id == id).unwrap();
     let broken = entry(&broken.1);
@@ -617,10 +591,7 @@ async fn a_corrupted_nar_is_never_sent_and_a_broken_grant_fails_alone() {
         (good.state.as_str(), good.error.as_str()),
         ("failed", "nar_mismatch")
     );
-    assert_eq!(
-        (good.paths_uploaded, good.files_uploaded, good.items_failed),
-        (1, 1, 1)
-    );
+    assert_eq!((good.paths_uploaded, good.items_failed), (1, 1));
 }
 
 #[tokio::test]
@@ -634,8 +605,10 @@ async fn items_that_do_not_match_their_grant_are_never_sent() {
     let granted = sign_grant(&json!({
         "schema": GRANT_SCHEMA, "issuer": "dev", "scope": SCOPE, "subject": "nest-1",
         "issued_at": now, "expires": 4_102_444_800i64, "paths": paths,
+        // A file such as the Manage source archive, which Manage granted
+        // until 17 November 2026: this Nest never uploads one.
         "files": [{"path": format!("manage-source/{REVISION}.tar"),
-                   "sha256": "f".repeat(64), "size": fixture.source.1}],
+                   "sha256": "f".repeat(64), "size": 2100}],
     }));
     apply_with(
         &fixture.data_dir,
@@ -666,11 +639,11 @@ async fn items_that_do_not_match_their_grant_are_never_sent() {
     let (state, error, _) = grant_state(&fixture).await;
     assert_eq!(state, "failed");
     let entry = report(&fixture.data_dir).unwrap().remove(0);
-    assert_eq!((entry.paths_uploaded, entry.items_failed), (1, 2));
-    assert!(
-        ["file_mismatch", "narinfo_mismatch"].contains(&error.as_str()),
-        "{error}"
+    assert_eq!(
+        (entry.paths_total, entry.paths_uploaded, entry.items_failed),
+        (2, 1, 1)
     );
+    assert_eq!(error, "narinfo_mismatch");
 }
 
 #[tokio::test]
@@ -678,7 +651,7 @@ async fn quota_expiry_and_missing_tokens_stop_uploads() {
     let fixture = fixture("stop");
     let server = Arc::new(Mutex::new(Server::default()));
     let url = serve(server.clone()).await;
-    let granted = grant(&fixture, SCOPE, 4_102_444_800, json!([]));
+    let granted = grant(&fixture, SCOPE, 4_102_444_800);
     apply_with(
         &fixture.data_dir,
         Some(&upload_config(&url, TOKEN, &[granted])),
@@ -696,7 +669,7 @@ async fn quota_expiry_and_missing_tokens_stop_uploads() {
     // An expired grant is never uploaded.
     reset(&fixture);
     let soon = Utc::now().timestamp() + 60;
-    let expiring = grant(&fixture, SCOPE, soon, json!([]));
+    let expiring = grant(&fixture, SCOPE, soon);
     apply_with(
         &fixture.data_dir,
         Some(&upload_config(&url, TOKEN, &[expiring])),
@@ -717,7 +690,7 @@ async fn quota_expiry_and_missing_tokens_stop_uploads() {
 
     // Without a current write token nothing is sent.
     reset(&fixture);
-    let granted = grant(&fixture, SCOPE, 4_102_444_800, json!([]));
+    let granted = grant(&fixture, SCOPE, 4_102_444_800);
     let mut config = upload_config(&url, TOKEN, &[granted]);
     config["expires_at"] = json!((Utc::now() - chrono::Duration::minutes(1)).to_rfc3339());
     apply_with(&fixture.data_dir, Some(&config), true)
@@ -795,7 +768,7 @@ async fn real_upload_service_accepts_nest_uploads() {
         "{claims}.{}",
         URL_SAFE_NO_PAD.encode(hmac_sha256(KEY, claims.as_bytes()))
     );
-    let granted = grant(&fixture, SCOPE, expires, source_file(&fixture));
+    let granted = grant(&fixture, SCOPE, expires);
     let url = format!("http://127.0.0.1:{port}/o/dev/{SCOPE}");
     apply_with(
         &fixture.data_dir,
@@ -817,7 +790,6 @@ async fn real_upload_service_accepts_nest_uploads() {
             path.narinfo
         );
     }
-    assert!(tree.join(format!("manage-source/{REVISION}.tar")).is_file());
     assert!(!tree.join(&fixture.paths[2].nar_url).exists());
     child.kill().await.unwrap();
 }
@@ -827,7 +799,7 @@ async fn corrupt_upload_state_never_sends_beyond_the_grant() {
     let fixture = fixture("corrupt-state");
     let server = Arc::new(Mutex::new(Server::default()));
     let url = serve(server.clone()).await;
-    let granted = grant(&fixture, SCOPE, 4_102_444_800, json!([]));
+    let granted = grant(&fixture, SCOPE, 4_102_444_800);
     apply_with(
         &fixture.data_dir,
         Some(&upload_config(&url, TOKEN, &[granted.clone()])),
@@ -900,7 +872,7 @@ async fn at_most_the_grant_limit_is_held() {
     let fixture = fixture("grant-limit");
     let url = format!("https://cache.tiaris.com/o/dev/{SCOPE}");
     let grants = (0..MAX_GRANTS as i64 + 4)
-        .map(|index| grant(&fixture, SCOPE, 4_102_444_800 + index, json!([])))
+        .map(|index| grant(&fixture, SCOPE, 4_102_444_800 + index))
         .collect::<Vec<_>>();
     apply_with(
         &fixture.data_dir,

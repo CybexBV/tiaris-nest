@@ -5,8 +5,7 @@
 //! A computer away from school cannot reach its Nest. For an update that may
 //! be downloaded off-site, Manage signs an upload grant naming what this Nest
 //! may upload: the closure paths it built itself, with the hashes and sizes of
-//! its verified closure manifest, and files such as the workstation runtime's
-//! Manage source archive. Nest advertises `software_cache_upload_v1` only to a
+//! its verified closure manifest. Nest advertises `software_cache_upload_v1` only to a
 //! Manage that says it accepts it (`software_cache_upload_supported`), and
 //! receives
 //!
@@ -19,10 +18,10 @@
 //!
 //! For each grant Nest registers it (`POST <url>/upload-grants`), then uploads
 //! every granted store path from its own cache, NAR before narinfo, the
-//! narinfo exactly as Nix wrote it (with the Nest signature), and each granted
-//! file, all as Nix HTTP binary cache PUTs with the write token as the Basic
+//! narinfo exactly as Nix wrote it (with the Nest signature), all as Nix HTTP
+//! binary cache PUTs with the write token as the Basic
 //! password and `X-Tiaris-Upload-Grant: <grant id>`. Nothing that is not in a
-//! grant is ever sent, and a local narinfo or file that does not match its
+//! grant is ever sent, and a local narinfo or NAR that does not match its
 //! grant is refused locally. One grant and one upload at a time, at most
 //! `BYTES_PER_SECOND`; failures are retried with backoff until the grant
 //! expires. The write token is kept in a 0600 file and never logged. Each
@@ -59,8 +58,6 @@ use crate::AppState;
 
 pub const CAPABILITY: &str = "software_cache_upload_v1";
 pub const CREDENTIALS_FILE_NAME: &str = "software-cache-upload.json";
-/// Root-owned offline Manage source archives (`<revision>.tar`).
-const SOURCE_ARCHIVE_DIR: &str = "/usr/share/tiaris-nest/manage-source";
 const GRANT_SCHEMA: &str = "tiaris.software-cache.upload-grant.v1";
 const GRANT_HEADER: &str = "X-Tiaris-Upload-Grant";
 const MAX_GRANTS: usize = 32;
@@ -280,7 +277,6 @@ struct GrantPayload {
     #[serde(default)]
     manifest_id: Option<String>,
     paths: Vec<GrantPath>,
-    files: Vec<GrantFile>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -293,13 +289,6 @@ struct GrantPath {
     nar_hash: String,
     nar_size: u64,
     references: Vec<String>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct GrantFile {
-    path: String,
-    sha256: String,
-    size: u64,
 }
 
 fn store_hash(store_path: &str) -> Option<&str> {
@@ -334,18 +323,6 @@ fn valid_nar_url(nar_url: &str, compression: &str) -> bool {
         .is_some_and(|name| name.len() == 52 && name.bytes().all(|byte| NIX32.contains(&byte)))
 }
 
-/// The Manage source revision of `manage-source/<40 hex>.tar`.
-fn source_revision(path: &str) -> Option<&str> {
-    path.strip_prefix("manage-source/")?
-        .strip_suffix(".tar")
-        .filter(|revision| {
-            revision.len() == 40
-                && revision
-                    .bytes()
-                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-        })
-}
-
 /// The id and payload of a `tug1.<payload>.<mac>` grant for `scope`. Nest
 /// cannot check the MAC (the cache server does); it checks that the grant
 /// names only well-formed items, so a malformed grant is never acted on.
@@ -368,7 +345,7 @@ fn decode_grant(text: &str, tree: &Destination) -> Result<(String, GrantPayload)
     if grant.scope != tree.scope || grant.issuer != tree.issuer {
         bail!("upload grant is for another organization tree");
     }
-    if grant.paths.is_empty() && grant.files.is_empty() {
+    if grant.paths.is_empty() {
         bail!("upload grant names nothing");
     }
     for path in &grant.paths {
@@ -385,15 +362,6 @@ fn decode_grant(text: &str, tree: &Destination) -> Result<(String, GrantPayload)
                 .any(|reference| store_hash(reference).is_none())
         {
             bail!("upload grant names a malformed store path");
-        }
-    }
-    for file in &grant.files {
-        if source_revision(&file.path).is_none()
-            || file.sha256.len() != 64
-            || !file.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-            || !(1..=MAX_UPLOAD_BYTES).contains(&file.size)
-        {
-            bail!("upload grant names a malformed file");
         }
     }
     let id = hex::encode(&Sha256::digest(payload.as_bytes())[..16]);
@@ -430,7 +398,7 @@ fn valid_grant_id(id: &str) -> bool {
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// Upload state of one grant. Items are the grant's paths, then its files,
+/// Upload state of one grant. Items are the grant's paths,
 /// named by their index in the grant, so the state can never name anything
 /// the grant does not.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -520,9 +488,7 @@ fn held_grant(dir: &Path, id: &str) -> Option<HeldGrant> {
             .map(|(_, grant)| grant),
         _ => None,
     };
-    let items = decoded
-        .as_ref()
-        .map_or(0, |grant| grant.paths.len() + grant.files.len());
+    let items = decoded.as_ref().map_or(0, |grant| grant.paths.len());
     let state = match state {
         Some(state) if state.is_valid(items) => state,
         Some(state) if decoded.is_some() => {
@@ -713,7 +679,6 @@ pub fn spawn(state: AppState) {
 #[derive(Clone, Debug)]
 struct Uploader {
     cache_root: PathBuf,
-    source_dir: PathBuf,
     bytes_per_second: u64,
     allow_loopback_http: bool,
 }
@@ -722,7 +687,6 @@ impl Uploader {
     fn from_config(config: &crate::config::AppConfig) -> Self {
         Self {
             cache_root: config.cache.root_dir.clone(),
-            source_dir: PathBuf::from(SOURCE_ARCHIVE_DIR),
             bytes_per_second: BYTES_PER_SECOND,
             allow_loopback_http: false,
         }
@@ -870,9 +834,7 @@ impl Session<'_> {
                 ItemOutcome::Retry(reason) => return Ok(GrantOutcome::Retry(reason)),
             }
         }
-        let paths = grant.paths.iter().map(|path| (Some(path), None));
-        let files = grant.files.iter().map(|file| (None, Some(file)));
-        for (index, (path, file)) in paths.chain(files).enumerate() {
+        for (index, path) in grant.paths.iter().enumerate() {
             let index = u32::try_from(index)?;
             if held.state.uploaded.contains(&index) || held.state.failed.contains_key(&index) {
                 continue;
@@ -880,11 +842,7 @@ impl Session<'_> {
             if !self.still_granted(id, grant.expires) {
                 return Ok(GrantOutcome::Gone);
             }
-            let outcome = match (path, file) {
-                (Some(path), _) => self.upload_path(id, path).await,
-                (_, Some(file)) => self.upload_file(id, file).await,
-                _ => unreachable!("every item is a path or a file"),
-            };
+            let outcome = self.upload_path(id, path).await;
             let recorded = match outcome {
                 ItemOutcome::Uploaded(bytes) => {
                     self.update(id, |state| {
@@ -1024,33 +982,6 @@ impl Session<'_> {
             ),
             Err(error) => ItemOutcome::Retry(transport_error(&error)),
         }
-    }
-
-    /// A granted file, after checking its size and SHA-256 locally.
-    async fn upload_file(&self, id: &str, file: &GrantFile) -> ItemOutcome {
-        let Some(revision) = source_revision(&file.path) else {
-            return ItemOutcome::Refused("invalid_file".into());
-        };
-        let local = self.uploader.source_dir.join(format!("{revision}.tar"));
-        let Ok(Ok(expected)) = hex::decode(&file.sha256).map(<[u8; 32]>::try_from) else {
-            return ItemOutcome::Refused("invalid_file".into());
-        };
-        let opened = fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&local);
-        let handle = match opened {
-            Ok(handle) => checked_file(handle, file.size, expected).await,
-            Err(error) => Err(error.into()),
-        };
-        let handle = match handle {
-            Ok(Some(handle)) => handle,
-            Ok(None) => return ItemOutcome::Refused("file_mismatch".into()),
-            Err(_) => return ItemOutcome::Refused("file_unavailable".into()),
-        };
-        let size = file.size;
-        let url = format!("{}/{}", self.destination.base, file.path);
-        self.put_file(id, &url, handle, size).await
     }
 
     /// PUT exactly `size` bytes of `file` at the upload rate.
@@ -1196,8 +1127,6 @@ pub(crate) struct UploadReport {
     pub(crate) state: String,
     pub(crate) paths_total: usize,
     pub(crate) paths_uploaded: usize,
-    pub(crate) files_total: usize,
-    pub(crate) files_uploaded: usize,
     pub(crate) items_failed: usize,
     pub(crate) bytes_uploaded: i64,
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -1212,10 +1141,7 @@ pub(crate) fn report(data_dir: &Path) -> Result<Vec<UploadReport>> {
     Ok(held_grants(&uploads_dir(data_dir))
         .into_iter()
         .map(|held| {
-            let (paths_total, files_total) = held
-                .grant
-                .as_ref()
-                .map_or((0, 0), |grant| (grant.paths.len(), grant.files.len()));
+            let paths_total = held.grant.as_ref().map_or(0, |grant| grant.paths.len());
             let state = held.state;
             let paths_uploaded = state
                 .uploaded
@@ -1228,8 +1154,6 @@ pub(crate) fn report(data_dir: &Path) -> Result<Vec<UploadReport>> {
                 state: state.state,
                 paths_total,
                 paths_uploaded,
-                files_total,
-                files_uploaded: state.uploaded.len() - paths_uploaded,
                 items_failed: state.failed.len(),
                 bytes_uploaded: state.bytes_uploaded,
                 error: state.error,
