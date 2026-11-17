@@ -1257,3 +1257,203 @@ fn only_managements_refusal_of_a_closed_session_ends_a_generic_setup() {
         );
     }
 }
+
+#[test]
+fn the_organization_name_is_display_text_that_never_refuses_a_claim() {
+    let id = Uuid::new_v4();
+    let session = Uuid::new_v4();
+    let bytes = envelope(session, 30);
+    let organization = |name: Option<Value>| {
+        let mut body = claimed(id, session, &bytes);
+        match name {
+            Some(name) => body["organization_name"] = name,
+            None => {
+                body.as_object_mut().unwrap().remove("organization_name");
+            }
+        }
+        match validate_reply(status_body(body), Some(id)).unwrap().answer {
+            Answer::Claimed {
+                organization,
+                envelope,
+                ..
+            } => {
+                assert_eq!(envelope, bytes);
+                organization
+            }
+            _ => panic!("a claimed reply stays claimed"),
+        }
+    };
+    // Manage accepts names of up to 255 characters: cut to 80.
+    let long = "G".repeat(255);
+    assert_eq!(
+        organization(Some(json!(long))),
+        Some("G".repeat(MAX_DISPLAY_CHARS))
+    );
+    assert_eq!(
+        organization(Some(json!(" Green\u{7}field\nSchool "))),
+        Some("GreenfieldSchool".to_string())
+    );
+    assert_eq!(organization(None), None);
+    assert_eq!(organization(Some(json!(""))), None);
+    assert_eq!(organization(Some(json!("\u{7}  "))), None);
+    assert_eq!(organization(Some(Value::Null)), None);
+}
+
+#[tokio::test]
+async fn claimed_by_is_shown_only_after_the_envelope_verified() {
+    let id = Uuid::new_v4();
+    let session = Uuid::new_v4();
+    let bytes = envelope(session, 30);
+    let mut nameless = claimed(id, session, &bytes);
+    nameless
+        .as_object_mut()
+        .unwrap()
+        .remove("organization_name");
+    let mut long = claimed(id, session, &bytes);
+    long["organization_name"] = json!(format!("Green\u{7}field {}", "x".repeat(250)));
+    let foreign = protocol::tests::signed_envelope_bytes(
+        &SigningKey::from_bytes(&[1; 32]),
+        session,
+        ORIGIN,
+        Utc::now(),
+        Utc::now() + chrono::Duration::days(30),
+    );
+    // A missing name: no claimed screen, the setup goes straight on.
+    // A long name with a control character: shown cleaned and cut.
+    // An unverifiable envelope: never "Claimed by".
+    for (reply, verifies, shown) in [
+        (nameless, true, None),
+        (
+            long,
+            true,
+            Some(format!("Greenfield {}", "x".repeat(MAX_DISPLAY_CHARS - 11))),
+        ),
+        (claimed(id, session, &foreign), false, None),
+    ] {
+        let (origin, _, server) = fake_manage(
+            vec![
+                (StatusCode::CREATED, claimable(id)),
+                (StatusCode::OK, reply),
+            ],
+            None,
+        )
+        .await;
+        let harness = Harness::new(origin);
+        let result = claim(&harness.context()).await;
+        server.abort();
+        assert_eq!(result.is_ok(), verifies);
+        let screen = harness.screen()["claim"].clone();
+        match shown {
+            Some(name) => {
+                assert_eq!(screen["state"], "claimed");
+                assert_eq!(screen["organization"], json!(name));
+            }
+            None => assert_eq!(screen["state"], "claimable"),
+        }
+    }
+}
+
+#[test]
+fn a_claim_seen_on_either_family_wins() {
+    let id = Uuid::new_v4();
+    let session = Uuid::new_v4();
+    let bytes = envelope(session, 30);
+    let waiting = || -> Result<StatusBody> { Ok(status_body(claimable(id))) };
+    let taken = || -> Result<StatusBody> { Ok(status_body(claimed(id, session, &bytes))) };
+    assert_eq!(prefer_answer(waiting(), taken()).unwrap().state, "claimed");
+    assert_eq!(prefer_answer(taken(), waiting()).unwrap().state, "claimed");
+    assert_eq!(
+        prefer_answer(waiting(), waiting()).unwrap().state,
+        "claimable"
+    );
+}
+
+#[tokio::test]
+async fn a_claim_that_lands_just_before_the_deadline_wins() {
+    let id = Uuid::new_v4();
+    let session = Uuid::new_v4();
+    let bytes = envelope(session, 30);
+    let (origin, fake, server) = fake_manage(
+        vec![
+            (StatusCode::CREATED, claimable(id)),
+            // Claimed while the loop waits for its next poll.
+            (StatusCode::OK, claimed(id, session, &bytes)),
+        ],
+        None,
+    )
+    .await;
+    let mut harness = Harness::new(origin);
+    // Polls far apart: the deadline comes before the next one.
+    let deadline = Utc::now() + chrono::Duration::milliseconds(200);
+    let mut context = harness.context();
+    context.tick = Duration::from_secs(5);
+    context.starts_installed_at = Some(deadline);
+    let claimed = claim_until(&context, deadline).await.unwrap().unwrap();
+    let seen = fake.lock().unwrap().seen.clone();
+    server.abort();
+    assert_eq!(claimed.bytes, bytes);
+    assert_eq!(seen.len(), 2);
+    assert!(seen[1].path.ends_with(&format!("{id}/status")));
+    assert_eq!(harness.store.load_envelope().unwrap().unwrap(), bytes);
+
+    // Still unclaimed at the deadline: the installed Nest starts.
+    let (origin, fake, server) = fake_manage(
+        vec![
+            (StatusCode::CREATED, claimable(id)),
+            (StatusCode::OK, claimable(id)),
+        ],
+        None,
+    )
+    .await;
+    harness = Harness::new(origin);
+    let deadline = Utc::now() + chrono::Duration::milliseconds(200);
+    let mut context = harness.context();
+    context.tick = Duration::from_secs(5);
+    assert!(claim_until(&context, deadline).await.unwrap().is_none());
+    assert_eq!(fake.lock().unwrap().seen.len(), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn start_over_without_a_reboot_forgets_this_boots_claim_and_registers_again() {
+    let old_id = Uuid::new_v4();
+    let new_id = Uuid::new_v4();
+    let closed = Uuid::new_v4();
+    let (origin, fake, server) =
+        fake_manage(vec![(StatusCode::CREATED, claimable(new_id))], None).await;
+    let harness = Harness::new(origin);
+    // This boot claimed the setup that STATE resumed; it is still current.
+    harness.store.prepare().unwrap();
+    let old_key = SigningKey::from_bytes(&[2; 32]);
+    harness
+        .store
+        .save_registration(&Registration {
+            key: old_key.clone(),
+            id: Some(old_id),
+        })
+        .unwrap();
+    harness.store.save_envelope(&envelope(closed, 30)).unwrap();
+    // A claim of another setup is kept.
+    forget_closed_run_claim(&harness.context(), Uuid::new_v4()).unwrap();
+    assert!(harness.store.load_envelope().unwrap().is_some());
+    // The refused resume forgets this boot's claim of that setup.
+    forget_closed_run_claim(&harness.context(), closed).unwrap();
+    assert!(harness.store.load_envelope().unwrap().is_none());
+    assert!(harness.store.load_registration().unwrap().is_none());
+    // Polls far apart: the claim screen stays while the test looks.
+    let mut context = harness.context();
+    context.tick = Duration::from_secs(5);
+    let waited = tokio::time::timeout(Duration::from_millis(300), claim(&context)).await;
+    assert!(waited.is_err());
+    let seen = fake.lock().unwrap().seen.clone();
+    server.abort();
+    // A new registration with a new key, and the claim screen shows its code.
+    assert_eq!(seen[0].path, "/v1/agent/nest/setup-registrations");
+    assert_ne!(registration_key(&seen[0]), old_key.verifying_key());
+    assert_eq!(
+        harness.store.load_registration().unwrap().unwrap().id,
+        Some(new_id)
+    );
+    assert_eq!(harness.screen()["claim"]["state"], "claimable");
+    assert_eq!(harness.screen()["claim"]["letters"], LETTERS);
+}

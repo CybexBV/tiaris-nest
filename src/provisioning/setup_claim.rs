@@ -59,6 +59,8 @@ const START_INSTALLED_AFTER_MINUTES: i64 = 10;
 const LETTER_ALPHABET: &str = "ABCDEFGHJKMNPQRTVWXY";
 const MAX_HARDWARE_CHARS: usize = 80;
 const MAX_TEXT_CHARS: usize = 200;
+/// The kiosk's limit for a shown name.
+const MAX_DISPLAY_CHARS: usize = 80;
 /// Waits are counted in ticks: one second in production.
 const OUTDATED_RETRY_TICKS: u32 = 3600;
 const FAILURE_BACKOFF_CAP_TICKS: u32 = 60;
@@ -115,6 +117,7 @@ pub(super) async fn prepare_generic(
                         "Management closed the retained Nest setup; this server is claimed again"
                     );
                     storage::release_state_probe(&options.state_mount)?;
+                    forget_closed_run_claim(&context, envelope.session_id)?;
                     claim(&context).await?
                 } else {
                     info!("resuming a claimed Nest setup from its retained STATE envelope");
@@ -531,32 +534,19 @@ pub(super) async fn claim(context: &ClaimContext<'_>) -> Result<Claimed> {
                         session_id,
                         envelope,
                     } => {
-                        context.status.claim(
-                            context.required_origin,
-                            &ClaimView {
-                                state: ClaimState::Claimed,
-                                letters: None,
-                                code: None,
-                                url: url.as_deref(),
-                                retry_at: None,
-                                organization: Some(&organization),
-                                starts_installed_at: None,
-                            },
-                        );
-                        let verified = verify_claimed(context, &envelope, session_id)?;
-                        if protocol::require_current_envelope(&verified).is_err() {
-                            info!("the claimed Nest setup has already ended; registering again");
-                            store.forget_claimed()?;
-                            context.show(ClaimState::Connecting, url.as_deref());
-                            context.wait(1).await;
-                            continue;
+                        let taken = take_claimed(
+                            context,
+                            organization.as_deref(),
+                            session_id,
+                            envelope,
+                            url.as_deref(),
+                        )?;
+                        if let Some(claimed) = taken {
+                            return Ok(claimed);
                         }
-                        store.save_envelope(&envelope)?;
-                        info!("this Nest was claimed; continuing setup");
-                        return Ok(Claimed {
-                            bytes: envelope,
-                            verified,
-                        });
+                        context.show(ClaimState::Connecting, url.as_deref());
+                        context.wait(1).await;
+                        continue;
                     }
                 }
                 registration = Some(current);
@@ -586,9 +576,48 @@ pub(super) async fn claim(context: &ClaimContext<'_>) -> Result<Claimed> {
     }
 }
 
+/// Verify a handed-over envelope, keep it in `/run` and only then say who
+/// claimed this server (no name, no claimed screen: the setup goes straight
+/// on). `None` when its setup has already ended; it is forgotten.
+fn take_claimed(
+    context: &ClaimContext<'_>,
+    organization: Option<&str>,
+    session_id: Uuid,
+    envelope: Vec<u8>,
+    url: Option<&str>,
+) -> Result<Option<Claimed>> {
+    let verified = verify_claimed(context, &envelope, session_id)?;
+    if protocol::require_current_envelope(&verified).is_err() {
+        info!("the claimed Nest setup has already ended; registering again");
+        context.store.forget_claimed()?;
+        return Ok(None);
+    }
+    context.store.save_envelope(&envelope)?;
+    if let Some(organization) = organization {
+        context.status.claim(
+            context.required_origin,
+            &ClaimView {
+                state: ClaimState::Claimed,
+                letters: None,
+                code: None,
+                url,
+                retry_at: None,
+                organization: Some(organization),
+                starts_installed_at: None,
+            },
+        );
+    }
+    info!("this Nest was claimed; continuing setup");
+    Ok(Some(Claimed {
+        bytes: envelope,
+        verified,
+    }))
+}
+
 /// `claim`, but only until `deadline`: `None` when nobody claimed this
 /// server in time. A network that is down does not stop the clock. A claim
-/// this boot already holds wins even after the deadline.
+/// this boot already holds wins even after the deadline, and so does one
+/// that landed since the last poll: the deadline polls once more.
 pub(super) async fn claim_until(
     context: &ClaimContext<'_>,
     deadline: DateTime<Utc>,
@@ -596,9 +625,63 @@ pub(super) async fn claim_until(
     let remaining = (deadline - Utc::now()).to_std().unwrap_or_default();
     tokio::select! {
         biased;
-        claimed = claim(context) => claimed.map(Some),
-        () = tokio::time::sleep(remaining) => Ok(None),
+        claimed = claim(context) => return claimed.map(Some),
+        () = tokio::time::sleep(remaining) => {}
     }
+    last_poll(context).await
+}
+
+/// One poll at the deadline: a claim that landed since the last poll wins.
+/// Any other answer, or none, lets the installed Nest start.
+async fn last_poll(context: &ClaimContext<'_>) -> Result<Option<Claimed>> {
+    if let Some(claimed) = run_envelope(context)? {
+        return Ok(Some(claimed));
+    }
+    let Some(Registration { key, id: Some(id) }) = context.store.load_registration()? else {
+        return Ok(None);
+    };
+    let reply = context
+        .transport
+        .poll(&key, id)
+        .await
+        .and_then(|body| validate_reply(body, Some(id)));
+    match reply {
+        Ok(Reply {
+            claim_url,
+            answer:
+                Answer::Claimed {
+                    organization,
+                    session_id,
+                    envelope,
+                },
+            ..
+        }) => take_claimed(
+            context,
+            organization.as_deref(),
+            session_id,
+            envelope,
+            claim_url.as_deref(),
+        ),
+        _ => Ok(None),
+    }
+}
+
+/// Management closed `session_id`, the setup STATE would have resumed:
+/// forget this boot's claim of that same setup in `/run` too, so `claim`
+/// registers again and shows a new code instead of continuing it. A claim
+/// of another setup stays.
+pub(super) fn forget_closed_run_claim(context: &ClaimContext<'_>, session_id: Uuid) -> Result<()> {
+    let Some(bytes) = context.store.load_envelope()? else {
+        return Ok(());
+    };
+    let same =
+        protocol::verify_envelope_bytes(&bytes, context.trusted_keys, context.required_origin)
+            .is_ok_and(|verified| verified.envelope.session_id == session_id);
+    if same {
+        info!("forgetting this boot's claim of the closed Nest setup");
+        context.store.forget_claimed()?;
+    }
+    Ok(())
 }
 
 /// This boot already holds a claimed envelope: continue with it while its
@@ -741,7 +824,8 @@ pub(super) enum Answer {
         retry_at: DateTime<Utc>,
     },
     Claimed {
-        organization: String,
+        /// Display text only: never a reason to refuse a claim.
+        organization: Option<String>,
         session_id: Uuid,
         envelope: Vec<u8>,
     },
@@ -779,8 +863,9 @@ pub(super) fn validate_reply(body: StatusBody, expected: Option<Uuid>) -> Result
         "claimed" => {
             let organization = body
                 .organization_name
-                .filter(|name| public_text(name))
-                .ok_or_else(|| anyhow!("claimed status lacks its organization"))?;
+                .as_deref()
+                .map(display_text)
+                .filter(|name| !name.is_empty());
             let session_id = body
                 .session_id
                 .ok_or_else(|| anyhow!("claimed status lacks its session"))?;
@@ -810,6 +895,21 @@ fn public_text(value: &str) -> bool {
     !value.trim().is_empty()
         && value.chars().count() <= MAX_TEXT_CHARS
         && !value.chars().any(char::is_control)
+}
+
+/// Text only shown, never checked: control characters removed, trimmed,
+/// cut to 80 characters.
+fn display_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect::<String>()
+        .trim()
+        .chars()
+        .take(MAX_DISPLAY_CHARS)
+        .collect::<String>()
+        .trim_end()
+        .to_string()
 }
 
 fn valid_letters(letters: &str) -> bool {
@@ -975,12 +1075,17 @@ impl Transport {
     }
 }
 
-/// A status beats a refusal, and a refusal beats a transport failure.
+/// A status beats a refusal, and a refusal beats a transport failure. When
+/// both families answer and only one says `claimed` (the claim landed
+/// between them), `claimed` wins.
 pub(super) fn prefer_answer(
     first: Result<StatusBody>,
     second: Result<StatusBody>,
 ) -> Result<StatusBody> {
     match (first, second) {
+        (Ok(first), Ok(second)) if first.state != "claimed" && second.state == "claimed" => {
+            Ok(second)
+        }
         (Ok(answer), _) | (Err(_), Ok(answer)) => Ok(answer),
         (Err(first), Err(second))
             if protocol::http_refusal(&first).is_none()
