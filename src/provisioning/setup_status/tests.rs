@@ -778,6 +778,19 @@ fn claim_states_carry_only_the_fields_the_contract_allows() {
         serde_json::to_value(claim_status(&view)).unwrap(),
         json!({"state":"connecting"})
     );
+    // A URL longer than 80 characters is left out, never cut.
+    let longest = format!("dev.tiaris.com/{}", "n".repeat(65));
+    let longer = format!("{longest}x");
+    view.url = Some(&longest);
+    assert_eq!(
+        serde_json::to_value(claim_status(&view)).unwrap()["url"],
+        json!(longest)
+    );
+    view.url = Some(&longer);
+    assert_eq!(
+        serde_json::to_value(claim_status(&view)).unwrap(),
+        json!({"state":"connecting"})
+    );
     // A server that already runs a Nest says when the ISO starts it, but only
     // while it waits for a claim.
     for state in [

@@ -246,10 +246,11 @@ pub(super) fn claim_status(view: &ClaimView<'_>) -> ClaimStatus {
         state: view.state,
         letters: only(ClaimState::Claimable, view.letters),
         code: only(ClaimState::Claimable, view.code),
+        // A longer URL is left out, never cut: a cut one would lead elsewhere.
         url: view
             .url
-            .map(|url| bounded(url, MAX_VALUE_CHARS))
-            .filter(|url| !url.is_empty()),
+            .map(|url| bounded(url, MAX_VALUE_CHARS + 1))
+            .filter(|url| !url.is_empty() && url.chars().count() <= MAX_VALUE_CHARS),
         retry_at: view
             .retry_at
             .filter(|_| view.state == ClaimState::Backoff)
