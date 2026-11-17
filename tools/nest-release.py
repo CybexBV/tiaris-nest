@@ -1059,7 +1059,6 @@ def _appliance_release_inputs(
         "linux-firmware",
         "nix-bin",
         "python3",
-        "udpcast",
     }
     if (
         not isinstance(versions, dict)
@@ -1094,12 +1093,8 @@ def _appliance_release_inputs(
         },
         # This is a frozen wire contract consumed by installed Nest binaries.
         # Additional Debian dependencies belong to the authenticated archive,
-        # not this exact-key map. UDPcast remains mandatory in signer metadata
-        # above and pinned by tiaris-nest' exact Debian dependency; the archive
-        # digest binds its package, version, SPDX and corresponding source.
-        "required_package_versions": {
-            name: value for name, value in versions.items() if name != "udpcast"
-        },
+        # not this exact-key map.
+        "required_package_versions": versions,
         "expected_kernel": metadata["expected_kernel"],
         "minimum_protocol": 4,
         "minimum_state_schema": 2,
