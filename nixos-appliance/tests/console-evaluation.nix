@@ -23,6 +23,13 @@ let
     installedMasksAutomaticTty1 = noAutomaticLogin installed;
     installedMasksDirectTty1 = !installed.systemd.services."getty@tty1".enable;
     setupMasksDirectTty1 = !setup.systemd.services."getty@tty1".enable;
+    # First generic ISO install, 2026-11-18: ttyS0 offered a root login
+    # without a password.
+    setupHasNoSerialLogin = !setup.systemd.services."serial-getty@ttyS0".enable;
+    setupLocksEveryAccount = setup.users.users.root.initialHashedPassword == "!"
+      && setup.users.users.nixos.initialHashedPassword == "!"
+      && setup.services.getty.autologinUser == null
+      && setup.security.sudo.wheelNeedsPassword;
     setupHasVisibleConsole = ownsTty1 setupConsole;
     installedHasVisibleConsole = ownsTty1 installedConsole;
     setupRunsSetupKiosk = setupConsole.serviceConfig.ExecStart == "${kiosk} --nest-setup"
