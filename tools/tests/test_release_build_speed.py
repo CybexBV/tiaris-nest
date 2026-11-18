@@ -91,6 +91,18 @@ class ReleaseGateWiringTests(unittest.TestCase):
         cleanup = run_script(step(self.build, 'Remove disposable workspace payloads'))
         self.assertIn('bash release/beast/release-gates.sh stop ' + GATE_DIRECTORY, cleanup)
 
+    def test_the_artifact_lookup_waits_for_github_and_keeps_every_check(self):
+        script = run_script(step(self.build, 'Bind candidate artifact identity and provenance'))
+        self.assertIn('for attempt in $(seq 1 12); do', script)
+        self.assertIn('exit 1', script)
+        for check in ('test "$(jq -r \'.name\' "$metadata")" = "$TIARIS_NEST_RELEASE_ARTIFACT"',
+                      'test "$(jq -r \'.expired\' "$metadata")" = "false"',
+                      'test "$(jq -r \'.workflow_run.id\' "$metadata")" = "$GITHUB_RUN_ID"',
+                      'test "${api_digest#sha256:}" = "$action_digest"'):
+            with self.subTest(check=check):
+                self.assertIn(check, script)
+                self.assertGreater(script.index(check), script.index('done\n'))
+
     def test_the_gates_keep_every_check_of_the_former_gate_jobs(self):
         script = GATES.read_text()
         self.assertEqual(re.search(r'^GATES=\((.*)\)$', script, re.MULTILINE).group(1), 'contracts rust nix')
