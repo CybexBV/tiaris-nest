@@ -438,8 +438,9 @@ jobs:
           nix-shell release/release-tools.nix --run \
             "bash manage-source/deploy/nixos/check-installer-netboot-release.sh --inspect-only --bundle-tree '$staging'"
           bundle="dist/$BUILD_BUNDLE"
+          # The squashfs inside is already zstd: a higher level saves under 1% and costs minutes.
           nix-shell release/release-tools.nix --run \
-            "tar --format=ustar --sort=name --numeric-owner --owner=0 --group=0 --mode=u=rw,go=r --mtime=@$source_epoch -C '$staging' -cf - bzImage initrd manifest.json nix-store.squashfs | zstd -19 --threads=1 --no-progress --no-dictID -o '$bundle'"
+            "tar --format=ustar --sort=name --numeric-owner --owner=0 --group=0 --mode=u=rw,go=r --mtime=@$source_epoch -C '$staging' -cf - bzImage initrd manifest.json nix-store.squashfs | zstd -3 --threads=1 --no-progress --no-dictID -o '$bundle'"
           python3 tools/nest-release.py inspect-workstation-netboot \
             --workstation-netboot-bundle "$bundle" \
             --workstation-netboot-tree "$staging" \
