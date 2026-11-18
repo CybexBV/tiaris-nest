@@ -291,6 +291,46 @@ fn ipv6_is_used_only_with_a_default_route_and_a_global_address() {
 }
 
 #[test]
+fn run_store_keeps_the_claiming_organization_for_its_session_only() {
+    let dir = TempDir::new();
+    let store = RunStore::new(dir.0.join("claim"));
+    let session = Uuid::from_bytes([5; 16]);
+    let other = Uuid::from_bytes([6; 16]);
+    assert_eq!(store.load_organization(session), None);
+
+    store.save_organization(session, Some("Greenfield School"));
+    let path = dir.0.join("claim").join(ORGANIZATION_FILE);
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        store.load_organization(session).as_deref(),
+        Some("Greenfield School")
+    );
+    assert_eq!(store.load_organization(other), None);
+
+    // Whatever the file holds is shown as one bounded line.
+    fs::write(&path, format!("{session}\nGreen\u{7}field\nSchool")).unwrap();
+    assert_eq!(
+        store.load_organization(session).as_deref(),
+        Some("GreenfieldSchool")
+    );
+    fs::write(&path, "not a session\nGreenfield School").unwrap();
+    assert_eq!(store.load_organization(session), None);
+
+    store.save_organization(session, Some("Greenfield School"));
+    store.save_organization(session, None);
+    assert_eq!(store.load_organization(session), None);
+    store.save_organization(session, Some("Greenfield School"));
+    store.forget_claimed().unwrap();
+    assert_eq!(store.load_organization(session), None);
+    store.save_organization(session, Some("Greenfield School"));
+    store.forget().unwrap();
+    assert_eq!(store.load_organization(session), None);
+}
+
+#[test]
 fn run_store_keeps_its_secrets_private_and_forgets_cleanly() {
     let dir = TempDir::new();
     let store = RunStore::new(dir.0.join("claim"));

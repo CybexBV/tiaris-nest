@@ -877,6 +877,44 @@ fn claim_screen_replaces_a_preserved_stop_and_hands_over_to_checking() {
 }
 
 #[test]
+fn the_claiming_organization_is_shown_by_name_from_approval_on() {
+    // First generic ISO install, 2026-11-18: the approval screen showed no
+    // organization and the install screen showed the plan's slug.
+    let (plan, inventory) = fixture();
+    let dir = tempdir::TempDir::new();
+    let (status, path) = reporter(&dir);
+    status.claim(
+        "https://manage.tiaris.com",
+        &claim_view(ClaimState::Claimed),
+    );
+    status.claimed_by(Some("Greenfield School"));
+    status.media_verified("https://manage.tiaris.com");
+    status.inventory_collected(&inventory);
+    status.session_claimed(&inventory);
+    let shown = published(&path);
+    assert_eq!(shown["state"], "awaiting_approval");
+    assert_eq!(shown["organization"], "Greenfield School");
+
+    status.plan_approved(&plan, &inventory);
+    assert_eq!(published(&path)["organization"], "Greenfield School");
+    status.resumed(&plan, &inventory);
+    assert_eq!(published(&path)["organization"], "Greenfield School");
+
+    // A new claim forgets the old name; without one the slug is the fallback.
+    status.claim(
+        "https://manage.tiaris.com",
+        &claim_view(ClaimState::Connecting),
+    );
+    status.claimed_by(None);
+    status.media_verified("https://manage.tiaris.com");
+    status.inventory_collected(&inventory);
+    status.session_claimed(&inventory);
+    assert!(published(&path).get("organization").is_none());
+    status.plan_approved(&plan, &inventory);
+    assert_eq!(published(&path)["organization"], "acme-control");
+}
+
+#[test]
 fn a_new_claim_after_an_ended_setup_starts_from_a_clean_screen() {
     let (plan, inventory) = fixture();
     let dir = tempdir::TempDir::new();
