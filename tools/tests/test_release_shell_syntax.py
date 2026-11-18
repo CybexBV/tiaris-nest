@@ -3,7 +3,6 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
-import textwrap
 import unittest
 
 
@@ -15,9 +14,8 @@ HELPERS = ('release/beast/preflight.sh', 'release/beast/second.sh',
 @unittest.skipUnless(shutil.which('rg'), 'rg is required by the release syntax gate')
 class ReleaseShellSyntaxTests(unittest.TestCase):
     def check_helpers(self, broken=None):
-        workflow = (ROOT / '.github/workflows/release.yml').read_text()
-        step = workflow.split('      - name: Bash syntax\n', 1)[1].split('      - name:', 1)[0]
-        script = textwrap.dedent(step.split('        run: |\n', 1)[1])
+        # The release runs this gate from release/beast/release-gates.sh.
+        gates = ROOT / 'release/beast/release-gates.sh'
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             for name in HELPERS:
@@ -26,7 +24,7 @@ class ReleaseShellSyntaxTests(unittest.TestCase):
                 # A syntax check must never execute any helper.
                 path.write_text('#!/usr/bin/env bash\nexit 99\n' +
                                 ('if true; then\n' if name == broken else ''))
-            result = subprocess.run(['bash', '--noprofile', '--norc', '-eo', 'pipefail', '-c', script],
+            result = subprocess.run(['bash', '--noprofile', '--norc', str(gates), 'bash-syntax'],
                                     cwd=root, text=True, capture_output=True, timeout=10)
         return result
 
