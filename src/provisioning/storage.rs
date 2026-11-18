@@ -1516,7 +1516,10 @@ const WHOLE_DISK_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
 /// exclusive BSD lock on it (systemd "Locking Block Device Access", the lock
 /// `udevadm lock` takes). Dropping this value releases the lock. The disk is
 /// opened read-only, so closing it starts no new re-read.
-pub(super) struct WholeDiskLock(File);
+pub(super) struct WholeDiskLock {
+    /// Held only for its lock; never read.
+    _lock: File,
+}
 
 impl WholeDiskLock {
     pub(super) async fn acquire(disk: &Path, timeout: Duration) -> Result<Self> {
@@ -1529,7 +1532,7 @@ impl WholeDiskLock {
         loop {
             // udevd holds the lock only while it handles one event.
             if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                return Ok(Self(file));
+                return Ok(Self { _lock: file });
             }
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
