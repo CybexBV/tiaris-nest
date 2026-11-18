@@ -31,7 +31,9 @@ Inside the container Nix builds at most 4 derivations at once with 4 cores each
 workflow runs three parts side by side: the workstation runtime, the Nest system
 closure and the setup media. They are separate `nix-build` processes on the one
 single-user store, whose locks build the Tiaris agent and kiosk they share once;
-the container's 12-CPU limit holds them all.
+the container's 12-CPU limit holds them all. Meanwhile, on the host, the release
+gates (`release-gates.sh`) run from a clean checkout of the tag; the build job
+joins them before it signs anything.
 
 Before compilation, `preflight.sh` checks the native packaging tools and performs
 a compressed cpio archive round trip inside the pinned Nix release-tools shell.

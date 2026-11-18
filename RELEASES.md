@@ -199,11 +199,18 @@ The required path (`release.yml`) is:
 
 | Job | Typical duration |
 | --- | --- |
-| Installer and release contracts, Rust production release gate, pinned workstation netboot (parallel) | 1–2 min |
-| Build and sign release candidate once (reproducible build, signing, self-verification, sealed receipt) | about 11 min |
+| Build and sign release candidate once: the gates (installer and release contracts, Rust production release gate, pinned workstation netboot expressions) run beside the reproducible build and must all pass before signing, self-verification and the sealed receipt | about 10–12 min |
 | Attest and stage immutable candidate (exact-byte verification, attestation, immutable publication, per-asset `gh release verify-asset`, predecessor recheck) | about 4–5 min |
 | Verify published closure through the candidate downloader (no VM) | about 2–3 min |
 | Promote (automatic for non-coordinated tags; `approve-coordinated-release.yml` for coordinated tags) | under 1 min |
+
+The workflow has one self-hosted runner, so separate jobs can only run one after
+another. The gates therefore run inside the build job, from a clean checkout of the
+exact tag (`release/beast/release-gates.sh`), and every attempt joins them before it
+signs anything. Inside the build container the workstation runtime, the Nest system
+closure and the setup media build side by side; Nix's store locks build the Tiaris
+agent and kiosk they share once. The runtime archive uses `zstd -3`: its squashfs is
+already zstd-compressed, so a higher level saved under 1% and cost minutes.
 
 Under the previous policy the warm VM job ("Boot, install, adopt, and reboot exact
 candidate", 44–50 min measured) sat between build and publication, and the cold VM

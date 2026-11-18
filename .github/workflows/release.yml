@@ -8,107 +8,9 @@ permissions:
   contents: read
 
 jobs:
-  contracts:
-    name: Installer and release contracts
-    environment: production-release
-    runs-on: [self-hosted, linux, x64, cybex-james-lab]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-
-      - name: Install native checks
-        run: |
-          command -v cc
-          command -v dnsmasq
-          command -v rg
-          command -v shellcheck
-
-      - name: Bash syntax
-        shell: bash
-        run: |
-          mapfile -t appliance_helpers < <(rg -l '^#!.*(bash|/sh)$' nixos-appliance/runtime | sort)
-          for helper in release/beast/*.sh nixos-appliance/*.sh "${appliance_helpers[@]}"; do
-            bash -n "$helper"
-          done
-
-      - name: Shellcheck
-        shell: bash
-        run: |
-          mapfile -t appliance_helpers < <(rg -l '^#!.*(bash|/sh)$' nixos-appliance/runtime | sort)
-          shellcheck release/beast/*.sh nixos-appliance/*.sh "${appliance_helpers[@]}"
-
-      - name: Python helper syntax
-        run: python3 -m py_compile nixos-appliance/*.py tools/pack-system-closure.py tools/system_closure.py
-
-      - name: NixOS appliance pinned-base contract
-        run: python3 -B -m unittest discover -s nixos-appliance/tests -v
-
-      - name: Appliance and release tests
-        run: python3 -B -m unittest discover -s tools/tests -v
-
-  rust-release:
-    name: Rust production release gate
-    environment: production-release
-    env:
-      CARGO_TARGET_DIR: /home/john/.local/state/tiaris-nest-ci-target/release-gate
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: [self-hosted, linux, x64, cybex-james-lab]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-
-      - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@8641a17e25bf5b40c118d48fe0f81e8655731839 # 1.85.0
-        with:
-          toolchain: 1.85.0
-          components: rustfmt, clippy
-
-      - name: Check formatting
-        run: cargo fmt --all --check
-
-      - name: Test
-        run: cargo test --locked
-
-      - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: Audit the dependencies before signing a production release
-        run: |
-          cargo audit --version
-          cargo tree -i sqlx-mysql 2>&1 | tee /tmp/sqlx-mysql-tree.txt
-          grep -q "nothing to print" /tmp/sqlx-mysql-tree.txt
-          # RUSTSEC-2026-0459: bundled SQLite before 3.54 can expose stale memory
-          # when a process opens a crafted database plus -wal file. The Nest opens
-          # only its own root-owned database, and no released sqlx accepts the
-          # patched libsqlite3-sys (>= 0.39). Accepted 2026-11-09; review by
-          # 2027-02-01 (the shared CI adapter applies the same expiry).
-          if [ "$(date -u +%F)" \> 2027-02-01 ]; then
-            echo "The RUSTSEC-2026-0459 audit exception expired; review it" >&2
-            exit 1
-          fi
-          cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0459
-
-  nix:
-    name: Pinned workstation netboot
-    environment: production-release
-    runs-on: [self-hosted, linux, x64, cybex-james-lab]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-
-      - name: Verify installed local Nix
-        run: nix-instantiate --version
-
-      - name: Parse workstation expressions
-        run: |
-          nix-instantiate --parse release/workstation-netboot.nix >/dev/null
-          nix-instantiate --parse release/release-tools.nix >/dev/null
-          for expression in nixos-appliance/*.nix; do nix-instantiate --parse "$expression" >/dev/null; done
-
   release_build:
     name: Build and sign release candidate once
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [contracts, rust-release, nix]
     runs-on: [self-hosted, linux, x64, cybex-james-lab]
     environment: production-release
     timeout-minutes: 240
@@ -144,6 +46,25 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Install pinned Rust toolchain for the release gates
+        uses: dtolnay/rust-toolchain@8641a17e25bf5b40c118d48fe0f81e8655731839 # 1.85.0
+        with:
+          toolchain: 1.85.0
+          components: rustfmt, clippy
+
+      # One runner: separate gate jobs could only run before the build, one
+      # after another. Every attempt starts the installer and release contracts,
+      # the Rust production release gate and the pinned workstation netboot
+      # expressions here, from a clean checkout of the exact tag, and joins them
+      # before anything is signed (release/beast/release-gates.sh).
+      - name: Start the release gates beside the build
+        env:
+          CARGO_TARGET_DIR: /home/john/.local/state/tiaris-nest-ci-target/release-gate
+        run: |
+          env -u TIARIS_NEST_BUILD_MANAGE_ORIGIN -u TIARIS_NEST_UPDATE_TRUSTED_PUBLIC_KEY \
+            -u TIARIS_NEST_PROVISIONING_PUBLIC_KEYS -u TIARIS_NEST_RELEASE_ARTIFACT \
+            bash release/beast/release-gates.sh start "$RUNNER_TEMP/tiaris-nest-release-gates"
 
       - name: Validate governed release inputs
         id: release-version
@@ -506,6 +427,12 @@ jobs:
           test "$(dist/tiaris-nest-x86_64-linux --version)" = "tiaris-nest $version"
           BUILD
 
+      # Every attempt, the reuse path included: nothing is signed, sealed or
+      # handed to publication unless every gate passed in this attempt.
+      - name: Require every release gate to pass
+        timeout-minutes: 60
+        run: bash release/beast/release-gates.sh join "$RUNNER_TEMP/tiaris-nest-release-gates"
+
       - name: Sign and self-verify release manifests
         if: steps.release-candidate.outputs.reuse != 'true'
         shell: bash
@@ -669,6 +596,9 @@ jobs:
       - name: Remove disposable workspace payloads
         if: always()
         run: |
+          if [ -f release/beast/release-gates.sh ]; then
+            bash release/beast/release-gates.sh stop "$RUNNER_TEMP/tiaris-nest-release-gates"
+          fi
           rm -rf -- "$GITHUB_WORKSPACE/dist" "$GITHUB_WORKSPACE/candidate-receipt" "$GITHUB_WORKSPACE/manage-source"
           rm -rf -- "$RUNNER_TEMP/tiaris-nest-unsigned-closure" "$RUNNER_TEMP/tiaris-nest-template" "$RUNNER_TEMP/tiaris-workstation-netboot-tree"
           rm -rf -- "$RUNNER_TEMP/tiaris-nest-predecessor" "$RUNNER_TEMP/tiaris-nest-qualification-predecessor" "$RUNNER_TEMP/tiaris-nest-retained-manage-source"

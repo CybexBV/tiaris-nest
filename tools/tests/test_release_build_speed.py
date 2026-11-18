@@ -1,7 +1,8 @@
-"""The release build parts run side by side.
+"""The release gates run beside the build, and the build parts run side by side.
 
-These tests run the workflow's own build script with fake tools to prove its
-parts overlap, keep the exact runtime archive and fail closed.
+The release workflow has one runner, so the gates run inside the build job. These
+tests keep every gate command, keep the gates joined before anything is signed,
+and run the real build script with fake tools to prove its parts fail closed.
 """
 from pathlib import Path
 import os
@@ -10,11 +11,14 @@ import shutil
 import subprocess
 import tempfile
 import textwrap
+import time
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / '.github/workflows/release.yml'
+GATES = ROOT / 'release/beast/release-gates.sh'
+GATE_DIRECTORY = '"$RUNNER_TEMP/tiaris-nest-release-gates"'
 
 
 def job(body, name):
@@ -36,6 +40,189 @@ def run_script(text):
             break
         lines.append(line)
     return textwrap.dedent('\n'.join(lines) + '\n')
+
+
+class ReleaseGateWiringTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.body = WORKFLOW.read_text()
+        cls.build = job(cls.body, 'release_build')
+        cls.names = re.findall(r'^      - name: (.+)$', cls.build, re.MULTILINE)
+
+    def test_the_release_has_no_serial_gate_jobs_and_the_build_waits_for_none(self):
+        jobs = re.findall(r'^  ([a-z_-]+):$', self.body.split('\njobs:\n', 1)[1], re.MULTILINE)
+        self.assertEqual(jobs, ['release_build', 'release_publish', 'release_public_closure', 'release_promote'])
+        header = self.build.split('    steps:\n', 1)[0]
+        self.assertNotIn('needs:', header)
+        # Publication, its closure check and promotion all still follow the build.
+        self.assertIn('    needs: [release_build]\n', job(self.body, 'release_publish'))
+        self.assertIn('    needs: [release_build, release_publish]\n', job(self.body, 'release_public_closure'))
+        self.assertIn('    needs: [release_build, release_public_closure]\n', job(self.body, 'release_promote'))
+
+    def test_every_attempt_starts_the_gates_from_the_exact_tag_before_anything_else(self):
+        self.assertEqual(self.names[:3], ['Checkout exact tag', 'Install pinned Rust toolchain for the release gates',
+                                          'Start the release gates beside the build'])
+        toolchain = step(self.build, 'Install pinned Rust toolchain for the release gates')
+        self.assertIn('toolchain: 1.85.0', toolchain)
+        self.assertIn('components: rustfmt, clippy', toolchain)
+        start = step(self.build, 'Start the release gates beside the build')
+        self.assertNotIn('    if:', start)
+        self.assertIn('CARGO_TARGET_DIR: /home/john/.local/state/tiaris-nest-ci-target/release-gate', start)
+        self.assertIn('bash release/beast/release-gates.sh start ' + GATE_DIRECTORY, start)
+        # The gates see the environment the separate gate jobs had: none of the
+        # build job's production inputs (the origin changes the compiled tests).
+        job_environment = self.build.split('\n    env:\n', 1)[1].split('\n    steps:\n', 1)[0]
+        for name in re.findall(r'^      ([A-Z_]+):', job_environment, re.MULTILINE):
+            with self.subTest(name=name):
+                self.assertIn(f'-u {name} ', start)
+
+    def test_every_attempt_joins_the_gates_before_signing_sealing_or_upload(self):
+        join = step(self.build, 'Require every release gate to pass')
+        self.assertNotIn('    if:', join)
+        self.assertIn('run: bash release/beast/release-gates.sh join ' + GATE_DIRECTORY, join)
+        position = self.names.index('Require every release gate to pass')
+        for later in ('Sign and self-verify release manifests', 'Seal exact signed files in the local candidate store',
+                      'Upload only the bounded candidate receipt', 'Bind candidate artifact identity and provenance'):
+            with self.subTest(step=later):
+                self.assertGreater(self.names.index(later), position)
+        # The reuse path restores a sealed candidate and still needs this attempt's gates.
+        self.assertLess(self.names.index('Restore exact local bytes without rebuilding or signing'), position)
+        self.assertLess(self.names.index('Build exact binaries, appliance media, and workstation runtime'), position)
+        cleanup = run_script(step(self.build, 'Remove disposable workspace payloads'))
+        self.assertIn('bash release/beast/release-gates.sh stop ' + GATE_DIRECTORY, cleanup)
+
+    def test_the_gates_keep_every_check_of_the_former_gate_jobs(self):
+        script = GATES.read_text()
+        self.assertEqual(re.search(r'^GATES=\((.*)\)$', script, re.MULTILINE).group(1), 'contracts rust nix')
+        for command in (
+                'command -v cc', 'command -v dnsmasq', 'command -v rg', 'command -v shellcheck',
+                'bash -n "$helper"',
+                'shellcheck release/beast/*.sh nixos-appliance/*.sh "${appliance[@]}"',
+                'python3 -m py_compile nixos-appliance/*.py tools/pack-system-closure.py tools/system_closure.py',
+                'python3 -B -m unittest discover -s nixos-appliance/tests -v',
+                'python3 -B -m unittest discover -s tools/tests -v',
+                'cargo fmt --all --check', 'cargo test --locked',
+                'cargo clippy --all-targets --all-features -- -D warnings',
+                'cargo audit --version', 'grep -q "nothing to print" "$tree"',
+                'if [ "$(date -u +%F)" \\> 2027-02-01 ]; then',
+                'cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0459',
+                'nix-instantiate --version',
+                'nix-instantiate --parse release/workstation-netboot.nix >/dev/null',
+                'nix-instantiate --parse release/release-tools.nix >/dev/null',
+                'for expression in nixos-appliance/*.nix; do nix-instantiate --parse "$expression" >/dev/null; done'):
+            with self.subTest(command=command):
+                self.assertIn(command, script)
+        for gate in ('contracts', 'rust', 'nix'):
+            self.assertIn(f'gate_{gate}() {{', script)
+        contracts = script.split('gate_contracts() {', 1)[1].split('\n}\n', 1)[0]
+        self.assertIn('  gate_bash_syntax\n  gate_shellcheck\n', contracts)
+
+
+@unittest.skipUnless(shutil.which('git') and shutil.which('setsid') and shutil.which('ps'),
+                     'git, setsid and ps are required')
+class ReleaseGateRunTests(unittest.TestCase):
+    """The real start/join/stop against a checkout whose gates are fakes."""
+
+    def setUp(self):
+        temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.checkout = temporary / 'checkout'
+        self.gates = temporary / 'gates'
+        script = self.checkout / 'release/beast/release-gates.sh'
+        script.parent.mkdir(parents=True)
+        # The real start/join/stop, with the gates replaced by commands from the
+        # fixture's environment: start runs the copy inside the clean checkout.
+        real = GATES.read_text()
+        fake = real.replace('  contracts | rust | nix | bash-syntax | shellcheck)\n'
+                            '    [ "$#" -eq 1 ] || { echo "usage: $0 GATE" >&2; exit 2; }\n'
+                            '    "gate_${1//-/_}"\n',
+                            '  contracts | rust | nix)\n'
+                            '    [ "$#" -eq 1 ] || exit 2\n'
+                            '    printf "%s\\n" "$PWD" > "$FAKE_RECORD/$1.cwd"\n'
+                            '    eval "$(printenv "FAKE_$1")"\n')
+        self.assertNotEqual(fake, real)
+        script.write_text(fake)
+        self.git('init', '-q', str(self.checkout))
+        self.git('-C', str(self.checkout), 'add', '.')
+        self.git('-C', str(self.checkout), '-c', 'user.name=Fixture', '-c', 'user.email=f@example.invalid',
+                 'commit', '-qm', 'fixture')
+        self.record = temporary / 'record'
+        self.record.mkdir()
+
+    @staticmethod
+    def git(*arguments):
+        subprocess.run(['git', *arguments], check=True, capture_output=True)
+
+    def gate(self, action, **gates):
+        environment = {**os.environ, 'FAKE_RECORD': str(self.record),
+                       'FAKE_contracts': 'echo contracts-ran', 'FAKE_rust': 'echo rust-ran',
+                       'FAKE_nix': 'echo nix-ran', **{'FAKE_' + key: value for key, value in gates.items()}}
+        return subprocess.run(['bash', str(self.checkout / 'release/beast/release-gates.sh'), action,
+                               str(self.gates)], cwd=self.checkout, env=environment,
+                              capture_output=True, text=True, timeout=60)
+
+    def test_passing_gates_join_and_run_in_a_clean_checkout_of_head(self):
+        # The rust gate waits for a file written only after start returned: a
+        # start that waited for its gates would never return.
+        result = self.gate('start', rust='until [ -e "$FAKE_RECORD/go" ]; do sleep 0.1; done; echo rust-ran')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.gates / 'rust.status').exists())
+        (self.record / 'go').touch()
+        joined = self.gate('join')
+        self.assertEqual(joined.returncode, 0, joined.stdout + joined.stderr)
+        for gate in ('contracts', 'rust', 'nix'):
+            self.assertIn(f'{gate}-ran', joined.stdout)
+            self.assertIn(f'Release gate {gate} passed', joined.stdout)
+            self.assertEqual((self.record / f'{gate}.cwd').read_text().strip(), str(self.gates / 'source'))
+        stopped = self.gate('stop')
+        self.assertEqual(stopped.returncode, 0, stopped.stderr)
+        self.assertFalse(self.gates.exists())
+        worktrees = subprocess.run(['git', '-C', str(self.checkout), 'worktree', 'list'],
+                                   capture_output=True, text=True, check=True).stdout
+        self.assertEqual(len(worktrees.splitlines()), 1)
+
+    def test_any_failing_gate_fails_the_join_after_every_gate_has_ended(self):
+        self.assertEqual(self.gate('start', nix='echo broken >&2; exit 7').returncode, 0)
+        joined = self.gate('join')
+        self.assertNotEqual(joined.returncode, 0)
+        self.assertIn('::error::Release gate nix failed (7)', joined.stdout)
+        self.assertIn('broken', joined.stdout)
+        self.assertIn('Release gate contracts passed', joined.stdout)
+        self.gate('stop')
+
+    def test_a_gate_killed_without_a_result_fails_the_join(self):
+        self.assertEqual(self.gate('start', contracts='sleep 300').returncode, 0)
+        pid = int((self.gates / 'contracts.pid').read_text())
+        os.killpg(pid, 9)
+        joined = self.gate('join')
+        self.assertNotEqual(joined.returncode, 0)
+        self.assertIn('::error::Release gate contracts failed (ended without a result)', joined.stdout)
+        self.gate('stop')
+
+    def wait_until_session_ends(self, pid):
+        for _ in range(300):
+            if subprocess.run(['ps', '-o', 'pid=', '-g', str(pid)], capture_output=True, text=True).stdout.strip() == '':
+                return
+            time.sleep(0.1)
+        self.fail(f'release gate session {pid} is still running')
+
+    def test_stop_ends_running_gates_and_removes_them(self):
+        self.assertEqual(self.gate('start', rust='sleep 300').returncode, 0)
+        pid = int((self.gates / 'rust.pid').read_text())
+        self.assertEqual(self.gate('stop').returncode, 0)
+        self.wait_until_session_ends(pid)
+        self.assertFalse(self.gates.exists())
+
+    def test_a_leftover_from_an_earlier_job_is_ended_and_replaced(self):
+        self.assertEqual(self.gate('start', rust='sleep 300').returncode, 0)
+        leftover = int((self.gates / 'rust.pid').read_text())
+        again = self.gate('start')
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertIn('Replacing leftover release gates', again.stdout)
+        self.wait_until_session_ends(leftover)
+        joined = self.gate('join')
+        self.assertEqual(joined.returncode, 0, joined.stdout + joined.stderr)
+        self.assertIn('rust-ran', joined.stdout)
+        self.gate('stop')
 
 
 # Each build part announces itself, then waits until every expected part has
