@@ -13,9 +13,11 @@ use std::{
     os::unix::{
         ffi::OsStrExt,
         fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+        io::AsRawFd,
     },
     path::{Path, PathBuf},
     process::Command as StdCommand,
+    time::Duration,
 };
 use tokio::process::Command;
 use uuid::Uuid;
@@ -686,6 +688,9 @@ pub(crate) async fn create_state_partition_first(
     )
     .await?;
     settle_partitions(&disk.path).await?;
+    // Hold udevd off the disk from formatting until STATE is mounted; see
+    // `WholeDiskLock`. Once mounted, a re-read can no longer drop it.
+    let disk_lock = WholeDiskLock::acquire(&disk_path, WHOLE_DISK_LOCK_TIMEOUT).await?;
     let state_partition = partition_path(&disk_path, state_index)?;
     run_checked(
         "mkfs.ext4",
@@ -700,9 +705,13 @@ pub(crate) async fn create_state_partition_first(
     )
     .await?;
     fs::create_dir_all(state_mount).context("create live state mount")?;
+    // Name the type: a probe never decides it, and the kernel loads ext4,
+    // which the setup ISO has not loaded yet.
     run_checked(
         "mount",
         &[
+            "-t",
+            "ext4",
             "-o",
             "nodev,nosuid",
             state_partition
@@ -714,6 +723,7 @@ pub(crate) async fn create_state_partition_first(
         ],
     )
     .await?;
+    drop(disk_lock);
     Ok(PreparedStorage {
         disk_path,
         state_mount: state_mount.to_path_buf(),
@@ -1491,6 +1501,48 @@ pub(super) fn partition_path(disk: &Path, number: u8) -> Result<PathBuf> {
     ))
 }
 
+const WHOLE_DISK_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// systemd-udevd re-reads a whole disk's partition table after a program
+/// closes it for writing (`sgdisk`, `partprobe`), which removes and re-adds
+/// every partition. `udevadm settle` can return before udevd has even seen
+/// that close. Landing between `mkfs.ext4` and `mount` of the new STATE
+/// partition, the re-read left `mount` without a probed type; it then tried
+/// only loaded filesystems, and on the setup ISO ext4 is a module that is not
+/// loaded yet: "FAT-fs (sda1): bogus number of reserved sectors" and a failed
+/// first install attempt (first real generic ISO install, 2026-11-18).
+///
+/// udevd neither probes nor re-reads a disk while another process holds an
+/// exclusive BSD lock on it (systemd "Locking Block Device Access", the lock
+/// `udevadm lock` takes). Dropping this value releases the lock. The disk is
+/// opened read-only, so closing it starts no new re-read.
+pub(super) struct WholeDiskLock(File);
+
+impl WholeDiskLock {
+    pub(super) async fn acquire(disk: &Path, timeout: Duration) -> Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(disk)
+            .with_context(|| format!("open {} for its lock", disk.display()))?;
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            // udevd holds the lock only while it handles one event.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(Self(file));
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
+                return Err(error).context("lock the target disk");
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!("the target disk stayed locked by another program")
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+}
+
 pub(super) async fn settle_partitions(disk: &str) -> Result<()> {
     run_checked("partprobe", &[disk]).await?;
     run_checked("udevadm", &["settle", "--timeout=30"]).await
@@ -1948,6 +2000,58 @@ mod tests {
         assert_eq!((ends[2] - starts[2] + 1) * 512, STATE_BYTES);
         assert_eq!((ends[3] - starts[3] + 1) * 512, SWAP_BYTES);
         assert!((ends[4] - starts[4] + 1) * 512 >= CACHE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn whole_disk_lock_excludes_udevd_until_dropped() {
+        // udevd takes the same exclusive BSD lock (`LOCK_EX | LOCK_NB`)
+        // before it re-reads a partition table.
+        let path = std::env::temp_dir().join(format!("nest-disk-lock-{}", Uuid::new_v4()));
+        fs::write(&path, b"disk").unwrap();
+        let udevd = File::open(&path).unwrap();
+        let try_udevd =
+            || unsafe { libc::flock(udevd.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+
+        let lock = WholeDiskLock::acquire(&path, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(
+            !try_udevd(),
+            "udevd must not get the disk while it is locked"
+        );
+        let error = WholeDiskLock::acquire(&path, Duration::from_millis(250))
+            .await
+            .err()
+            .expect("a held lock is not taken twice");
+        assert!(error.to_string().contains("stayed locked"));
+        drop(lock);
+        assert!(try_udevd(), "dropping the lock releases the disk");
+        unsafe { libc::flock(udevd.as_raw_fd(), libc::LOCK_UN) };
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn fresh_state_is_formatted_and_mounted_as_ext4_under_the_disk_lock() {
+        // First generic ISO install, 2026-11-18: an untyped mount right after
+        // mkfs.ext4 raced udevd's partition re-read and failed.
+        let source = include_str!("storage.rs");
+        let body = source
+            .split_once("pub(crate) async fn create_state_partition_first(")
+            .unwrap()
+            .1
+            .split_once("pub(crate) async fn resume_prepared_storage(")
+            .unwrap()
+            .0;
+        let position = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        let settled = position("settle_partitions(&disk.path)");
+        let locked = position("WholeDiskLock::acquire(&disk_path");
+        let formatted = position("\"mkfs.ext4\"");
+        let mounted =
+            position("\"mount\",\n        &[\n            \"-t\",\n            \"ext4\",");
+        let released = position("drop(disk_lock);");
+        assert!(
+            settled < locked && locked < formatted && formatted < mounted && mounted < released
+        );
     }
 
     #[test]

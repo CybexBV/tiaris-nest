@@ -61,6 +61,16 @@ in {
   systemd.services.systemd-time-wait-sync.serviceConfig.TimeoutStartSec = "60s";
   services.openssh.enable = lib.mkForce false;
   services.getty.autologinUser = lib.mkForce null;
+  # The installer profile gives root and "nixos" empty passwords and the
+  # kernel's console=ttyS0 starts a serial login prompt: anyone at the
+  # machine could log in. The setup ISO needs no login anywhere. Lock both
+  # accounts and start no serial getty; kernel messages still reach ttyS0,
+  # which is all qualification reads from it.
+  users.users.root.initialHashedPassword = lib.mkForce "!";
+  users.users.nixos.initialHashedPassword = lib.mkForce "!";
+  services.getty.helpLine = lib.mkForce "";
+  security.sudo.wheelNeedsPassword = lib.mkForce true;
+  systemd.services."serial-getty@ttyS0".enable = false;
   environment.systemPackages = [ a.package pkgs.nix pkgs.nixos-install-tools pkgs.iputils pkgs.iproute2 pkgs.gptfdisk pkgs.e2fsprogs pkgs.dosfstools pkgs.util-linux pkgs.curl pkgs.jq pkgs.zstd pkgs.python3 ];
   nix.settings = { experimental-features = [ "nix-command" ]; substituters = lib.mkForce []; trusted-public-keys = lib.mkForce [ "tiaris-nest-appliance-1:${a.releasePublicKey}" ]; };
   systemd.services.tiaris-nest-bootstrap = {

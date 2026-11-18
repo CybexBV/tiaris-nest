@@ -53,6 +53,7 @@ const STORED_SCHEMA: &str = "tiaris.nest.setup-registration-state.v1";
 const REGISTRATIONS_PATH: &str = "/v1/agent/nest/setup-registrations";
 const REGISTRATION_FILE: &str = "registration.json";
 const ENVELOPE_FILE: &str = "envelope.bin";
+const ORGANIZATION_FILE: &str = "organization";
 const STARTS_INSTALLED_FILE: &str = "starts-installed-at";
 /// How long a server that already runs a Nest waits for a new claim.
 const START_INSTALLED_AFTER_MINUTES: i64 = 10;
@@ -140,6 +141,13 @@ pub(super) async fn prepare_generic(
             }
             Retained::None => claim(&context).await?,
         };
+        // Who claimed it, for the approval and install screens. Kept in
+        // `/run`, so a restarted bootstrap in this boot still knows it.
+        status.claimed_by(
+            store
+                .load_organization(claimed.verified.envelope.session_id)
+                .as_deref(),
+        );
         let result = super::prepare_verified(
             options,
             status,
@@ -653,6 +661,7 @@ fn take_claimed(
         return Ok(None);
     }
     context.store.save_envelope(&envelope)?;
+    context.store.save_organization(session_id, organization);
     if let Some(organization) = organization {
         context.status.claim(
             context.required_origin,
@@ -1357,16 +1366,53 @@ impl RunStore {
         }
     }
 
+    /// The claiming organization's name for `session_id`: display text
+    /// only, so it is best effort and never stops the setup.
+    pub(super) fn save_organization(&self, session_id: Uuid, name: Option<&str>) {
+        let result = match name {
+            Some(name) => self.prepare().and_then(|()| {
+                storage::atomic_write(
+                    &self.dir.join(ORGANIZATION_FILE),
+                    format!("{session_id}\n{name}").as_bytes(),
+                    0o600,
+                )
+            }),
+            None => self.remove(&[ORGANIZATION_FILE]),
+        };
+        if let Err(error) = result {
+            warn!(error = %error, "could not keep the claiming organization's name");
+        }
+    }
+
+    /// The name saved for `session_id`, if any; another setup's is ignored.
+    pub(super) fn load_organization(&self, session_id: Uuid) -> Option<String> {
+        let body = super::read_bounded_nofollow(
+            &self.dir.join(ORGANIZATION_FILE),
+            1024,
+            "claiming organization name",
+        )
+        .ok()?;
+        let text = String::from_utf8(body).ok()?;
+        let (saved, name) = text.split_once('\n')?;
+        let name = display_text(name);
+        (saved.parse::<Uuid>().ok()? == session_id && !name.is_empty()).then_some(name)
+    }
+
     /// Forget the registration and the envelope; the next attempt registers
     /// with a new key and shows a new code.
     pub(super) fn forget(&self) -> Result<()> {
-        self.remove(&[ENVELOPE_FILE, REGISTRATION_FILE])
+        self.remove(&[ENVELOPE_FILE, REGISTRATION_FILE, ORGANIZATION_FILE])
     }
 
     /// A claimed setup ended: forget it, and the claim screen that returns
     /// gives an installed Nest its full 10 minutes again.
     pub(super) fn forget_claimed(&self) -> Result<()> {
-        self.remove(&[ENVELOPE_FILE, REGISTRATION_FILE, STARTS_INSTALLED_FILE])
+        self.remove(&[
+            ENVELOPE_FILE,
+            REGISTRATION_FILE,
+            STARTS_INSTALLED_FILE,
+            ORGANIZATION_FILE,
+        ])
     }
 
     fn remove(&self, names: &[&str]) -> Result<()> {

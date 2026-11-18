@@ -944,6 +944,9 @@ struct ReporterState {
     hardware_blocked: bool,
     current_step: Option<InstallStep>,
     last_progress: Option<(u8, Instant)>,
+    /// The claiming organization's name, when this boot's claim told it.
+    /// Shown instead of the signed plan's slug.
+    organization_name: Option<String>,
 }
 
 /// Best-effort publisher. Every method updates the in-memory projection and
@@ -979,6 +982,7 @@ impl SetupStatusReporter {
                 hardware_blocked: false,
                 current_step: None,
                 last_progress: None,
+                organization_name: None,
             }),
         }
     }
@@ -1043,6 +1047,7 @@ impl SetupStatusReporter {
             state.hardware_blocked = false;
             state.current_step = None;
             state.last_progress = None;
+            state.organization_name = None;
             state.status = SetupStatus::claim(origin_host(manage_origin), claim);
         });
     }
@@ -1064,6 +1069,17 @@ impl SetupStatusReporter {
             .unwrap_or(true)
     }
 
+    /// The organization that claimed this server, by name (generic ISO).
+    /// Display text only; the setup screens show it from here on.
+    pub(super) fn claimed_by(&self, organization_name: Option<&str>) {
+        let name = organization_name
+            .map(|name| bounded(name, MAX_VALUE_CHARS))
+            .filter(|name| !name.is_empty());
+        self.update(Milestone::Started, |state| {
+            state.organization_name = name;
+        });
+    }
+
     pub(super) fn media_verified(&self, manage_origin: &str) {
         self.update(Milestone::MediaVerified, |state| {
             if state.status.state == SetupState::Claim {
@@ -1072,6 +1088,10 @@ impl SetupStatusReporter {
             }
             state.phase = Phase::Inventory;
             state.status.tiaris_host = origin_host(manage_origin);
+            // The approval screen says who will approve this server.
+            if let Some(name) = &state.organization_name {
+                state.status.organization = Some(name.clone());
+            }
         });
     }
 
@@ -1123,7 +1143,7 @@ impl SetupStatusReporter {
         self.update(Milestone::PlanAccepted, |state| {
             state.phase = Phase::Preparing;
             state.hardware_blocked = false;
-            apply_plan(&mut state.status, plan, inventory);
+            apply_plan(state, plan, inventory);
             state.status.state = SetupState::Installing;
             state.status.approved_at = Some(timestamp(Utc::now()));
             state.status.stop = None;
@@ -1137,7 +1157,7 @@ impl SetupStatusReporter {
             state.phase = Phase::Preparing;
             state.disk_may_be_changed = true;
             state.hardware_blocked = false;
-            apply_plan(&mut state.status, plan, inventory);
+            apply_plan(state, plan, inventory);
             state.status.state = SetupState::Installing;
             state.status.approved_at = Some(timestamp(Utc::now()));
             state.status.stop = None;
@@ -1259,15 +1279,21 @@ fn set_step(state: &mut ReporterState, step: InstallStep) {
 }
 
 fn apply_plan(
-    status: &mut SetupStatus,
+    state: &mut ReporterState,
     plan: &SignedInstallPlan,
     inventory: &NestProvisioningInventory,
 ) {
-    status.organization = plan
-        .organization_slug
-        .as_deref()
-        .map(|slug| bounded(slug, MAX_VALUE_CHARS))
-        .filter(|slug| !slug.is_empty());
+    let status = &mut state.status;
+    // The signed plan carries only the slug: older Nests refuse a plan with
+    // any field they do not know, so Manage cannot add the name there. The
+    // name comes from this boot's claim; the slug stays the fallback (a
+    // personalized ISO, or a generic one resumed after a power cut).
+    status.organization = state.organization_name.clone().or_else(|| {
+        plan.organization_slug
+            .as_deref()
+            .map(|slug| bounded(slug, MAX_VALUE_CHARS))
+            .filter(|slug| !slug.is_empty())
+    });
     let name = bounded(&plan.display_name, MAX_VALUE_CHARS);
     status.name = (!name.is_empty()).then_some(name);
     status.disk = Some(disk_summary(&plan.target_disk));
