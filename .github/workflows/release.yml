@@ -578,10 +578,21 @@ jobs:
           [[ "$artifact_id" =~ ^[1-9][0-9]*$ ]]
           [[ "$action_digest" =~ ^[0-9a-f]{64}$ ]]
           metadata="$RUNNER_TEMP/tiaris-nest-candidate-artifact.json"
-          gh api \
-            -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2026-03-10' \
-            "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id" > "$metadata"
+          # GitHub's API can answer 404 for a second or two after the upload
+          # (run 44291577015): wait for it, then check it exactly as before.
+          for attempt in $(seq 1 12); do
+            if gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id" > "$metadata"; then
+              break
+            fi
+            if [ "$attempt" -eq 12 ]; then
+              echo "::error::GitHub did not return artifact $artifact_id within a minute"
+              exit 1
+            fi
+            sleep 5
+          done
           test "$(jq -r '.name' "$metadata")" = "$TIARIS_NEST_RELEASE_ARTIFACT"
           test "$(jq -r '.expired' "$metadata")" = "false"
           test "$(jq -r '.workflow_run.id' "$metadata")" = "$GITHUB_RUN_ID"
