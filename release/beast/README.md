@@ -26,6 +26,13 @@ runner credentials, signing key or private source key. A small allowlist passes
 public build inputs. Signing happens after the container exits, with the existing
 protected environment key and signature/compatibility checks.
 
+Inside the container Nix builds at most 4 derivations at once with 4 cores each
+(the Dockerfile's `nix.conf`), and the outer Cargo build uses 8 jobs. The release
+workflow runs three parts side by side: the workstation runtime, the Nest system
+closure and the setup media. They are separate `nix-build` processes on the one
+single-user store, whose locks build the Tiaris agent and kiosk they share once;
+the container's 12-CPU limit holds them all.
+
 Before compilation, `preflight.sh` checks the native packaging tools and performs
 a compressed cpio archive round trip inside the pinned Nix release-tools shell.
 That shell explicitly supplies cpio, jq and Python instead of depending on

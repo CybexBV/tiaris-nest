@@ -411,6 +411,9 @@ jobs:
           reserve_ci_host_capacity "Nest build $GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" 48 12
           python3 tools/beast-build.py <<'BUILD'
           set -euo pipefail
+          # The build parts below run side by side; their clean-checkout checks
+          # must only read the source, never refresh a checkout's Git index.
+          export GIT_OPTIONAL_LOCKS=0
           version="$BUILD_VERSION"
           TIARIS_NEST_BUILD_MANAGE_ORIGIN="$TIARIS_NEST_BUILD_MANAGE_ORIGIN" \
             cargo build --release --locked --bin tiaris-nest --bin tiaris-nest-bootstrap
@@ -421,34 +424,6 @@ jobs:
           install -m 0755 target/release/tiaris-nest-bootstrap "$RUNNER_TEMP/tiaris-nest-bootstrap"
           test "$("$RUNNER_TEMP/tiaris-nest-bootstrap" required-manage-origin)" = \
             "$TIARIS_NEST_BUILD_MANAGE_ORIGIN"
-          # A reused runtime is already in dist/ with its published bytes.
-          if [ "$BUILD_REUSE_RUNTIME" = true ]; then
-            test -f "dist/$BUILD_BUNDLE"
-          else
-          nix-build release/workstation-netboot.nix \
-            --arg manageRepo ./manage-source \
-            --arg sourceDateEpoch "$source_epoch" \
-            --out-link result-workstation-netboot
-          staging="$RUNNER_TEMP/tiaris-workstation-netboot-tree"
-          install -d -m 0755 "$staging"
-          for component in manifest.json bzImage initrd nix-store.squashfs; do
-            install -m 0644 "result-workstation-netboot/$component" "$staging/$component"
-            touch --date="@$source_epoch" "$staging/$component"
-          done
-          nix-shell release/release-tools.nix --run \
-            "bash manage-source/deploy/nixos/check-installer-netboot-release.sh --inspect-only --bundle-tree '$staging'"
-          bundle="dist/$BUILD_BUNDLE"
-          # The squashfs inside is already zstd: a higher level saves under 1% and costs minutes.
-          nix-shell release/release-tools.nix --run \
-            "tar --format=ustar --sort=name --numeric-owner --owner=0 --group=0 --mode=u=rw,go=r --mtime=@$source_epoch -C '$staging' -cf - bzImage initrd manifest.json nix-store.squashfs | zstd -3 --threads=1 --no-progress --no-dictID -o '$bundle'"
-          python3 tools/nest-release.py inspect-workstation-netboot \
-            --workstation-netboot-bundle "$bundle" \
-            --workstation-netboot-tree "$staging" \
-            --workstation-netboot-url "https://github.invalid/$GITHUB_REF_NAME/$BUILD_BUNDLE" \
-            --workstation-netboot-runtime-version "$BUILD_RUNTIME" \
-            --workstation-netboot-manage-revision "$BUILD_MANAGE_REVISION" \
-            --workstation-netboot-nixpkgs-revision "$BUILD_NIXPKGS_REVISION"
-          fi
           mapfile -t provisioning_keys < <(printf '%s\n' "$TIARIS_NEST_PROVISIONING_PUBLIC_KEYS" | sed '/^[[:space:]]*$/d')
           template_args=()
           for key in "${provisioning_keys[@]}"; do
@@ -463,17 +438,71 @@ jobs:
             --release-public-key "$TIARIS_NEST_UPDATE_TRUSTED_PUBLIC_KEY"
             "${template_args[@]}"
           )
+          build_workstation_runtime() {
+            nix-build release/workstation-netboot.nix \
+              --arg manageRepo ./manage-source \
+              --arg sourceDateEpoch "$source_epoch" \
+              --out-link result-workstation-netboot
+            local staging="$RUNNER_TEMP/tiaris-workstation-netboot-tree" bundle="dist/$BUILD_BUNDLE" component
+            install -d -m 0755 "$staging"
+            for component in manifest.json bzImage initrd nix-store.squashfs; do
+              install -m 0644 "result-workstation-netboot/$component" "$staging/$component"
+              touch --date="@$source_epoch" "$staging/$component"
+            done
+            nix-shell release/release-tools.nix --run \
+              "bash manage-source/deploy/nixos/check-installer-netboot-release.sh --inspect-only --bundle-tree '$staging'"
+            # The squashfs inside is already zstd: a higher level saves under 1% and costs minutes.
+            nix-shell release/release-tools.nix --run \
+              "tar --format=ustar --sort=name --numeric-owner --owner=0 --group=0 --mode=u=rw,go=r --mtime=@$source_epoch -C '$staging' -cf - bzImage initrd manifest.json nix-store.squashfs | zstd -3 --threads=1 --no-progress --no-dictID -o '$bundle'"
+            python3 tools/nest-release.py inspect-workstation-netboot \
+              --workstation-netboot-bundle "$bundle" \
+              --workstation-netboot-tree "$staging" \
+              --workstation-netboot-url "https://github.invalid/$GITHUB_REF_NAME/$BUILD_BUNDLE" \
+              --workstation-netboot-runtime-version "$BUILD_RUNTIME" \
+              --workstation-netboot-manage-revision "$BUILD_MANAGE_REVISION" \
+              --workstation-netboot-nixpkgs-revision "$BUILD_NIXPKGS_REVISION"
+          }
           # The build sandbox receives public inputs only. NARInfos are signed
           # outside Nix and the container after these exact bytes are returned.
-          nixos-appliance/build-closure.sh \
-            --unsigned-output-dir "$RUNNER_TEMP/tiaris-nest-unsigned-closure" \
-            "${build_args[@]}"
-          nixos-appliance/build-template.sh \
-            --output-dir "$RUNNER_TEMP/tiaris-nest-template" \
-            "${build_args[@]}"
-          mv "$RUNNER_TEMP/tiaris-nest-template/tiaris-nest-appliance-template-$version-x86_64-linux.iso" dist/
-          mv "$RUNNER_TEMP/tiaris-nest-template/tiaris-nest-appliance-template-$version-x86_64-linux.json" \
-            "$RUNNER_TEMP/tiaris-nest-appliance-template-metadata.json"
+          build_system_closure() {
+            nixos-appliance/build-closure.sh \
+              --unsigned-output-dir "$RUNNER_TEMP/tiaris-nest-unsigned-closure" \
+              "${build_args[@]}"
+          }
+          build_setup_media() {
+            nixos-appliance/build-template.sh \
+              --output-dir "$RUNNER_TEMP/tiaris-nest-template" \
+              "${build_args[@]}"
+            mv "$RUNNER_TEMP/tiaris-nest-template/tiaris-nest-appliance-template-$version-x86_64-linux.iso" dist/
+            mv "$RUNNER_TEMP/tiaris-nest-template/tiaris-nest-appliance-template-$version-x86_64-linux.json" \
+              "$RUNNER_TEMP/tiaris-nest-appliance-template-metadata.json"
+          }
+          # The workstation runtime, the Nest system closure and the setup media
+          # share only the pinned Tiaris agent and kiosk, which Nix's store locks
+          # build once. Build them side by side; every part must succeed.
+          parts=()
+          part_pids=()
+          beside() {
+            local part="$1"
+            shift
+            ( "$@" 2>&1 | sed -u "s/^/[$part] /" ) &
+            parts+=("$part")
+            part_pids+=("$!")
+          }
+          # A reused runtime is already in dist/ with its published bytes.
+          if [ "$BUILD_REUSE_RUNTIME" = true ]; then
+            test -f "dist/$BUILD_BUNDLE"
+          else
+            beside "workstation runtime" build_workstation_runtime
+          fi
+          beside "Nest system" build_system_closure
+          beside "setup media" build_setup_media
+          for index in "${!part_pids[@]}"; do
+            if ! wait "${part_pids[$index]}"; then
+              echo "Release build part failed: ${parts[$index]}" >&2
+              exit 1
+            fi
+          done
           test "$(dist/tiaris-nest-x86_64-linux --version)" = "tiaris-nest $version"
           BUILD
 
