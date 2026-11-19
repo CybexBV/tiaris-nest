@@ -137,6 +137,19 @@ WORKSTATION_NETBOOT_COMPONENTS = (
     "initrd",
     "nix-store.squashfs",
 )
+# The USB installer stick: a release asset beside the template ISO, named in
+# the manifest by its own signed descriptor (docs: RELEASES.md).
+USB_INSTALLER_IMAGE_KEY = "usb_installer_image_v1"
+USB_INSTALLER_IMAGE_SIGNATURE_DOMAIN = "TIARIS-NEST-USB-INSTALLER-IMAGE-V1"
+USB_INSTALLER_IMAGE_FIELDS = frozenset(
+    {"version", "url", "size_bytes", "sha256", "manage_source_revision", "signature"}
+)
+USB_INSTALLER_IMAGE_BUILD_SCHEMA = "tiaris.usb-installer.image.v1"
+USB_INSTALLER_IMAGE_BUILD_NAME = "tiaris-usb-installer.img"
+# Every published release file stays under GitHub's 2 GiB asset limit.
+USB_INSTALLER_IMAGE_MAX_BYTES = 2 * 1024 * 1024 * 1024 - 1
+# The Nest refuses sticks older than this (`410 usb_installer_outdated`).
+USB_INSTALLER_NEST_SOURCE = Path(__file__).resolve().parents[1] / "src" / "usb_installer.rs"
 ED25519_PUBLIC_DER_PREFIX = bytes.fromhex("302a300506032b6570032100")
 SEMVER_RE = re.compile(
     r"^(0|[1-9][0-9]*)\."
@@ -2193,6 +2206,127 @@ def _verify_workstation_netboot_ustar(bundle: Path) -> None:
         _fail("workstation netboot archive decompression failed")
 
 
+def _usb_installer_image_name(version: str) -> str:
+    return f"tiaris-usb-installer-{version}.img"
+
+
+def _usb_installer_image_message(descriptor: dict[str, Any]) -> bytes:
+    return (
+        f"{USB_INSTALLER_IMAGE_SIGNATURE_DOMAIN}\n"
+        f"{descriptor['version']}\n"
+        f"{descriptor['manage_source_revision']}\n"
+        f"{descriptor['size_bytes']}\n"
+        f"{descriptor['sha256']}\n"
+        f"{descriptor['url']}\n"
+    ).encode("utf-8")
+
+
+def _validate_usb_installer_image(
+    value: object, version: str, manage_source_revision: object
+) -> tuple[dict[str, Any], bytes]:
+    """The stick descriptor of a manifest: its unsigned fields and its signature."""
+    descriptor = dict(
+        _require_exact_object_keys(
+            value, set(USB_INSTALLER_IMAGE_FIELDS), "USB installer image descriptor"
+        )
+    )
+    signature = _canonical_base64(
+        descriptor.pop("signature"), "USB installer image signature", expected_bytes=64
+    )
+    if descriptor["version"] != version:
+        _fail("USB installer image belongs to another Nest release")
+    if not isinstance(descriptor["url"], str):
+        _fail("usb-installer-image-url must be a string")
+    url = _validate_url(descriptor["url"], "usb-installer-image-url")
+    if urlsplit(url).path.rsplit("/", 1)[-1] != _usb_installer_image_name(version):
+        _fail("usb-installer-image-url filename does not bind the USB installer image")
+    _require_positive_int(
+        descriptor["size_bytes"],
+        "USB installer image size",
+        maximum=USB_INSTALLER_IMAGE_MAX_BYTES,
+    )
+    _require_sha256(descriptor["sha256"], "USB installer image SHA-256")
+    _validate_revision(
+        descriptor["manage_source_revision"], "USB installer image Tiaris revision"
+    )
+    if descriptor["manage_source_revision"] != manage_source_revision:
+        _fail("USB installer image was not built from the release's pinned Tiaris revision")
+    return descriptor, signature
+
+
+def _minimum_stick_protocol(path: Path = USB_INSTALLER_NEST_SOURCE) -> int:
+    try:
+        source = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        _fail("the Nest's minimum USB installer protocol is unreadable")
+    matches = re.findall(
+        r"^pub const MINIMUM_STICK_PROTOCOL: u32 = ([1-9][0-9]{0,5});$", source, re.MULTILINE
+    )
+    if len(matches) != 1:
+        _fail("the Nest's minimum USB installer protocol is unreadable")
+    return int(matches[0])
+
+
+def _usb_installer_image_inputs(
+    arguments: argparse.Namespace, version: str
+) -> tuple[dict[str, Any], list[tuple[Path, str]]] | None:
+    """The unsigned stick descriptor of the image, checked against its build record."""
+    values = (
+        getattr(arguments, "usb_installer_image", None),
+        getattr(arguments, "usb_installer_image_url", None),
+        getattr(arguments, "usb_installer_image_record", None),
+    )
+    if not any(values):
+        return None
+    if not all(values):
+        _fail(
+            "usb-installer-image, usb-installer-image-url and "
+            "usb-installer-image-record must be supplied together"
+        )
+    image, record_path = Path(values[0]), Path(values[2])
+    if image.name != _usb_installer_image_name(version):
+        _fail(f"USB installer image must be named {_usb_installer_image_name(version)}")
+    url = _validate_url(values[1], "usb-installer-image-url")
+    if urlsplit(url).path.rsplit("/", 1)[-1] != image.name:
+        _fail("usb-installer-image-url filename does not bind the USB installer image")
+    sha256, size = _inspect_artifact(
+        image, "USB installer image", maximum_bytes=USB_INSTALLER_IMAGE_MAX_BYTES
+    )
+    record, _ = _load_bounded_json(
+        record_path, "USB installer image build record", maximum_bytes=64 * 1024
+    )
+    if (
+        record.get("schema") != USB_INSTALLER_IMAGE_BUILD_SCHEMA
+        or record.get("image") != USB_INSTALLER_IMAGE_BUILD_NAME
+        or record.get("size_bytes") != size
+        or record.get("sha256") != sha256
+    ):
+        _fail("USB installer image differs from its build record")
+    revision = _validate_revision(
+        record.get("source_revision"), "USB installer image Tiaris revision"
+    )
+    # A release never ships a stick that its own Nest would turn away.
+    protocol, minimum = record.get("protocol"), _minimum_stick_protocol()
+    if not isinstance(protocol, int) or isinstance(protocol, bool) or protocol < minimum:
+        _fail(
+            f"USB installer image speaks stick protocol {protocol}, but this Nest "
+            f"accepts {minimum} or newer: pin a Tiaris revision with a current stick"
+        )
+    return (
+        {
+            "version": version,
+            "url": url,
+            "size_bytes": size,
+            "sha256": sha256,
+            "manage_source_revision": revision,
+        },
+        [
+            (image, "USB installer image"),
+            (record_path, "USB installer image build record"),
+        ],
+    )
+
+
 def _manifest_command(arguments: argparse.Namespace) -> None:
     artifact = Path(arguments.artifact)
     private_key = Path(arguments.private_key)
@@ -2251,6 +2385,18 @@ def _manifest_command(arguments: argparse.Namespace) -> None:
             workstation_netboot_inputs
         )
         protected_inputs.extend(workstation_protected)
+    usb_installer_image: dict[str, Any] | None = None
+    usb_installer_image_inputs = _usb_installer_image_inputs(arguments, version)
+    if usb_installer_image_inputs is not None:
+        usb_installer_image, usb_installer_protected = usb_installer_image_inputs
+        protected_inputs.extend(usb_installer_protected)
+        if (
+            appliance_release is None
+            or appliance_release.get("schema") != appliance_v3.SCHEMA
+            or usb_installer_image["manage_source_revision"]
+            != appliance_release["manage_source_revision"]
+        ):
+            _fail("USB installer image was not built from the release's pinned Tiaris revision")
     if installer_iso_template is not None and installer_iso_template.get("package_delivery") == appliance_v3.DELIVERY:
         if appliance_release is None or appliance_release.get("schema") != appliance_v3.SCHEMA or workstation_netboot is None:
             _fail("NixOS releases require matching signed system closure and workstation runtime")
@@ -2304,6 +2450,13 @@ def _manifest_command(arguments: argparse.Namespace) -> None:
                 and workstation_netboot_signature != reused_workstation_signature
             ):
                 _fail("the reused workstation runtime was not signed by this release key")
+        usb_installer_image_signature = None
+        if usb_installer_image is not None:
+            usb_installer_image_signature = _sign(
+                private_fd,
+                _usb_installer_image_message(usb_installer_image),
+            )
+            _require_stable_private_key(private_fd, private_identity)
     finally:
         os.close(private_fd)
     _self_verify(public_der, signature, message)
@@ -2324,6 +2477,12 @@ def _manifest_command(arguments: argparse.Namespace) -> None:
             public_der,
             workstation_netboot_signature,
             _workstation_netboot_message(workstation_netboot),
+        )
+    if usb_installer_image is not None and usb_installer_image_signature is not None:
+        _self_verify(
+            public_der,
+            usb_installer_image_signature,
+            _usb_installer_image_message(usb_installer_image),
         )
 
     manifest = {
@@ -2352,6 +2511,11 @@ def _manifest_command(arguments: argparse.Namespace) -> None:
             workstation_netboot_signature
         ).decode("ascii")
         manifest["workstation_netboot"] = workstation_netboot
+    if usb_installer_image is not None and usb_installer_image_signature is not None:
+        usb_installer_image["signature"] = base64.b64encode(
+            usb_installer_image_signature
+        ).decode("ascii")
+        manifest[USB_INSTALLER_IMAGE_KEY] = usb_installer_image
     body = (json.dumps(manifest, indent=2, ensure_ascii=True) + "\n").encode("utf-8")
     _atomic_write(output, body)
     print(f"wrote signed Nest release manifest: {output}")
@@ -2721,6 +2885,8 @@ def _release_manifest_artifact_identities(
         template_key,
     }
     optional_fields = {"appliance_release_v1", "workstation_netboot"}
+    if nixos:
+        optional_fields.add(USB_INSTALLER_IMAGE_KEY)
     if not required_fields <= set(value) or not set(value) <= (
         required_fields | optional_fields
     ):
@@ -3083,6 +3249,15 @@ def _release_manifest_artifact_identities(
         for field in ("nixpkgs_revision", "manage_source_revision"):
             if appliance[field] != workstation_identity[field]:
                 _fail("NixOS appliance and workstation runtime source pins disagree")
+        # The stick is signed in the manifest, which the compatibility asset
+        # binds by SHA-256; the asset's own artifact set stays as it was.
+        if USB_INSTALLER_IMAGE_KEY in value:
+            stick, stick_signature = _validate_usb_installer_image(
+                value[USB_INSTALLER_IMAGE_KEY], version, appliance["manage_source_revision"]
+            )
+            signed_messages.append(
+                (stick_signature, _usb_installer_image_message(stick))
+            )
     identities: dict[str, object] = {
         "nest_binary": {"url": artifact_url, "sha256": artifact_sha256},
         "appliance_iso_template": {
@@ -3782,6 +3957,25 @@ def _verify_reused_workstation_netboot(
             _fail("the reused workstation runtime bundle differs from its signed descriptor")
 
 
+def _verify_usb_installer_image_bytes(manifest, version, path):
+    """The image file is required exactly when the (already validated) manifest names a stick."""
+    stick = manifest.get(USB_INSTALLER_IMAGE_KEY)
+    if (stick is None) != (path is None):
+        _fail(
+            "NixOS verification requires the USB installer image exactly when "
+            "the release manifest names one"
+        )
+    if stick is None:
+        return
+    if Path(path).name != _usb_installer_image_name(version):
+        _fail("USB installer image filename differs from its signed release")
+    sha256, size = _inspect_artifact(
+        Path(path), "USB installer image", maximum_bytes=USB_INSTALLER_IMAGE_MAX_BYTES
+    )
+    if sha256 != stick["sha256"] or size != stick["size_bytes"]:
+        _fail("USB installer image bytes differ from their signed descriptor")
+
+
 def _verify_nixos_command(arguments, manifest):
     version, _identities, messages = _release_manifest_artifact_identities(manifest)
     public_der = ED25519_PUBLIC_DER_PREFIX + _trusted_public_key(arguments.trusted_public_key)
@@ -3844,6 +4038,9 @@ def _verify_nixos_command(arguments, manifest):
         inspected_workstation, _ = _inspect_workstation_netboot(_workstation_netboot_inputs(workstation_args))
         if inspected_workstation != {key: value for key, value in workstation.items() if key != "signature"}:
             _fail("workstation artifact bytes differ from their signed descriptor")
+    _verify_usb_installer_image_bytes(
+        manifest, version, getattr(arguments, "usb_installer_image", None)
+    )
     if arguments.appliance_package_snapshot_metadata:
         build_args = argparse.Namespace(
             workstation_netboot_bundle=arguments.workstation_netboot_bundle,
@@ -4362,6 +4559,18 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     manifest.add_argument(
+        "--usb-installer-image",
+        help="exact USB installer stick image, named tiaris-usb-installer-VERSION.img",
+    )
+    manifest.add_argument(
+        "--usb-installer-image-url",
+        help="immutable public URL of the USB installer stick image",
+    )
+    manifest.add_argument(
+        "--usb-installer-image-record",
+        help="the stick's build record (tiaris-usb-installer.json) written beside the template ISO",
+    )
+    manifest.add_argument(
         "--published-at",
         required=True,
         help="fixed UTC RFC3339 timestamp with second precision",
@@ -4597,6 +4806,10 @@ def _parser() -> argparse.ArgumentParser:
             "NixOS releases: the signed manifest whose runtime descriptor this "
             "release reuses; replaces --workstation-netboot-tree"
         ),
+    )
+    verify.add_argument(
+        "--usb-installer-image",
+        help="NixOS releases: the exact USB installer stick image the manifest names",
     )
     verify.add_argument(
         "--trusted-public-key",
