@@ -1892,11 +1892,9 @@ async fn local_health(readiness: crate::readiness::ApplianceReadiness) -> Value 
         } else {
             "degraded"
         };
-    let state_storage = crate::disk::stats(Path::new(crate::state_backup::STATE_DIR)).ok();
+    let state_storage = crate::disk::stats(Path::new(STATE_DIR)).ok();
     let sync = crate::manage::sync_health();
-    let mut attention = health_attention(state_storage.as_ref(), &sync);
-    let backup = crate::state_backup::upload::health(Path::new(crate::state_backup::STATE_DIR));
-    attention.extend(backup.attention);
+    let attention = health_attention(state_storage.as_ref(), &sync);
     json!({
         "status":status,"checks":checks,"pxe_discovery":pxe,"resources":crate::resources::latest(),
         // Facts Manage alerts on; none of them changes `status` (which gates
@@ -1905,13 +1903,12 @@ async fn local_health(readiness: crate::readiness::ApplianceReadiness) -> Value 
         "storage":{"state":state_storage},
         "sync":sync,
         "database":crate::schema_evolution::status(),
-        "state_backup":crate::state_backup::last_receipt(Path::new(crate::state_backup::STATE_DIR)),
-        // Automatic backups: key, kept copies and the upload to Manage.
-        "state_backup_upload":backup.fact,
         "attention":attention,
     })
 }
 
+/// The STATE partition of an installed Nest.
+const STATE_DIR: &str = "/var/lib/tiaris-nest/state";
 /// STATE (16 GiB: database, identity, receipts) below this is attention.
 const STATE_STORAGE_LOW_BYTES: u64 = 512 * 1024 * 1024;
 /// Failed sync cycles (about 30 s apart, then backing off) before attention.
@@ -2019,7 +2016,7 @@ mod tests {
     fn local_health_names_a_full_state_disk_and_failing_sync_without_changing_status() {
         let gib = 1024 * 1024 * 1024;
         let disk = |available: u64| crate::disk::DiskStats {
-            path: crate::state_backup::STATE_DIR.into(),
+            path: STATE_DIR.into(),
             total_bytes: 16 * gib,
             available_bytes: available,
         };

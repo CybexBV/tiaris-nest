@@ -1,0 +1,30 @@
+{
+  "schema": "tiaris.hardware-identity-placeholders.v1",
+  "system_uuids": [
+    "03000200-0400-0500-0006-000700080009",
+    "00020003-0004-0005-0006-000700080009",
+    "12345678-1234-5678-90ab-cddeefaabbcc"
+  ],
+  "serial_numbers": [
+    "default string",
+    "default",
+    "to be filled by o.e.m.",
+    "oem",
+    "system serial number",
+    "chassis serial number",
+    "base board serial number",
+    "serial number",
+    "not specified",
+    "not applicable",
+    "not available",
+    "n/a",
+    "na",
+    "none",
+    "unknown",
+    "invalid",
+    "0123456789",
+    "1234567890",
+    "123456789",
+    "12345678"
+  ]
+}

@@ -34,6 +34,7 @@ use crate::{
 };
 
 mod counterpart;
+mod failure;
 mod profile;
 mod scan_rebuild;
 
@@ -1002,25 +1003,34 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
         }
         ProcessOutcome::Failed(exit_code) => {
             let oom_killed = oom_kills_after > oom_kills_before;
-            let (error_kind, error) = classify_nix_build_failure(&logs, oom_killed);
+            let failure = failure::classify_nix_build_failure(&logs, oom_killed);
+            let mut metadata = admitted_result_metadata(
+                &state.config,
+                &job,
+                &target,
+                admitted_commit.as_deref(),
+                detected.as_ref().map(|ready| ready.nar_hash.as_str()),
+                Some(failure.kind),
+            );
+            if let (Some(map), false) =
+                (metadata.as_object_mut(), failure.failed_packages.is_empty())
+            {
+                map.insert(
+                    failure::FAILED_PACKAGES_KEY.to_string(),
+                    json!(failure.failed_packages),
+                );
+            }
             db::finish_build_job(
                 &state.db,
                 job.id,
                 "failed",
                 &logs,
-                &error,
+                &failure.message,
                 "",
                 "",
                 0,
                 Some(exit_code.into()),
-                Some(admitted_result_metadata(
-                    &state.config,
-                    &job,
-                    &target,
-                    admitted_commit.as_deref(),
-                    detected.as_ref().map(|ready| ready.nar_hash.as_str()),
-                    Some(error_kind),
-                )),
+                Some(metadata),
             )
             .await?;
         }
@@ -2171,58 +2181,6 @@ fn parse_memory_event(raw: &str, event: &str) -> Option<u64> {
             .then(|| fields.next()?.parse::<u64>().ok())
             .flatten()
     })
-}
-
-fn classify_nix_build_failure(logs: &str, oom_killed: bool) -> (&'static str, String) {
-    let lower = logs.to_ascii_lowercase();
-    if lower.contains("daemon-socket")
-        || lower.contains("cannot connect to socket")
-        || lower.contains("error connecting to the nix daemon")
-    {
-        return (
-            "nix_daemon_unavailable",
-            "The Nix daemon is unavailable; restore nix-daemon.socket and retry".to_string(),
-        );
-    }
-    if oom_killed || lower.contains("out of memory") || lower.contains("oom-kill") {
-        return (
-            "out_of_memory",
-            "Nest exhausted its build memory; increase memory/swap or reduce max_build_cores"
-                .to_string(),
-        );
-    }
-    if lower.contains("no space left on device") || lower.contains("disk full") {
-        return (
-            "insufficient_disk_space",
-            "Nest ran out of disk space while building the Nix closure".to_string(),
-        );
-    }
-    if lower.contains("unable to start any build") {
-        let candidates: Vec<String> =
-            extract_would_build_derivations(logs, SOURCE_BUILD_CANDIDATE_CAP)
-                .paths
-                .iter()
-                .map(|path| derivation_display_name(path))
-                .collect();
-        return (
-            "source_build_blocked",
-            source_build_blocked_message(&candidates),
-        );
-    }
-    if lower.contains("builder for '")
-        || lower.contains("failed to build")
-        || lower.contains("dependencies of derivation")
-    {
-        return (
-            "package_build_failed",
-            "A package in the pinned nixpkgs revision failed to build; inspect the bounded build log"
-                .to_string(),
-        );
-    }
-    (
-        "nix_build_failed",
-        "Nix failed to build the requested closure; inspect the bounded build log".to_string(),
-    )
 }
 
 const SOURCE_BUILD_CANDIDATE_CAP: usize = 50;
@@ -6177,6 +6135,9 @@ fn build_result_metadata(
             metadata.insert("nixpkgs_revision".to_string(), json!(revision));
         }
     }
+    // A retry may carry its predecessor's metadata: only this result's
+    // failure names what failed.
+    metadata.remove(failure::FAILED_PACKAGES_KEY);
     if let Some(error_kind) = error_kind {
         metadata.insert("error_kind".to_string(), json!(error_kind));
     } else {
@@ -11819,24 +11780,29 @@ esac
             Some(2)
         );
         assert_eq!(
-            classify_nix_build_failure("compiler killed", true).0,
+            failure::classify_nix_build_failure("compiler killed", true).kind,
             "out_of_memory"
         );
         assert_eq!(
-            classify_nix_build_failure("error: builder for '/nix/store/example.drv' failed", false)
-                .0,
+            failure::classify_nix_build_failure(
+                "error: builder for '/nix/store/example.drv' failed",
+                false
+            )
+            .kind,
             "package_build_failed"
         );
         assert_eq!(
-            classify_nix_build_failure("No space left on device", false).0,
+            failure::classify_nix_build_failure("No space left on device", false).kind,
             "insufficient_disk_space"
         );
         assert_eq!(
-            classify_nix_build_failure("cannot connect to socket at daemon-socket", false).0,
+            failure::classify_nix_build_failure("cannot connect to socket at daemon-socket", false)
+                .kind,
             "nix_daemon_unavailable"
         );
         let blocked_log = "these 2 derivations will be built:\n  /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-firefox-140.0.drv\n  /nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-vlc-3.0.21.drv\nerror: unable to start any build; either increase '--max-jobs' or enable remote builds";
-        let (kind, message) = classify_nix_build_failure(blocked_log, false);
+        let failure::NixBuildFailure { kind, message, .. } =
+            failure::classify_nix_build_failure(blocked_log, false);
         assert_eq!(kind, "source_build_blocked");
         assert!(message.contains("firefox-140.0"));
         assert!(message.contains("Allow building from source"));

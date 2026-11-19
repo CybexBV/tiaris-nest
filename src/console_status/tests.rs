@@ -314,31 +314,32 @@ fn pxe_statuses_outside_the_contract_are_omitted() {
 }
 
 #[tokio::test]
-async fn active_installs_count_distinct_unexpired_boot_grants() {
+async fn active_installs_count_distinct_computers_that_started_in_the_last_ten_minutes() {
     let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
     sqlx::query(
-        "CREATE TABLE nest_boot_sessions (session_id TEXT PRIMARY KEY, normalized_mac TEXT NOT NULL, expires_at INTEGER NOT NULL)",
+        "CREATE TABLE nest_boot_sessions (session_id TEXT PRIMARY KEY, normalized_mac TEXT NOT NULL, issued_at INTEGER NOT NULL)",
     )
     .execute(&pool)
     .await
     .unwrap();
-    for (session, mac, expires) in [
-        ("a", "02:00:00:00:00:01", 700),
-        ("b", "02:00:00:00:00:01", 800),
-        ("c", "02:00:00:00:00:02", 650),
-        ("d", "02:00:00:00:00:03", 500),
+    // The session of "d" still lives (a day), but it started an hour ago.
+    for (session, mac, issued) in [
+        ("a", "02:00:00:00:00:01", 4000),
+        ("b", "02:00:00:00:00:01", 4100),
+        ("c", "02:00:00:00:00:02", 3700),
+        ("d", "02:00:00:00:00:03", 600),
     ] {
         sqlx::query(
-            "INSERT INTO nest_boot_sessions (session_id, normalized_mac, expires_at) VALUES (?, ?, ?)",
+            "INSERT INTO nest_boot_sessions (session_id, normalized_mac, issued_at) VALUES (?, ?, ?)",
         )
         .bind(session)
         .bind(mac)
-        .bind(at(expires).timestamp())
+        .bind(at(issued).timestamp())
         .execute(&pool)
         .await
         .unwrap();
     }
-    assert_eq!(count_active_installs(&pool, at(600)).await.unwrap(), 2);
+    assert_eq!(count_active_installs(&pool, at(4200)).await.unwrap(), 2);
 }
 
 #[test]

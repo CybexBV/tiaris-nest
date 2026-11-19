@@ -8,11 +8,13 @@ const INBOX: &str = "/var/lib/tiaris-nest/state/inbox/update-schedule.json";
 const CONTROL: &str = "/var/lib/tiaris-nest/control/update-schedule.json";
 pub const CAPABILITY: &str = "appliance_update_schedule_v1";
 /// The Nest understands `tiaris.nest.update-schedule.v2`: install as soon as
-/// it is idle, or only inside the schedule.
+/// it is idle, and inside the schedule (the night) at the latest.
 pub const WHEN_IDLE_CAPABILITY: &str = "appliance_update_when_idle_v1";
 const SCHEMA_V1: &str = "tiaris.nest.update-schedule.v1";
 const SCHEMA_V2: &str = "tiaris.nest.update-schedule.v2";
-/// When an admitted update may install. Schema v1 has no mode: window only.
+/// The signed `mode` of a policy. Manage signs `when_idle` only; the Nest no
+/// longer acts on the value (it updates when idle, in the night at the
+/// latest), but still verifies policies signed earlier with `window`.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode {

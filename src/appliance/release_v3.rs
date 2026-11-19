@@ -10,14 +10,18 @@ use std::{collections::BTreeMap, path::Path};
 pub const SCHEMA: &str = "tiaris.nest.appliance-release.v3";
 pub const DOMAIN: &str = "TIARIS-NEST-APPLIANCE-RELEASE-V3";
 pub const MAX_ARCHIVE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-pub fn pinned_nixpkgs_revision() -> &'static str {
-    include_str!("../../release/nixpkgs.nix")
-        .split_once("revision = \"")
-        .and_then(|(_, tail)| tail.split_once('"'))
-        .map(|(revision, _)| revision)
-        .expect("shared Nix pin has a revision")
+
+/// A NixOS release name such as `26.05` or `26.11`. The Nest has no version
+/// of its own to compare with: a signed release names the NixOS it brings.
+pub fn nixos_version(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 5
+        && bytes[2] == b'.'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| index == 2 || byte.is_ascii_digit())
 }
-pub const NIXOS_VERSION: &str = "26.05";
 const NIX32: &[u8] = b"0123456789abcdfghijklmnpqrsvwxyz";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -75,8 +79,7 @@ impl NixosRelease {
     pub fn validate(&self) -> Result<()> {
         if self.schema != SCHEMA
             || self.base_os != "nixos"
-            || self.base_os_version != NIXOS_VERSION
-            || self.nixpkgs_revision != pinned_nixpkgs_revision()
+            || !nixos_version(&self.base_os_version)
             || self.minimum_protocol != 4
             || self.minimum_state_schema != 3
             || !self.rollback_compatible
@@ -88,6 +91,9 @@ impl NixosRelease {
             bail!("release ID is not canonical SemVer")
         }
         require_hex(&self.source_revision, 40)?;
+        // Any nixpkgs revision: an update may bring a newer NixOS than the
+        // one this Nest was built from.
+        require_hex(&self.nixpkgs_revision, 40)?;
         require_hex(&self.manage_source_revision, 40)?;
         require_hex(&self.sqlite_migrations_sha256, 64)?;
         require_hex(&self.system_closure.sha256, 64)?;

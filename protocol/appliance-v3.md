@@ -30,11 +30,16 @@ and informational firmware Secure Boot state. Update receipts bind the exact
 attempt, source/candidate generations and closure. Qualification additionally
 binds device incarnation and prior installed state.
 
-Schedules keep their signature domain. Schema `tiaris.nest.update-schedule.v1`
-means window only. A Nest that reports `appliance_update_when_idle_v1` also
-accepts `tiaris.nest.update-schedule.v2`, which adds a signed `mode`:
-`when_idle` (install once the Nest is idle) or `window`; v2 requires it and v1
-forbids it. A V3 `run_now` binding contains `attempt_id`, `release_id` and
+Schedules keep their signature domain. A Nest installs an update once it is
+idle, and inside the policy's schedule (every night, from Manage) at the latest.
+Schema `tiaris.nest.update-schedule.v2` carries a signed `mode`, which Manage
+always sets to `when_idle`; v2 requires the field and v1 forbids it. The Nest
+still verifies a policy signed earlier with `window`, but no longer acts on the
+value.
+
+A release names the NixOS it brings (`base_os_version`, `nixpkgs_revision`). A
+Nest accepts a signed release on any NixOS version and nixpkgs revision, not
+only the ones it was built from. A V3 `run_now` binding contains `attempt_id`, `release_id` and
 `system_closure_sha256`; it contains no legacy snapshot field. Signed network changes/acknowledgements retain their existing
 schemas. A protected committed network receipt preserves their exact signatures
 and hashes across reboot; only its derived runtime files may be repaired.

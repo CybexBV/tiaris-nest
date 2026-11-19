@@ -49,7 +49,7 @@ full code (`KX-4821-QM`) on its screen. An administrator claims it in the
 Console; Tiaris then hands over the session's signed envelope. The bootstrap
 verifies those bytes exactly as it verifies a filled slot and runs the existing flow: session claim, disk approval,
 installation. The envelope is kept in `/run` until STATE exists and on STATE
-(`.setup-claim-envelope.bin`, root 0600, left out of state backups) from then
+(`.setup-claim-envelope.bin`, root 0600) from then
 on, so resuming after a power cut never needs the ISO. Booted on a server
 that already holds an installed Nest (a completed installation with that
 envelope, or a STATE partition whose NixOS Nest has its systemd-boot UEFI
@@ -248,8 +248,9 @@ the tool tests and the `manifest` signing step refuse any other change to
 declared changes. Until then new state lives in files under the Nest state
 directory (`src/state_files.rs`): detected commits, scans and upload grants.
 
-Nest state and keys can be backed up encrypted and restored onto a
-replacement Nest: `docs/nest-state-backup.md`.
+A Nest's state is not backed up. A Nest that is installed again and claimed
+for the same organization gets its identity, configuration and trust in its
+new cache key from Manage, and rebuilds its cache.
 
 ## Off-site software uploads
 
@@ -395,17 +396,27 @@ November 2026); it answers the stick protocol:
   one default installer profile answers `404 profile_unavailable`. A running
   installer asks the same question to renew its boot grant.
   `GET /usb-installer/v1/runtime` names the active runtime without creating a
-  session. A stick older than `MINIMUM_STICK_PROTOCOL` gets `410`.
+  session. A stick older than `MINIMUM_STICK_PROTOCOL` (3: sticks that hold no
+  clock against a launch, whose session lasts a day) gets
+  `410 usb_installer_outdated`, and its screen says to download the USB
+  installer again.
+
+A boot session lives 24 hours (`BOOT_SESSION_SECONDS` in `src/netboot.rs`), and
+its grant, the computer's permission to enroll with Tiaris, names that same
+end: an installer may wait for hours on a slow link or for an administrator.
+Only this Nest's clock and Tiaris's judge the end, never the computer's own;
+the installer sets its clock from the `Date` of this Nest's answers.
 
 The stick starts the runtime with `kexec`; the grant, enrollment and approval
 are those of network boot, and its Wi-Fi password never reaches Nest.
 
-`build-template.sh` writes the stick image beside the template ISO, as
-`tiaris-usb-installer.img` and its build record `tiaris-usb-installer.json`
-(checked against each other), when the pinned Tiaris revision builds a stick.
-Tiaris publishes that copy as a public download (Tiaris `docs/downloads.md`).
-It is not a release asset, not part of the installed Nest, and nothing signed
-changes: the release manifest keeps its exact keys.
+Every Nest release carries the stick. `build-template.sh` writes the image
+beside the template ISO, as `tiaris-usb-installer.img` and its build record
+`tiaris-usb-installer.json` (checked against each other). The release
+publishes it as the asset `tiaris-usb-installer-VERSION.img` and names it in
+the signed manifest (`usb_installer_image_v1`, see `RELEASES.md`). Tiaris
+mirrors that asset to its public downloads (Tiaris `docs/downloads.md`). It is
+not part of the installed Nest.
 
 ## Retired rootfs multicast
 
@@ -498,16 +509,18 @@ keeps serving: root independently verifies the bounded archive and the live
 SQLite migration inventory, imports and roots its closure, checks it against the
 release and rehearses the database (status `waiting_window`, stage
 `preparing_ahead`). Nothing touches boot state yet. Signed policy then admits
-the switch: **Update now**, the Nest being idle (mode `when_idle`, the default
-from Manage), or the maintenance window (mode `window`, and every v1 policy).
-While it waits the stage is `nest_busy` or `maintenance_window`. At the switch
+the switch: **Update now**, the Nest being idle, or the night period the policy
+names (the deadline for a Nest that is never idle). There are no modes: a policy
+signed earlier with mode `window` is read the same way. While it waits the stage
+is `nest_busy`. At the switch
 root checks the closure again, seals the next generation and selects it for one
 boot. Holds, active builds, maintenance leases and network transactions defer
 it. The service polls requests every 30 seconds.
 
 Idle means nothing kept the Nest busy for 10 minutes: no request from a
 computer in flight or served (boot, netboot, installer, USB stick, cache; health
-probes do not count), no unexpired boot grant and no queued or running build.
+probes do not count), no computer that started the installer in the last ten
+minutes and no queued or running build.
 The daemon writes this to `/run/tiaris-nest/activity.json`
 every 20 seconds (`src/activity.rs`). A missing or stale report counts as busy
 until the Nest has been up for 30 minutes: then the daemon serves nothing.

@@ -59,8 +59,11 @@ pub const FAILURE_UNKNOWN: &str = "unknown";
 pub const ERROR_RUNTIME_REPORT_STORAGE_UNAVAILABLE: &str = "runtime_report_storage_unavailable";
 const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
 const FAILURE_MESSAGE_MAX_CHARS: usize = 512;
-const BOOT_GRANT_LIFETIME_SECONDS: i64 = 10 * 60;
-const BOOT_SESSION_RETENTION_SECONDS: i64 = 24 * 60 * 60;
+/// How long a boot session lives. Its grant (the computer's permission to
+/// enroll with Tiaris) names this same end and holds until then: an installer
+/// may wait for hours on a slow link or for an administrator. Only this
+/// Nest's clock and Tiaris's judge the end, never the computer's own.
+pub const BOOT_SESSION_SECONDS: i64 = 24 * 60 * 60;
 const BOOT_CONTEXT_MAX_BYTES: usize = 64 * 1024;
 const BUNDLE_RETENTION_SECONDS: i64 = 7 * 24 * 60 * 60;
 // Renew verified evidence with headroom before Tiaris's 24-hour freshness gate.
@@ -2098,8 +2101,9 @@ pub async fn create_boot_session_for_runtime(
         bail!("adopted Nest device identity is invalid");
     }
     let issued_at = Utc::now().timestamp();
-    let expires_at = issued_at + BOOT_GRANT_LIFETIME_SECONDS;
-    let cleanup_after = issued_at + BOOT_SESSION_RETENTION_SECONDS;
+    // The grant ends when its session does, and the session is removed then.
+    let expires_at = issued_at + BOOT_SESSION_SECONDS;
+    let cleanup_after = expires_at;
     let mut nonce_bytes = [0_u8; 32];
     let mut session_bytes = [0_u8; 16];
     OsRng.fill_bytes(&mut nonce_bytes);
@@ -4030,6 +4034,73 @@ mod tests {
         let report = report(&fixture.state).await.unwrap();
         assert_eq!(report.active_bundle_sha256, newer.sha256);
         assert_eq!(report.reconcile_generation, Some(2));
+        fixture.cleanup();
+    }
+
+    /// The grant holds for its boot session: the end the Nest signs is the
+    /// session's own, a day after it opened. An installer that waited an hour
+    /// for an administrator still finds its context; after the day both the
+    /// context and the session are gone.
+    #[tokio::test]
+    async fn a_boot_session_and_its_grant_last_a_day_not_ten_minutes() {
+        let fixture = RuntimeFilesystemFixture::new().await;
+        let descriptor = fixture.install_bundle("1.0.0", &"a".repeat(64)).await;
+        fixture.activate(&descriptor, None).await;
+        let launch = create_boot_session(&fixture.state, "02:00:00:00:00:01", None, None, None)
+            .await
+            .unwrap();
+        let (session_id, context_path, issued_at, expires_at, cleanup_after): (
+            String,
+            String,
+            i64,
+            i64,
+            i64,
+        ) = sqlx::query_as(
+            "SELECT session_id, context_path, issued_at, expires_at, cleanup_after
+             FROM nest_boot_sessions",
+        )
+        .fetch_one(&fixture.state.db)
+        .await
+        .unwrap();
+        assert_eq!(expires_at - issued_at, BOOT_SESSION_SECONDS);
+        assert_eq!(BOOT_SESSION_SECONDS, 24 * 60 * 60);
+        assert_eq!(cleanup_after, expires_at);
+        assert_eq!(launch.expires_at, expires_at);
+        let context: serde_json::Value =
+            serde_json::from_slice(&fs::read(&context_path).unwrap()).unwrap();
+        let claims = &context["nest_boot_grant"]["claims"];
+        assert_eq!(claims["issued_at"], issued_at);
+        assert_eq!(claims["expires_at"], expires_at);
+
+        let age_session = |seconds: i64| {
+            let db = fixture.state.db.clone();
+            async move {
+                sqlx::query(
+                    "UPDATE nest_boot_sessions SET issued_at = issued_at - ?1,
+                     expires_at = expires_at - ?1, cleanup_after = cleanup_after - ?1",
+                )
+                .bind(seconds)
+                .execute(&db)
+                .await
+                .unwrap();
+            }
+        };
+        let serve = || {
+            serve_context(
+                State(fixture.state.clone()),
+                AxumPath(session_id.clone()),
+                HeaderMap::new(),
+            )
+        };
+
+        age_session(60 * 60).await;
+        assert_eq!(serve().await.unwrap().status(), StatusCode::OK);
+        assert_eq!(cleanup_expired_sessions(&fixture.state).await.unwrap(), 0);
+
+        age_session(BOOT_SESSION_SECONDS).await;
+        assert!(matches!(serve().await, Err(AppError::NotFound)));
+        assert_eq!(cleanup_expired_sessions(&fixture.state).await.unwrap(), 1);
+        assert!(!Path::new(&context_path).exists());
         fixture.cleanup();
     }
 
