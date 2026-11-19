@@ -2,6 +2,8 @@
 import copy
 import secrets
 
+from blueprint_delivery import source_free
+
 
 def complete_sign_in_setup(api):
     policies = [row for row in api('/v1/policies')
@@ -63,10 +65,7 @@ def prepare(owner):
     policy = api('/v1/nest/delivery-policy')
     if policy['emergency_override_mode'] is not None:
         raise ValueError('fresh fixture unexpectedly has emergency policy overrides')
-    fields = ('mode', 'approved_public_substituters', 'approved_public_keys', 'required_nest_replicas',
-              'rollback_window_days', 'max_concurrent_transfers_per_nest')
-    api('/v1/nest/delivery-policy', {**{key: policy[key] for key in fields},
-                                    'allow_nest_source_builds': False, 'allow_local_builds': False})
-    result = api('/v1/nest/delivery-policy')
-    if result['allow_nest_source_builds'] or result['source_builds_allowed'] or result['allow_local_builds']:
+    # Nest-only delivery is Manage's one switch that makes delivery source-free.
+    api('/v1/nest/delivery-policy', {'nest_only': True})
+    if not source_free(api('/v1/nest/delivery-policy')):
         raise ValueError('fixture source-free delivery policy did not take effect')

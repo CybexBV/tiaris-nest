@@ -178,12 +178,13 @@ subnet. The runner builds the candidate's committed Tiaris source into disposabl
 images and retains the verified Owner for every API request and the setup claim.
 It does not use an external production session or a development admission helper.
 
-The initial V3 qualification requires
-`TIARIS_NEST_NIXOS_QUALIFICATION_PREDECESSOR_DIR` and
-`TIARIS_NEST_NIXOS_QUALIFICATION_PREDECESSOR_MANIFEST_SHA256`: a separately signed
-older NixOS release bound to the production origin. Ubuntu ancestry remains
-historical evidence and cannot supply the upgrade fixture. Development-bound
-NixOS artifacts cannot be relabeled for this purpose.
+Warm qualification uses the candidate's published predecessor as its upgrade
+baseline. `TIARIS_NEST_NIXOS_QUALIFICATION_PREDECESSOR_DIR` and
+`TIARIS_NEST_NIXOS_QUALIFICATION_PREDECESSOR_MANIFEST_SHA256` optionally name a
+separately signed older NixOS release bound to the production origin instead
+(the initial V3 qualification needed one). Ubuntu ancestry remains historical
+evidence and cannot supply the upgrade fixture. Development-bound NixOS
+artifacts cannot be relabeled for this purpose.
 
 The optional `TIARIS_NEST_QUALIFICATION_PREDECESSOR_CACHE_ROOT` authorizes only
 runner-private warm transport storage. It grants no VM, signing, publication or

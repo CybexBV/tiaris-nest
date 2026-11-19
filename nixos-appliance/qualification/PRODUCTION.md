@@ -47,11 +47,14 @@ below map to the existing `CYBEX_JAMES_*` GitHub variables; the runner retains
 - `TIARIS_NEST_QUALIFICATION_STATE_ROOT`: an existing root-owned 0700 directory.
 - `TIARIS_NEST_QUALIFICATION_SUBNET`: an unused private IPv4 /24 with its gateway.
 - `TIARIS_NEST_NIXOS_QUALIFICATION_PREDECESSOR_DIR` and
-  `TIARIS_NEST_NIXOS_QUALIFICATION_PREDECESSOR_MANIFEST_SHA256`: the independently
-  signed NixOS upgrade baseline. The baseline must admit the production origin and
-  fixture provisioning key, and precede the candidate version. For initial NixOS
-  production qualification this is a separately built, signed private baseline;
-  an Ubuntu release or a development-origin NixOS ISO is not a substitute.
+  `TIARIS_NEST_NIXOS_QUALIFICATION_PREDECESSOR_MANIFEST_SHA256` (optional): an
+  independently signed NixOS upgrade baseline. The baseline must admit the
+  production origin and fixture provisioning key, and precede the candidate
+  version. Without them the warm job resolves the candidate's published
+  predecessor itself, which is the normal case now that consecutive releases
+  share `https://manage.tiaris.com`. Set them only when the published predecessor
+  cannot serve (another origin, or no NixOS release); an Ubuntu release or a
+  development-origin NixOS ISO is never a substitute.
 
 The isolated Manage service first runs its exact image in migration-only mode,
 then provisions the restricted database roles using the SQL from that same
@@ -318,3 +321,13 @@ qualification run against a `https://manage.tiaris.com` fixture, while warm
 update and rollback qualification start with the next release, whose baseline is
 the first `https://manage.tiaris.com` release. Installed Nests are reinstalled,
 not updated, across this change.
+
+Since 19 November 2026 the fixture on the runner serves `https://manage.tiaris.com`
+alone: the template's `manage_origin` names it, without a transition, and its
+certificate is a Let's Encrypt certificate for that one name, issued by DNS-01
+for the fixture only and renewed with the runner's other qualification
+certificate. The Nest and the harness accept only publicly trusted certificates
+(the Nest's Manage clients use the built-in web PKI roots), so a self-made
+certificate cannot stand in. The qualification predecessor is the candidate's
+published predecessor. Releases built for `https://manage.cybex.net` (v0.2.99 and
+earlier) can no longer be qualified with this fixture.
