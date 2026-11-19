@@ -36,7 +36,7 @@ class UsbInstallerImageTests(unittest.TestCase):
     def write_record(self, **changes):
         body = self.image.read_bytes()
         record = {"schema": "tiaris.usb-installer.image.v1", "image": "tiaris-usb-installer.img",
-                  "protocol": 2, "size_bytes": len(body), "sha256": hashlib.sha256(body).hexdigest(),
+                  "protocol": 3, "size_bytes": len(body), "sha256": hashlib.sha256(body).hexdigest(),
                   "source_revision": REVISION, **changes}
         self.record.write_text(json.dumps(record))
 

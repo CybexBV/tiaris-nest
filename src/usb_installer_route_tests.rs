@@ -11,7 +11,7 @@ mod usb_installer_routes {
     use serde_json::Value;
     use tower::ServiceExt;
 
-    const STICK_AGENT: &str = "tiaris-usb-installer/2 (0123456789ab)";
+    const STICK_AGENT: &str = "tiaris-usb-installer/3 (0123456789ab)";
     const MAC: &str = "aa:bb:cc:dd:ee:ff";
 
     async fn get(app: Router, uri: &str, agent: Option<&str>) -> (StatusCode, Value) {
@@ -317,12 +317,12 @@ mod usb_installer_routes {
         let (status, body) = get(
             app,
             "/usb-installer/v1/boot?mac=aa:bb:cc:dd:ee:ff",
-            Some("tiaris-usb-installer/1 (0123456789ab)"),
+            Some("tiaris-usb-installer/2 (0123456789ab)"),
         )
         .await;
         assert_eq!(status, StatusCode::GONE);
         assert_eq!(body["error"], "usb_installer_outdated");
-        assert_eq!(body["minimum_stick_protocol"], 2);
+        assert_eq!(body["minimum_stick_protocol"], 3);
         fixture.cleanup();
     }
 

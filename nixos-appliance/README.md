@@ -394,7 +394,7 @@ Identity fields come from the sealed root:tiaris-nest 0640 install plan (`name`,
 `organization`, `interface`), the live boot URL (`address`), the Manage origin
 (`tiaris_host`), the PXE supervisor (`pxe`), `/proc/stat` (`booted_at`) and the
 immutable system identity (`system`). `active_installs` counts distinct
-workstations holding an unexpired (ten-minute) Nest boot grant. The kiosk treats
+workstations that started the installer in the last ten minutes. The kiosk treats
 a status older than 90 seconds as stale attention.
 
 ## Services and network changes

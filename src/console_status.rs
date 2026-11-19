@@ -28,6 +28,7 @@ const ATTENTION_AFTER_CHECKS: u32 = 6;
 /// Tiaris normally hears from Nest every sync interval (at most an hour, 30 s
 /// by default). Ten silent minutes means the link, not the schedule, failed.
 const TIARIS_UNREACHABLE_AFTER_SECONDS: i64 = 10 * 60;
+const RECENT_INSTALL_START_SECONDS: i64 = 10 * 60;
 const MAX_STATUS_BYTES: usize = 16 * 1024;
 const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(5);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(20);
@@ -656,13 +657,14 @@ fn runtime_ipv4(public_base_url: &str) -> Option<String> {
 }
 
 /// Computers currently being served an installation: distinct workstations
-/// holding an unexpired Nest boot grant. Nest issues one grant per PXE boot
-/// of the workstation installer runtime and it expires after ten minutes.
+/// that started the workstation installer runtime in the last ten minutes.
+/// Nest opens one boot session per such start; the session itself lives a
+/// day, so its end says nothing about who is starting now.
 pub async fn count_active_installs(db: &sqlx::SqlitePool, now: DateTime<Utc>) -> Result<u32> {
     let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(DISTINCT normalized_mac) FROM nest_boot_sessions WHERE expires_at > ?",
+        "SELECT COUNT(DISTINCT normalized_mac) FROM nest_boot_sessions WHERE issued_at > ?",
     )
-    .bind(now.timestamp())
+    .bind(now.timestamp() - RECENT_INSTALL_START_SECONDS)
     .fetch_one(db)
     .await
     .context("count active workstation boot grants")?;
