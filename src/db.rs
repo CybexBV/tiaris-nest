@@ -2820,14 +2820,25 @@ fn terminal_build_progress_stage(status: &str) -> &'static str {
 }
 
 fn terminal_build_progress_message(status: &str, metadata: Option<&Value>) -> String {
+    let object = metadata.and_then(Value::as_object);
+    let first_failed_package = object
+        .and_then(|object| object.get("failed_packages"))
+        .and_then(Value::as_array)
+        .and_then(|names| names.first())
+        .and_then(Value::as_str);
     match status {
         "succeeded" => "Build completed and cached".to_string(),
         "cancelled" => "Build cancelled by Tiaris".to_string(),
-        _ => match metadata
-            .and_then(Value::as_object)
+        _ => match object
             .and_then(|object| object.get("error_kind"))
             .and_then(Value::as_str)
         {
+            Some("package_build_failed") if first_failed_package.is_some() => {
+                format!(
+                    "{} failed to build",
+                    first_failed_package.unwrap_or_default()
+                )
+            }
             Some("out_of_memory") => "Build ran out of memory".to_string(),
             Some("insufficient_memory") => "Nest memory is below the required minimum".to_string(),
             Some("insufficient_swap") => "Nest swap is below the required minimum".to_string(),
@@ -2838,6 +2849,8 @@ fn terminal_build_progress_message(status: &str, metadata: Option<&Value>) -> St
                     .to_string()
             }
             Some("nix_daemon_unavailable") => "Nix daemon is unavailable".to_string(),
+            Some("network_unavailable") => "Nest could not reach the network".to_string(),
+            Some("evaluation_failed") => "The configuration could not be evaluated".to_string(),
             Some("build_timeout") => "Build timed out".to_string(),
             _ => "Build failed".to_string(),
         },
@@ -4550,6 +4563,37 @@ mod tests {
             "package_build_failed"
         );
         assert_eq!(reported_again.cache_metadata["desired"], "new");
+    }
+
+    #[test]
+    fn a_failed_build_names_its_package_in_the_progress_message() {
+        let named = json!({
+            "error_kind": "package_build_failed",
+            "failed_packages": ["firefox-esr-128.5.0esr", "vlc-3.0.21"],
+        });
+        assert_eq!(
+            terminal_build_progress_message("failed", Some(&named)),
+            "firefox-esr-128.5.0esr failed to build"
+        );
+        let unnamed = json!({"error_kind": "package_build_failed"});
+        assert_eq!(
+            terminal_build_progress_message("failed", Some(&unnamed)),
+            "A package failed to build"
+        );
+        for (kind, message) in [
+            ("network_unavailable", "Nest could not reach the network"),
+            (
+                "evaluation_failed",
+                "The configuration could not be evaluated",
+            ),
+            ("insufficient_disk_space", "Nest disk space is insufficient"),
+            ("out_of_memory", "Build ran out of memory"),
+        ] {
+            assert_eq!(
+                terminal_build_progress_message("failed", Some(&json!({"error_kind": kind}))),
+                message
+            );
+        }
     }
 
     #[tokio::test]
