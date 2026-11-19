@@ -19,6 +19,9 @@ use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 pub const CAPABILITY: &str = "appliance_update_v3";
+/// The Nest takes a newer release in place of a staged update that has not
+/// started (`store`); Manage replaces a waiting attempt only for such a Nest.
+pub const REPLACE_CAPABILITY: &str = "appliance_update_replace_v1";
 pub const IDENTITY_PATH: &str = "/usr/share/tiaris-nest/system-identity.json";
 pub const MIGRATIONS_PATH: &str = "/usr/share/tiaris-nest/sqlite-migrations.json";
 const RESERVE: u64 = 23 * 1024 * 1024 * 1024;
@@ -161,14 +164,17 @@ async fn store(update: super::ManagedApplianceUpdate<NixosRelease>) -> Result<()
     }
     let current = read_installed()?;
     newer(&update.release, &current.release)?;
-    if let Some(prior) = super::read_optional_bounded_json::<StoredUpdate>(
+    let prior = super::read_optional_bounded_json::<StoredUpdate>(
         Path::new(super::UPDATE_REQUEST_PATH),
         256 * 1024,
-    ) {
+    );
+    if let Some(prior) = &prior {
         if prior.attempt_id == update.attempt_id && prior.release == update.release {
             return Ok(());
         }
-        bail!("another appliance update is already staged")
+        // Manage replaces a waiting update only with a newer release.
+        newer(&update.release, &prior.release)
+            .map_err(|_| anyhow!("another appliance update is already staged"))?;
     }
     validate_directory(Path::new(UPDATE_CACHE_ROOT), 0, 0o755)?;
     validate_directory(Path::new(UPDATE_BUNDLE_ROOT), 985, 0o700)?;
@@ -198,17 +204,62 @@ async fn store(update: super::ManagedApplianceUpdate<NixosRelease>) -> Result<()
         transport != update.release.system_closure.url,
     )
     .await?;
-    super::write_atomic_json(
+    let stored = StoredUpdate {
+        schema: "tiaris.nest.appliance-update-request.v3".into(),
+        attempt_id: update.attempt_id,
+        requested_at: update.requested_at,
+        release: update.release,
+        bundle_path: path.to_str().ok_or_else(|| anyhow!("archive path"))?.into(),
+    };
+    let Some(prior) = prior else {
+        return super::write_atomic_json(Path::new(super::UPDATE_REQUEST_PATH), &stored, 0o600);
+    };
+    let replaced = replace_waiting(&prior, &stored);
+    if replaced.is_err() {
+        // The older update goes ahead; Manage hands this one again later.
+        let _ = fs::remove_file(&path);
+    }
+    replaced
+}
+
+/// Puts a newer release in place of a staged update the root updater has
+/// not started installing. Preparing ahead does not count as started: the
+/// root updater drops what it prepared for a request that changed
+/// (`generation_update.drop_prepared`).
+fn replace_waiting(prior: &StoredUpdate, stored: &StoredUpdate) -> Result<()> {
+    let Some(_lease) = crate::maintenance::try_exclusive()? else {
+        bail!("the staged appliance update is being prepared or installed")
+    };
+    let staged = super::read_optional_bounded_json::<StoredUpdate>(
         Path::new(super::UPDATE_REQUEST_PATH),
-        &StoredUpdate {
-            schema: "tiaris.nest.appliance-update-request.v3".into(),
-            attempt_id: update.attempt_id,
-            requested_at: update.requested_at,
-            release: update.release,
-            bundle_path: path.to_str().ok_or_else(|| anyhow!("archive path"))?.into(),
-        },
-        0o600,
-    )
+        256 * 1024,
+    );
+    ensure!(
+        staged.is_some_and(|staged| staged.attempt_id == prior.attempt_id),
+        "the staged appliance update changed"
+    );
+    let status = super::read_optional_bounded_json::<Value>(
+        Path::new(super::UPDATE_STATUS_PATH),
+        128 * 1024,
+    );
+    ensure!(
+        !started(status.as_ref(), prior.attempt_id),
+        "the staged appliance update has started"
+    );
+    super::write_atomic_json(Path::new(super::UPDATE_REQUEST_PATH), stored, 0o600)?;
+    let bundle = Path::new(UPDATE_BUNDLE_ROOT).join(format!("{}.tar.zst", prior.attempt_id));
+    match fs::remove_file(&bundle) {
+        Ok(()) => super::sync_directory(Path::new(UPDATE_BUNDLE_ROOT)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Whether the root updater reported more than waiting for this attempt.
+fn started(status: Option<&Value>, attempt_id: Uuid) -> bool {
+    status.is_some_and(|status| {
+        status["attempt_id"] == attempt_id.to_string() && status["status"] != "waiting_window"
+    })
 }
 
 pub async fn download(

@@ -156,8 +156,11 @@ def verify_store_closure(cache, toplevel):
         raise ValueError('installed closure does not contain the signed release toplevel')
 
 
+ATTEMPT = '[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}'
+
+
 def safe_attempt(value):
-    if not isinstance(value, str) or not re.fullmatch('[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', value):
+    if not isinstance(value, str) or not re.fullmatch(ATTEMPT, value):
         raise ValueError('invalid attempt identity')
     return value
 
@@ -571,6 +574,27 @@ def activate(prepared):
         raise
 
 
+def drop_prepared(owner=0):
+    """Remove what preparing an earlier request left: its private copy, its
+    receipts and the store root of its closure. Manage replaces a waiting
+    update with a newer release, and the daemon swaps the request; preparing
+    the new one starts from nothing."""
+    for parent in (STAGING / 'private', CONTROL / 'appliance-updates'):
+        if not parent.is_dir():
+            continue
+        for path in parent.iterdir():
+            if not re.fullmatch(ATTEMPT, path.name):
+                continue
+            if path.is_symlink() or path.stat().st_uid != owner:
+                raise ValueError('unsafe root staging cleanup')
+            shutil.rmtree(path)
+            sync_dir(parent)
+    if ROOTS.is_dir():
+        for root in ROOTS.glob('pending-*'):
+            root.unlink()
+        sync_dir(ROOTS)
+
+
 def stage():
     """Prepare as soon as an update arrives, wait until the signed policy lets
     it start (Update now, the Nest being idle, or the night), then switch."""
@@ -579,7 +603,10 @@ def stage():
     with maintenance_lock():
         if any(path.exists() for path in (PENDING, PREPARE, COMMIT, ROLLBACK)):
             raise ValueError('pending generation transaction requires recovery')
-        prepared = prepared_update() or prepare()
+        prepared = prepared_update()
+        if prepared is None:
+            drop_prepared()
+            prepared = prepare()
         waiting = None if started(prepared['attempt_id']) else waiting_for()
         if waiting:
             emit_status(prepared, 'waiting_window', waiting)

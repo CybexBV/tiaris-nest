@@ -1,11 +1,13 @@
 //! Whether computers depend on this Nest right now.
 //!
-//! A Nest whose signed update policy says `when_idle` installs a prepared
-//! update only after it served no computer and ran no build for a quiet
-//! period. The daemon serves every boot, netboot, install and cache request,
-//! so it alone can tell. It publishes `/run/tiaris-nest/activity.json`; the
-//! root updater (`tiaris-nest-appliance-update-window`) reads it and decides.
+//! A Nest installs a prepared update once it served no computer and ran no
+//! build for a quiet period (and in the night at the latest). The daemon
+//! serves every boot, netboot, install and cache request, so it alone can
+//! tell. Requests the Nest makes to itself, such as its readiness check, serve
+//! no computer and do not count. It publishes `/run/tiaris-nest/activity.json`;
+//! the root updater (`tiaris-nest-appliance-update-window`) reads it and decides.
 use std::{
+    net::SocketAddr,
     pin::Pin,
     sync::atomic::{AtomicI64, AtomicUsize, Ordering},
     task::{Context, Poll},
@@ -15,7 +17,7 @@ use std::{
 use anyhow::Result;
 use axum::{
     body::{Body, Bytes},
-    extract::Request,
+    extract::{ConnectInfo, Request},
     middleware::Next,
     response::Response,
 };
@@ -97,10 +99,18 @@ impl http_body::Body for Tracked {
     }
 }
 
-/// Health probes come from the Nest itself and Manage; every other route
-/// serves a computer (boot scripts, netboot, installer, USB stick, cache).
+/// Health probes serve nobody; every other route serves a computer (boot
+/// scripts, netboot, installer, USB stick, cache) unless the Nest itself asks.
 fn counts(path: &str) -> bool {
     !path.starts_with("/healthz")
+}
+
+fn serves_a_computer(request: &Request) -> bool {
+    let connect = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|value| value.0);
+    counts(request.uri().path()) && !crate::routes::is_own_request(request.headers(), connect)
 }
 
 pub async fn track(request: Request, next: Next) -> Response {
@@ -108,7 +118,7 @@ pub async fn track(request: Request, next: Next) -> Response {
 }
 
 async fn track_with(counter: &'static Counter, request: Request, next: Next) -> Response {
-    if !counts(request.uri().path()) {
+    if !serves_a_computer(&request) {
         return next.run(request).await;
     }
     let served = Served::start(counter);
@@ -265,6 +275,58 @@ mod tests {
         drop(response);
         assert!(COUNTER.last_served.load(Ordering::SeqCst) > 0);
         assert_eq!(COUNTER.in_flight.load(Ordering::SeqCst), 0);
+    }
+
+    /// The readiness check asks for `/boot.ipxe?tiaris_check=1` through nginx
+    /// about every seven seconds. An hour of it leaves the Nest idle for the
+    /// updater; one computer's request, even with the same marker, does not.
+    #[tokio::test]
+    async fn an_hour_of_readiness_checks_ends_idle_and_a_computer_does_not() {
+        // The updater's QUIET_SECONDS (tiaris-nest-appliance-update-window).
+        const QUIET_SECONDS: i64 = 10 * 60;
+        static COUNTER: Counter = Counter::new();
+        let app = Router::new()
+            .route("/boot.ipxe", get(|| async { "#!ipxe\n" }))
+            .layer(axum::middleware::from_fn(|request, next| {
+                track_with(&COUNTER, request, next)
+            }));
+        let request = |client: &'static str| {
+            let mut request = Request::get("/boot.ipxe?tiaris_check=1")
+                .header("x-forwarded-for", client)
+                .body(Body::empty())
+                .unwrap();
+            // nginx reaches the daemon on loopback.
+            request
+                .extensions_mut()
+                .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 50200))));
+            request
+        };
+        let sample = |idle_since, now| {
+            next_idle_since(
+                idle_since,
+                COUNTER.in_flight.load(Ordering::SeqCst) > 0,
+                now,
+                COUNTER.last_served.load(Ordering::SeqCst),
+            )
+        };
+        // The hour ends now, as served requests are stamped with the clock.
+        let end = Utc::now().timestamp();
+        let mut idle_since = None;
+        for second in 0..3600 {
+            if second % 7 == 0 {
+                drop(app.clone().oneshot(request("127.0.0.1")).await.unwrap());
+            }
+            if second % 20 == 0 {
+                idle_since = sample(idle_since, end - 3600 + second);
+            }
+        }
+        idle_since = sample(idle_since, end);
+        assert!(idle_since.is_some_and(|since| end - since >= QUIET_SECONDS));
+
+        drop(app.oneshot(request("192.0.2.55")).await.unwrap());
+        let now = Utc::now().timestamp();
+        idle_since = sample(idle_since, now);
+        assert!(idle_since.is_some_and(|since| now - since < QUIET_SECONDS));
     }
 
     #[test]

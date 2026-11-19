@@ -221,6 +221,7 @@ class PrepareThenSwitch(unittest.TestCase):
                 patch.object(update, 'COMMIT', self.directory / 'none'), \
                 patch.object(update, 'ROLLBACK', self.directory / 'none'), \
                 patch.object(update, 'prepared_update', return_value=prepared), \
+                patch.object(update, 'drop_prepared', side_effect=lambda: calls.append('drop')), \
                 patch.object(update, 'prepare', side_effect=lambda: calls.append('prepare') or self.prepared), \
                 patch.object(update, 'waiting_for', side_effect=lambda: calls.append('gate') or waiting), \
                 patch.object(update, 'started', return_value=started), \
@@ -231,10 +232,25 @@ class PrepareThenSwitch(unittest.TestCase):
         return calls
 
     def test_prepares_before_waiting_and_switches_only_when_allowed(self):
-        self.assertEqual(self.run_stage(None, 'nest_busy'), ['prepare', 'gate', ('waiting_window', 'nest_busy')])
+        self.assertEqual(self.run_stage(None, 'nest_busy'), ['drop', 'prepare', 'gate', ('waiting_window', 'nest_busy')])
         self.assertEqual(self.run_stage(self.prepared, None), ['gate', 'activate'])
         # After a crash during activation the report never goes back to waiting.
         self.assertEqual(self.run_stage(self.prepared, 'nest_busy', started=True), ['activate'])
+
+    def test_a_replaced_request_leaves_nothing_prepared_behind(self):
+        staging, control = self.directory / 'staging', self.directory / 'control'
+        other = '22222222-2222-4222-8222-222222222222'
+        for parent in (staging / 'private', control / 'appliance-updates'):
+            (parent / other).mkdir(parents=True)
+            (parent / other / 'receipt.json').write_text('{}')
+        (control / 'appliance-updates' / '0.2.30').mkdir()
+        (self.roots / ('good-7')).symlink_to(self.system)
+        with patch.object(update, 'STAGING', staging), patch.object(update, 'CONTROL', control), \
+                patch.object(update, 'ROOTS', self.roots):
+            update.drop_prepared(owner=os.getuid())
+        self.assertEqual(list((staging / 'private').iterdir()), [])
+        self.assertEqual(sorted(path.name for path in (control / 'appliance-updates').iterdir()), ['0.2.30'])
+        self.assertEqual(sorted(path.name for path in self.roots.iterdir()), ['good-7'])
 
     def test_the_gate_names_what_it_waits_for(self):
         for code, output, expected in ((0, '', None), (75, 'nest_busy\n', 'nest_busy'), (75, '', 'nest_busy')):
