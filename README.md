@@ -49,7 +49,7 @@ full code (`KX-4821-QM`) on its screen. An administrator claims it in the
 Console; Tiaris then hands over the session's signed envelope. The bootstrap
 verifies those bytes exactly as it verifies a filled slot and runs the existing flow: session claim, disk approval,
 installation. The envelope is kept in `/run` until STATE exists and on STATE
-(`.setup-claim-envelope.bin`, root 0600, left out of state backups) from then
+(`.setup-claim-envelope.bin`, root 0600) from then
 on, so resuming after a power cut never needs the ISO. Booted on a server
 that already holds an installed Nest (a completed installation with that
 envelope, or a STATE partition whose NixOS Nest has its systemd-boot UEFI
@@ -248,8 +248,9 @@ the tool tests and the `manifest` signing step refuse any other change to
 declared changes. Until then new state lives in files under the Nest state
 directory (`src/state_files.rs`): detected commits, scans and upload grants.
 
-Nest state and keys can be backed up encrypted and restored onto a
-replacement Nest: `docs/nest-state-backup.md`.
+A Nest's state is not backed up. A Nest that is installed again and claimed
+for the same organization gets its identity, configuration and trust in its
+new cache key from Manage, and rebuilds its cache.
 
 ## Off-site software uploads
 

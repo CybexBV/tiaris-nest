@@ -134,9 +134,6 @@ struct PeerContract {
     accepts_usb_installer: bool,
     #[serde(default)]
     accepts_when_idle: bool,
-    /// Manage accepts chunked state backup uploads (`state_backup::upload`).
-    #[serde(default)]
-    accepts_state_backup_chunks: bool,
     /// Manage accepts the site check lane (`site_check`).
     #[serde(default)]
     accepts_site_check: bool,
@@ -227,11 +224,6 @@ struct AgentNestConfigResponse {
     /// so, Nest does not advertise it (an older Manage rejects the report).
     #[serde(default)]
     software_cache_upload_supported: bool,
-    /// Manage accepts chunked state backup uploads
-    /// (`POST /v1/agent/nest/state-backups/{id}/upload`); until it says so,
-    /// Nest sends every backup in one request.
-    #[serde(default)]
-    state_backup_chunked_upload_supported: bool,
     #[serde(default)]
     software_update_channel: Option<Value>,
     #[serde(default)]
@@ -1071,7 +1063,6 @@ async fn sync_nest_foundation(
                 accepts_uploads: desired.software_cache_upload_supported,
                 accepts_usb_installer: false,
                 accepts_when_idle: desired.update_when_idle_supported,
-                accepts_state_backup_chunks: desired.state_backup_chunked_upload_supported,
                 accepts_site_check: desired.site_check_supported,
                 accepts_boot_machine_identity: desired.boot_machine_identity_supported,
                 runtime_epoch: desired
@@ -1140,23 +1131,10 @@ fn peer_contract_after_failed_fetch(
         accepts_uploads: false,
         accepts_usb_installer: false,
         accepts_when_idle: false,
-        accepts_state_backup_chunks: false,
         accepts_site_check: false,
         accepts_boot_machine_identity: false,
         runtime_epoch: false,
         report_protocol: TIARIS_COMPONENT_PROTOCOL_VERSION,
-    })
-}
-
-/// Manage confirmed, within PEER_CONTRACT_MAX_AGE_SECONDS, that it accepts chunked state backup uploads.
-pub(crate) fn state_backup_chunks_supported(config: &AppConfig) -> bool {
-    load_managed_state_from_config(config).is_ok_and(|managed| {
-        peer_contract_after_failed_fetch(
-            managed.last_peer_contract,
-            managed.last_peer_contract_at,
-            Utc::now().timestamp(),
-        )
-        .accepts_state_backup_chunks
     })
 }
 
@@ -3735,7 +3713,6 @@ mod tests {
             accepts_uploads: true,
             accepts_usb_installer: true,
             accepts_when_idle: true,
-            accepts_state_backup_chunks: true,
             accepts_site_check: true,
             accepts_boot_machine_identity: true,
             runtime_epoch: true,
@@ -5211,46 +5188,6 @@ mod tests {
     }
 
     #[test]
-    fn chunked_state_backups_need_a_recently_confirming_manage() {
-        let older: AgentNestConfigResponse = serde_json::from_value(json!({})).unwrap();
-        let newer: AgentNestConfigResponse =
-            serde_json::from_value(json!({"state_backup_chunked_upload_supported": true})).unwrap();
-        assert!(!older.state_backup_chunked_upload_supported);
-        assert!(newer.state_backup_chunked_upload_supported);
-        let root = std::env::temp_dir().join(format!(
-            "tiaris-peer-chunks-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let mut config = AppConfig::default();
-        config.manage.state_path = root.join("manage-state.json");
-        // No state file, or a Manage that never said so: one request per backup.
-        assert!(!state_backup_chunks_supported(&config));
-        let contract = |chunks: bool, at: i64| {
-            json!({
-                "last_peer_contract": {
-                    "supports_scheduling": true, "accepts_uploads": false,
-                    "accepts_usb_installer": true, "runtime_epoch": true, "report_protocol": 1,
-                    "accepts_state_backup_chunks": chunks,
-                },
-                "last_peer_contract_at": at,
-            })
-            .to_string()
-        };
-        let now = Utc::now().timestamp();
-        for (chunks, at, expected) in [
-            (true, now - 60, true),
-            (false, now - 60, false),
-            // A day without confirmation: Manage may have been rolled back.
-            (true, now - PEER_CONTRACT_MAX_AGE_SECONDS - 60, false),
-        ] {
-            fs::write(&config.manage.state_path, contract(chunks, at)).unwrap();
-            assert_eq!(state_backup_chunks_supported(&config), expected);
-        }
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
     fn when_idle_capability_requires_manage_support_and_scheduling() {
         // A Manage that does not know `appliance_update_when_idle_v1` rejects
         // the whole report, so Nest advertises it only when Manage says so.
@@ -5272,14 +5209,15 @@ mod tests {
             push_when_idle_capability(&mut capabilities, supported);
             assert_eq!(capabilities.contains(&idle), expected);
         }
-        // Contracts persisted before this field existed read as unsupported.
+        // Contracts persisted before this field existed read as unsupported;
+        // a field a later release retired (state backup chunks) is ignored.
         let stored: PeerContract = serde_json::from_value(json!({
             "supports_scheduling": true, "accepts_uploads": true,
-            "accepts_usb_installer": true, "runtime_epoch": true, "report_protocol": 1
+            "accepts_usb_installer": true, "runtime_epoch": true, "report_protocol": 1,
+            "accepts_state_backup_chunks": true
         }))
         .unwrap();
         assert!(!stored.accepts_when_idle);
-        assert!(!stored.accepts_state_backup_chunks);
     }
 
     #[test]

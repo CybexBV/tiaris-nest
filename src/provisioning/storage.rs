@@ -104,8 +104,7 @@ pub(crate) fn existing_state_for_session(
 }
 
 /// The claimed envelope of a generic ISO, kept on STATE beside the durable
-/// state. A dot file: state backups leave it out. Root-only like the flat
-/// durable state, which holds the device key.
+/// state. Root-only like the flat durable state, which holds the device key.
 pub(super) const RETAINED_SETUP_ENVELOPE: &str = ".setup-claim-envelope.bin";
 
 /// Keep a generic ISO's envelope on the new STATE before any durable state
@@ -1750,8 +1749,6 @@ mod tests {
             vec![7; 8192]
         );
         assert_eq!(unmounts.get(), 1);
-        // A dot file: state backups leave the media secret out.
-        assert!(!crate::state_backup::included(RETAINED_SETUP_ENVELOPE));
 
         // Oversized or linked copies grant nothing.
         fs::write(&path, vec![1; 8193]).unwrap();
