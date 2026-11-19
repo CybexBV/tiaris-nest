@@ -57,7 +57,7 @@ class QualificationTests(unittest.TestCase):
         blueprint = {'current_revision_id': 'revision'}
         verified = datetime.datetime(2026, 9, 19, 14, tzinfo=datetime.timezone.utc)
         before = {'device_id': 'device', 'public_key_fingerprint': 'key'}
-        device = before | {'device_kind': 'workstation', 'health_status': 'online',
+        device = before | {'device_kind': 'workstation', 'state': 'fine',
             'configuration_status': 'compliant', 'desired_blueprint_revision_id': 'revision',
             'applied_blueprint_revision_id': 'revision', 'desired_config_hash': 'a' * 64,
             'reported_config_hash': 'a' * 64, 'applied_config_hash': 'a' * 64,

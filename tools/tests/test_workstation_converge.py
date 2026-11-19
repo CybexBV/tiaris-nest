@@ -21,7 +21,7 @@ NEW_BOOT = '0b4a1c58-3f7e-4f0d-9d55-1f7f0f6a4b2e'
 
 def observed(*, current, booted, profile=None, boot_id=OLD_BOOT, **fields):
     device = INSTALLED | {
-        'device_kind': 'workstation', 'health_status': 'online', 'configuration_status': 'compliant',
+        'device_kind': 'workstation', 'state': 'fine', 'configuration_status': 'compliant',
         'desired_blueprint_revision_id': 'dock-revision', 'applied_blueprint_revision_id': 'dock-revision',
         'desired_config_hash': 'a' * 64, 'reported_config_hash': 'a' * 64, 'applied_config_hash': 'a' * 64,
         'configuration_verified_at': '2026-11-02T17:00:00Z', 'active_operation': None,
@@ -130,7 +130,7 @@ class ConvergeTests(unittest.TestCase):
             'old revision': {'applied_blueprint_revision_id': 'standard-revision'},
             'hash mismatch': {'reported_config_hash': 'c' * 64},
             'identity changed': {'public_key_fingerprint': 'other'},
-            'offline': {'health_status': 'offline'},
+            'offline': {'state': 'silent'},
         }
         for name, fields in cases.items():
             with self.subTest(name):
