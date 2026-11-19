@@ -65,7 +65,7 @@ def require_workstation(device, descriptor, blueprint, previous=None, verified_a
     runtime = facts.get('workstation_runtime') or {}
     generation = facts.get('blueprint_generation') or {}
     current = generation.get('current_system')
-    if (device.get('device_kind') == 'nixos-installer' or device.get('health_status') != 'online'
+    if (device.get('device_kind') == 'nixos-installer' or device.get('state') not in ('fine', 'updating')
             or device.get('configuration_status') != 'compliant'
             or device.get('desired_blueprint_revision_id') != blueprint['current_revision_id']
             or device.get('applied_blueprint_revision_id') != blueprint['current_revision_id']
@@ -267,7 +267,7 @@ def run(api, state, nest, manifest, catalog, output):
                     print(label + ' passed', flush=True)
                     return value
                 if isinstance(value, dict):
-                    observation = {k: value.get(k) for k in ('device_kind', 'health_status',
+                    observation = {k: value.get(k) for k in ('device_kind', 'state',
                         'configuration_status', 'installer_target_preparation_state', 'active_command_type',
                         'active_command_status', 'active_command_progress') if k in value}
                     operation = value.get('active_operation') or {}
