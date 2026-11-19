@@ -3718,6 +3718,9 @@ fn boot_report_state(
         if let Some(reliability) = reliability_state {
             object.insert("reliability".to_string(), reliability);
         }
+        if let Some(failures) = crate::setup_failures::report() {
+            object.insert("setup_failures".to_string(), failures);
+        }
     }
     state
 }

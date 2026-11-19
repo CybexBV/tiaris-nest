@@ -14,6 +14,7 @@ use crate::{
     db,
     error::{AppError, AppResult},
     models::{BootProfile, BootProfileType, Device, NewBootEvent, normalize_mac},
+    setup_failures::SetupFailure,
 };
 
 const MAX_BOOT_SERIAL_LEN: usize = 128;
@@ -669,15 +670,35 @@ pub(super) async fn create_installer_launch_for_runtime(
         boot_machines::load(&state.config.paths.data_dir).reinstall_check(request_id, identity)
             != ReinstallCheck::NotThisComputer
     });
-    crate::netboot::create_boot_session_for_runtime(
+    let launch = crate::netboot::create_boot_session_for_runtime(
         state,
         mac,
         Some(profile_id),
         binding.as_ref().and_then(|value| value.0.as_deref()),
         binding.as_ref().and_then(|value| value.1.as_deref()),
     )
-    .await
-    .map_err(|_| AppError::Config("could not create signed Nest boot session".to_string()))
+    .await;
+    match launch {
+        Ok(launch) => {
+            crate::setup_failures::clear();
+            Ok(launch)
+        }
+        Err(_) => {
+            // Tiaris never hears of this computer: the boot report tells it.
+            let reason = if crate::netboot::active_runtime_identity(state)
+                .await
+                .is_err()
+            {
+                SetupFailure::RuntimeUnavailable
+            } else {
+                SetupFailure::SessionUnavailable
+            };
+            crate::setup_failures::record(reason, mac);
+            Err(AppError::Config(
+                "could not create signed Nest boot session".to_string(),
+            ))
+        }
+    }
 }
 
 fn normalized_optional_mac(mac: Option<String>) -> AppResult<Option<String>> {
