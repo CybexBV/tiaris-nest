@@ -32,7 +32,55 @@ fn observation(now: i64) -> Observation {
         },
         pxe: Some(Pxe::Active),
         active_installs: Some(3),
+        retired: None,
     }
+}
+
+#[test]
+fn a_replaced_or_removed_nest_says_so_before_anything_else() {
+    for (retirement, code, title) in [
+        (
+            Retirement::Replaced,
+            AttentionCode::NestReplaced,
+            "Acme Nest was replaced",
+        ),
+        (
+            Retirement::Removed,
+            AttentionCode::NestRemoved,
+            "Acme Nest was removed from Tiaris",
+        ),
+    ] {
+        let mut current = observation(3_600);
+        current.retired = Some(retirement);
+        current.last_contact = None;
+        current.units = Some(UnitStates {
+            failed: vec!["tftpd-hpa.service"],
+            inactive_required: Vec::new(),
+            first_boot_active: true,
+        });
+        let status = ReadinessTracker::default().evaluate(&current);
+        assert_eq!(status.state, ConsoleState::Attention);
+        let attention = status.attention.unwrap();
+        assert_eq!(attention.code, code);
+        assert_eq!(attention.title, title);
+        assert!(attention.detail.contains("Switch this server off"));
+        assert_eq!(
+            serde_json::to_value(attention.code).unwrap(),
+            json!(match retirement {
+                Retirement::Replaced => "nest_replaced",
+                Retirement::Removed => "nest_removed",
+            })
+        );
+    }
+    assert_eq!(
+        Retirement::from_diagnostic_code("nest_replaced"),
+        Some(Retirement::Replaced)
+    );
+    assert_eq!(
+        Retirement::from_diagnostic_code("nest_removed"),
+        Some(Retirement::Removed)
+    );
+    assert_eq!(Retirement::from_diagnostic_code("forbidden"), None);
 }
 
 #[test]

@@ -1751,6 +1751,7 @@ async fn report_nest_state(
             .ok_or_else(|| anyhow!("managed fingerprint missing"))?,
         &state.config.manage.api_url,
     )?;
+    crate::console_status::record_retirement(None);
     crate::console_status::notify_changed();
     if let Err(error) = crate::wake_on_lan::acknowledge(&state.db, &response.wake_on_lan).await {
         debug!(error = %error, "Wake-on-LAN receipts remain queued for acknowledgement");
@@ -3146,10 +3147,15 @@ async fn parse_success_json<T: DeserializeOwned>(
 ) -> Result<T> {
     let status = response.status();
     if !status.is_success() {
-        let detail = match read_bounded_response_body(&mut response, context).await {
-            Ok(body) => managed_api_error_detail(&body),
-            Err(_) => None,
-        };
+        let body = read_bounded_response_body(&mut response, context)
+            .await
+            .ok();
+        if status == reqwest::StatusCode::FORBIDDEN {
+            if let Some(retirement) = body.as_deref().and_then(retirement_from_refusal) {
+                crate::console_status::record_retirement(Some(retirement));
+            }
+        }
+        let detail = body.as_deref().and_then(managed_api_error_detail);
         if let Some(detail) = detail {
             bail!("{context} failed with HTTP {status}: {detail}");
         }
@@ -3157,6 +3163,13 @@ async fn parse_success_json<T: DeserializeOwned>(
     }
     let body = read_bounded_response_body(&mut response, context).await?;
     serde_json::from_slice::<T>(&body).with_context(|| format!("parse {context} response failed"))
+}
+
+/// Manage refuses a Nest it replaced or removed with a reason of its own.
+fn retirement_from_refusal(body: &[u8]) -> Option<crate::console_status::Retirement> {
+    let value = serde_json::from_slice::<Value>(body).ok()?;
+    let code = value.get("diagnostic_code")?.as_str()?;
+    crate::console_status::Retirement::from_diagnostic_code(code)
 }
 
 fn managed_api_error_detail(body: &[u8]) -> Option<String> {
@@ -5330,6 +5343,30 @@ mod tests {
         }))
         .unwrap();
         assert!(!stored.accepts_boot_machine_identity);
+    }
+
+    #[test]
+    fn a_refusal_for_a_replaced_or_removed_nest_is_recognised() {
+        use crate::console_status::Retirement;
+        assert_eq!(
+            retirement_from_refusal(
+                br#"{"error":"this Nest was replaced by another Nest in Tiaris","error_code":"forbidden","diagnostic_code":"nest_replaced"}"#
+            ),
+            Some(Retirement::Replaced)
+        );
+        assert_eq!(
+            retirement_from_refusal(
+                br#"{"error_code":"forbidden","diagnostic_code":"nest_removed"}"#
+            ),
+            Some(Retirement::Removed)
+        );
+        assert_eq!(
+            retirement_from_refusal(
+                br#"{"error":"invalid signature","error_code":"unauthorized"}"#
+            ),
+            None
+        );
+        assert_eq!(retirement_from_refusal(b"not json"), None);
     }
 
     #[test]
