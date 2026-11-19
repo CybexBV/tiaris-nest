@@ -994,12 +994,12 @@ async fn an_unclaimed_nest_starts_the_installed_one_at_its_deadline() {
     let mut harness = Harness::new(origin);
     harness.status = SetupStatusReporter::new(Some(status_path.clone()));
     harness.status_path = status_path;
-    let deadline = Utc::now() + chrono::Duration::milliseconds(300);
+    let deadline = room_from_now();
     let mut context = harness.context();
     context.starts_installed_at = Some(deadline);
     let started = std::time::Instant::now();
     assert!(claim_until(&context, deadline).await.unwrap().is_none());
-    assert!(started.elapsed() >= Duration::from_millis(250));
+    assert!(started.elapsed() >= ROOM - Duration::from_millis(50));
     let seen = fake.lock().unwrap().seen.clone();
     server.abort();
     let at = json!(deadline.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
@@ -1450,7 +1450,7 @@ async fn a_claim_that_lands_just_before_the_deadline_wins() {
     .await;
     let mut harness = Harness::new(origin);
     // Polls far apart: the deadline comes before the next one.
-    let deadline = Utc::now() + chrono::Duration::milliseconds(200);
+    let deadline = room_from_now();
     let mut context = harness.context();
     context.tick = Duration::from_secs(5);
     context.starts_installed_at = Some(deadline);
@@ -1472,7 +1472,7 @@ async fn a_claim_that_lands_just_before_the_deadline_wins() {
     )
     .await;
     harness = Harness::new(origin);
-    let deadline = Utc::now() + chrono::Duration::milliseconds(200);
+    let deadline = room_from_now();
     let mut context = harness.context();
     context.tick = Duration::from_secs(5);
     assert!(claim_until(&context, deadline).await.unwrap().is_none());
@@ -1509,7 +1509,7 @@ async fn start_over_without_a_reboot_forgets_this_boots_claim_and_registers_agai
     // Polls far apart: the claim screen stays while the test looks.
     let mut context = harness.context();
     context.tick = Duration::from_secs(5);
-    let waited = tokio::time::timeout(Duration::from_millis(300), claim(&context)).await;
+    let waited = tokio::time::timeout(ROOM, claim(&context)).await;
     assert!(waited.is_err());
     let seen = fake.lock().unwrap().seen.clone();
     server.abort();
@@ -1522,6 +1522,16 @@ async fn start_over_without_a_reboot_forgets_this_boots_claim_and_registers_agai
     );
     assert_eq!(harness.screen()["claim"]["state"], "claimable");
     assert_eq!(harness.screen()["claim"]["letters"], LETTERS);
+}
+
+/// Room for one step on a busy test machine. Only lower bounds of time are
+/// certain there (a wait lasts at least its length); every upper bound a test
+/// needs (a poll before the deadline, a deadline's poll within Manage's poll
+/// limit of the one before) gets this much, never a few milliseconds.
+const ROOM: Duration = Duration::from_secs(1);
+
+fn room_from_now() -> DateTime<Utc> {
+    Utc::now() + chrono::Duration::from_std(ROOM).unwrap()
 }
 
 /// The fake Manage just answered a regular poll of `id`.
@@ -1550,6 +1560,8 @@ async fn a_claim_in_the_deadlines_last_second_is_not_lost_to_the_poll_limit() {
     // A regular poll was answered a moment before the deadline, the
     // administrator claimed right after it, and the deadline's poll comes
     // within the same second: Manage answers `429`, which is no answer.
+    // Manage's limit is one tick here: the deadline's poll lands within it
+    // (ROOM), and its retry waits the tick `Retry-After` names.
     let id = Uuid::new_v4();
     let session = Uuid::new_v4();
     let bytes = envelope(session, 30);
@@ -1558,7 +1570,7 @@ async fn a_claim_in_the_deadlines_last_second_is_not_lost_to_the_poll_limit() {
     let harness = Harness::new(origin);
     saved_registration(&harness, id);
     let mut context = harness.context();
-    context.tick = Duration::from_millis(50);
+    context.tick = ROOM;
     polled_just_now(&fake, id, context.tick);
     let taken = last_poll(&context).await.unwrap().unwrap();
     let seen = fake.lock().unwrap().seen.clone();
@@ -1569,33 +1581,41 @@ async fn a_claim_in_the_deadlines_last_second_is_not_lost_to_the_poll_limit() {
         [StatusCode::TOO_MANY_REQUESTS, StatusCode::OK]
     );
 
-    // The same through the deadline: the loop's last regular poll lands
-    // shortly before it, the claim right after.
-    let mut fast = claimable(id);
-    fast["poll_after_seconds"] = json!(2);
+    // The same through the deadline: the loop's regular poll lands before
+    // it, the claim right after. The regular poll is the loop's first request
+    // (the registration is known) and its answer puts the next one far past
+    // the deadline. Polled at once, deadline at ROOM, Manage's limit (one
+    // tick) lifts at 2 × ROOM: the regular poll has ROOM to land before the
+    // deadline, and the deadline's poll ROOM to land within the limit.
+    let mut slow = claimable(id);
+    slow["poll_after_seconds"] = json!(60);
     let (origin, fake, server) = fake_manage(
         vec![
-            (StatusCode::CREATED, fast.clone()),
-            (StatusCode::OK, fast),
+            (StatusCode::OK, slow),
             (StatusCode::OK, claimed(id, session, &bytes)),
         ],
         None,
     )
     .await;
     let harness = Harness::new(origin);
+    saved_registration(&harness, id);
     let mut context = harness.context();
-    context.tick = Duration::from_millis(400);
+    context.tick = ROOM * 2;
     fake.lock().unwrap().poll_interval = context.tick;
-    // Registered at 0, polled at 800 ms, deadline at 1000 ms.
-    let deadline = Utc::now() + chrono::Duration::milliseconds(1000);
-    let taken = claim_until(&context, deadline).await.unwrap().unwrap();
+    let taken = claim_until(&context, room_from_now())
+        .await
+        .unwrap()
+        .unwrap();
     let seen = fake.lock().unwrap().seen.clone();
     server.abort();
     assert_eq!(taken.verified.envelope.session_id, session);
+    assert!(
+        seen.iter()
+            .all(|seen| seen.path == format!("{REGISTRATIONS_PATH}/{id}/status"))
+    );
     assert_eq!(
         seen.iter().map(|seen| seen.answered).collect::<Vec<_>>(),
         [
-            StatusCode::CREATED,
             StatusCode::OK,
             StatusCode::TOO_MANY_REQUESTS,
             StatusCode::OK
@@ -1640,7 +1660,7 @@ async fn a_poll_refused_as_too_fast_never_reads_as_a_registration_still_there() 
     let harness = Harness::new(origin);
     saved_registration(&harness, id);
     let mut context = harness.context();
-    context.tick = Duration::from_millis(50);
+    context.tick = ROOM;
     polled_just_now(&fake, id, context.tick);
     assert!(registration_gone(&context).await);
     let seen = fake.lock().unwrap().seen.clone();
