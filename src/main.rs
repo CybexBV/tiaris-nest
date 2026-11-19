@@ -30,84 +30,6 @@ async fn main() -> anyhow::Result<()> {
     if let Command::RehearseApplianceDatabase { database, output } = &command {
         return tiaris_nest::appliance::nixos::rehearse_database(database, output).await;
     }
-    if let Command::GenerateStateBackupKey {
-        private_key,
-        public_key,
-    } = &command
-    {
-        let fingerprint = tiaris_nest::state_backup::generate_key(private_key, public_key)?;
-        println!(
-            "{}",
-            serde_json::json!({"recipient_fingerprint": fingerprint})
-        );
-        return Ok(());
-    }
-    if let Command::BackupApplianceState {
-        recipient,
-        output,
-        state_dir,
-    } = &command
-    {
-        if tiaris_nest::appliance::is_managed_appliance() && effective_uid() != 0 {
-            bail!("a Nest state backup must run as root");
-        }
-        let summary = tiaris_nest::state_backup::backup(state_dir, recipient, output).await?;
-        println!("{}", serde_json::to_string(&summary)?);
-        return Ok(());
-    }
-    if let Command::SetStateBackupKey {
-        public_key,
-        state_dir,
-    } = &command
-    {
-        if tiaris_nest::appliance::is_managed_appliance() && effective_uid() != 0 {
-            bail!("setting the Nest backup key must run as root");
-        }
-        let fingerprint = tiaris_nest::state_backup::schedule::set_key(state_dir, public_key)?;
-        println!(
-            "{}",
-            serde_json::json!({"recipient_fingerprint": fingerprint})
-        );
-        return Ok(());
-    }
-    if let Command::ScheduledStateBackup {
-        state_dir,
-        backup_dir,
-    } = &command
-    {
-        if tiaris_nest::appliance::is_managed_appliance() && effective_uid() != 0 {
-            bail!("a Nest state backup must run as root");
-        }
-        let outcome = tiaris_nest::state_backup::schedule::run(state_dir, backup_dir).await?;
-        println!("{}", serde_json::to_string(&outcome)?);
-        return Ok(());
-    }
-    if let Command::RestoreApplianceState {
-        backup,
-        identity,
-        state_dir,
-        scope,
-        dry_run,
-    } = &command
-    {
-        if tiaris_nest::appliance::is_managed_appliance() {
-            if effective_uid() != 0 {
-                bail!("a Nest state restore must run as root");
-            }
-            let running = std::process::Command::new("systemctl")
-                .args(["is-active", "--quiet", "tiaris-nest.service"])
-                .status()
-                .is_ok_and(|status| status.success());
-            if running && !dry_run {
-                bail!("stop the Nest first: systemctl stop tiaris-nest.service");
-            }
-        }
-        let summary =
-            tiaris_nest::state_backup::restore(backup, identity, state_dir, *scope, *dry_run)
-                .await?;
-        println!("{}", serde_json::to_string(&summary)?);
-        return Ok(());
-    }
     if matches!(command, Command::VerifyApplianceUpdatePolicy) {
         println!(
             "{}",
@@ -231,14 +153,8 @@ async fn main() -> anyhow::Result<()> {
         Command::ValidateApplianceConfig => {
             unreachable!("validate-appliance-config exits before database setup")
         }
-        Command::VerifyApplianceDatabase { .. }
-        | Command::RehearseApplianceDatabase { .. }
-        | Command::GenerateStateBackupKey { .. }
-        | Command::BackupApplianceState { .. }
-        | Command::SetStateBackupKey { .. }
-        | Command::ScheduledStateBackup { .. }
-        | Command::RestoreApplianceState { .. } => {
-            unreachable!("database and state commands exit before config loading")
+        Command::VerifyApplianceDatabase { .. } | Command::RehearseApplianceDatabase { .. } => {
+            unreachable!("database commands exit before config loading")
         }
         Command::VerifyApplianceUpdatePolicy => {
             unreachable!("policy verification exits before config loading")
@@ -295,11 +211,6 @@ fn managed_command_requires_service_user(
                 | Command::VerifyApplianceUpdatePolicy
                 | Command::VerifyApplianceDatabase { .. }
                 | Command::RehearseApplianceDatabase { .. }
-                | Command::GenerateStateBackupKey { .. }
-                | Command::BackupApplianceState { .. }
-                | Command::SetStateBackupKey { .. }
-                | Command::ScheduledStateBackup { .. }
-                | Command::RestoreApplianceState { .. }
                 | Command::ApplyApplianceUpdateSchedule
                 | Command::CheckApplianceUpdateSchedule
                 | Command::VerifyApplianceCandidateUpdate
@@ -344,7 +255,6 @@ async fn run_server(
     if state.config.manage.enabled {
         tiaris_nest::manage::spawn(state.clone());
         tiaris_nest::software_cache_upload::spawn(state.clone());
-        tiaris_nest::state_backup::upload::spawn(state.clone());
         tiaris_nest::site_check::spawn(state.clone());
     }
     tiaris_nest::console_status::spawn(state.clone());
