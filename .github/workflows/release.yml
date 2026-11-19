@@ -397,6 +397,10 @@ jobs:
             mv "$RUNNER_TEMP/tiaris-nest-template/tiaris-nest-appliance-template-$version-x86_64-linux.iso" dist/
             mv "$RUNNER_TEMP/tiaris-nest-template/tiaris-nest-appliance-template-$version-x86_64-linux.json" \
               "$RUNNER_TEMP/tiaris-nest-appliance-template-metadata.json"
+            # The USB installer stick is a release asset beside the template ISO.
+            mv "$RUNNER_TEMP/tiaris-nest-template/tiaris-usb-installer.img" "dist/tiaris-usb-installer-$version.img"
+            mv "$RUNNER_TEMP/tiaris-nest-template/tiaris-usb-installer.json" \
+              "$RUNNER_TEMP/tiaris-usb-installer-record.json"
           }
           # The workstation runtime, the Nest system closure and the setup media
           # share only the pinned Tiaris agent and kiosk, which Nix's store locks
@@ -509,6 +513,9 @@ jobs:
             --appliance-system-closure-metadata "$RUNNER_TEMP/tiaris-nest-appliance-closure-metadata.json" \
             --appliance-system-closure-url "$artifact_base/tiaris-nest-appliance-closure-$version-x86_64-linux.tar.zst" \
             "${workstation_args[@]}" \
+            --usb-installer-image "dist/tiaris-usb-installer-$version.img" \
+            --usb-installer-image-url "$artifact_base/tiaris-usb-installer-$version.img" \
+            --usb-installer-image-record "$RUNNER_TEMP/tiaris-usb-installer-record.json" \
             --workstation-netboot-runtime-version "${{ steps.workstation-source.outputs.runtime_version }}" \
             --workstation-netboot-manage-revision "${{ steps.workstation-source.outputs.revision }}" \
             --workstation-netboot-nixpkgs-revision "${{ steps.workstation-source.outputs.nixpkgs_revision }}" \
@@ -536,6 +543,7 @@ jobs:
               tiaris-nest-x86_64-linux
               "tiaris-nest-appliance-template-$version-x86_64-linux.iso"
               "tiaris-nest-appliance-closure-$version-x86_64-linux.tar.zst"
+              "tiaris-usb-installer-$version.img"
               "${{ steps.workstation-source.outputs.bundle_name }}"
               tiaris-nest-release.json
               tiaris-nest-release-compatibility.json
@@ -732,6 +740,7 @@ jobs:
             tiaris-nest-x86_64-linux
             "tiaris-nest-appliance-template-$version-x86_64-linux.iso"
             "tiaris-nest-appliance-closure-$version-x86_64-linux.tar.zst"
+            "tiaris-usb-installer-$version.img"
             "$TIARIS_NEST_WORKSTATION_BUNDLE_NAME"
           )
           case "$TIARIS_NEST_HAS_PREDECESSOR" in
@@ -770,6 +779,7 @@ jobs:
             --appliance-system-closure "dist/tiaris-nest-appliance-closure-$version-x86_64-linux.tar.zst" \
             --workstation-netboot-bundle "dist/$TIARIS_NEST_WORKSTATION_BUNDLE_NAME" \
             --workstation-netboot-tree "$RUNNER_TEMP/tiaris-workstation-netboot-verify" \
+            --usb-installer-image "dist/tiaris-usb-installer-$version.img" \
             --trusted-public-key "$TIARIS_NEST_UPDATE_TRUSTED_PUBLIC_KEY"
           artifact_base="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/$GITHUB_REF_NAME"
           python3 -B tools/nest-release.py verify-compatibility \
@@ -811,6 +821,7 @@ jobs:
             dist/tiaris-nest-x86_64-linux
             dist/tiaris-nest-appliance-template-${{ env.TIARIS_NEST_RELEASE_VERSION }}-x86_64-linux.iso
             dist/tiaris-nest-appliance-closure-${{ env.TIARIS_NEST_RELEASE_VERSION }}-x86_64-linux.tar.zst
+            dist/tiaris-usb-installer-${{ env.TIARIS_NEST_RELEASE_VERSION }}.img
             dist/${{ env.TIARIS_NEST_WORKSTATION_BUNDLE_NAME }}
             dist/tiaris-nest-release.json
             dist/tiaris-nest-release-compatibility.json
@@ -878,17 +889,18 @@ jobs:
               --arg template "tiaris-nest-appliance-template-$TIARIS_NEST_RELEASE_VERSION-x86_64-linux.iso" \
               --arg closure "tiaris-nest-appliance-closure-$TIARIS_NEST_RELEASE_VERSION-x86_64-linux.tar.zst" \
               --arg netboot "$TIARIS_NEST_WORKSTATION_BUNDLE_NAME" \
+              --arg stick "tiaris-usb-installer-$TIARIS_NEST_RELEASE_VERSION.img" \
               --arg manifest "tiaris-nest-release.json" \
               --arg compatibility "tiaris-nest-release-compatibility.json" \
               --arg checksums "SHA256SUMS" \
               --arg predecessor_identity "tiaris-nest-build-predecessor.json" \
               'type == "array"
-               and length <= 8
+               and length <= 9
                and ((map(.name) | length) == (map(.name) | unique | length))
                and all(.[].name;
                  . == $binary or . == $manifest
                  or . == $compatibility
-                 or . == $template or . == $closure or . == $netboot or . == $checksums
+                 or . == $template or . == $closure or . == $netboot or . == $stick or . == $checksums
                  or . == $predecessor_identity)' \
               "$stale_assets" >/dev/null
             gh api --method DELETE \
@@ -922,6 +934,7 @@ jobs:
             dist/tiaris-nest-x86_64-linux
             "dist/tiaris-nest-appliance-template-$TIARIS_NEST_RELEASE_VERSION-x86_64-linux.iso"
             "dist/tiaris-nest-appliance-closure-$TIARIS_NEST_RELEASE_VERSION-x86_64-linux.tar.zst"
+            "dist/tiaris-usb-installer-$TIARIS_NEST_RELEASE_VERSION.img"
             "dist/$TIARIS_NEST_WORKSTATION_BUNDLE_NAME"
             dist/tiaris-nest-release.json
             dist/tiaris-nest-release-compatibility.json
@@ -959,6 +972,7 @@ jobs:
             dist/tiaris-nest-x86_64-linux
             "dist/tiaris-nest-appliance-template-$TIARIS_NEST_RELEASE_VERSION-x86_64-linux.iso"
             "dist/tiaris-nest-appliance-closure-$TIARIS_NEST_RELEASE_VERSION-x86_64-linux.tar.zst"
+            "dist/tiaris-usb-installer-$TIARIS_NEST_RELEASE_VERSION.img"
             "dist/$TIARIS_NEST_WORKSTATION_BUNDLE_NAME"
             dist/tiaris-nest-release.json
             dist/tiaris-nest-release-compatibility.json

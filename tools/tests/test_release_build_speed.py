@@ -295,7 +295,8 @@ done
 mkdir -p "$output"
 if [ "$name" = build-template.sh ]; then
   touch "$output/tiaris-nest-appliance-template-$BUILD_VERSION-x86_64-linux.iso" \\
-    "$output/tiaris-nest-appliance-template-$BUILD_VERSION-x86_64-linux.json"
+    "$output/tiaris-nest-appliance-template-$BUILD_VERSION-x86_64-linux.json" \\
+    "$output/tiaris-usb-installer.img" "$output/tiaris-usb-installer.json"
 fi
 printf '%s end\\n' "$name" >> "$FAKE_LOG"
 '''
@@ -359,6 +360,9 @@ class ReleaseBuildScriptTests(unittest.TestCase):
         self.assertIn('inspect inspect-workstation-netboot', log)
         self.assertTrue((self.work / 'dist/tiaris-nest-appliance-template-0.2.151-x86_64-linux.iso').is_file())
         self.assertTrue((self.root / 'scratch/tiaris-nest-appliance-template-metadata.json').is_file())
+        # The stick is a release asset beside the ISO; its build record stays outside dist.
+        self.assertTrue((self.work / 'dist/tiaris-usb-installer-0.2.151.img').is_file())
+        self.assertTrue((self.root / 'scratch/tiaris-usb-installer-record.json').is_file())
         self.assertTrue((self.work / 'dist' / self.environment['BUILD_BUNDLE']).is_file())
         for component in ('manifest.json', 'bzImage', 'initrd', 'nix-store.squashfs'):
             self.assertTrue((self.root / 'scratch/tiaris-workstation-netboot-tree' / component).is_file())

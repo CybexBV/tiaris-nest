@@ -148,11 +148,14 @@ class ProductionTests(unittest.TestCase):
                 build['export_usb_installer'](stick, other)
             self.assertEqual(list(other.iterdir()), [])
 
-    def test_template_build_exports_the_stick_only_when_tiaris_builds_one(self):
+    def test_every_template_build_exports_the_stick(self):
         source = (HELPERS.parent / 'build.py').read_text()
-        self.assertIn("'-A', 'usbInstallerAvailable'", source)
+        self.assertIn("export_usb_installer(nix('usbInstaller'), output)", source)
         nix = (HELPERS.parent / 'default.nix').read_text()
-        self.assertIn('usbInstallerAvailable = usbInstaller != null;', nix)
+        # No "this Tiaris revision has no stick" path: such a revision does not build.
+        for optional in ('usbInstallerAvailable', 'pathExists'):
+            self.assertNotIn(optional, source)
+            self.assertNotIn(optional, nix)
         # The installed Nest neither carries nor serves the stick.
         self.assertNotIn('usbInstaller', (HELPERS.parent / 'module.nix').read_text())
 

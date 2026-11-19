@@ -61,6 +61,7 @@ def asset_paths(values):
         'tiaris-nest-x86_64-linux',
         f'tiaris-nest-appliance-template-{version}-x86_64-linux.iso',
         f'tiaris-nest-appliance-closure-{version}-x86_64-linux.tar.zst',
+        f'tiaris-usb-installer-{version}.img',
         bundle, 'tiaris-nest-release.json', 'tiaris-nest-release-compatibility.json', 'SHA256SUMS')]
     # Release policy fast-v1 publishes no VM qualification evidence; the
     # on-demand nest-vm-qualification.yml workflow keeps its own artifacts.
