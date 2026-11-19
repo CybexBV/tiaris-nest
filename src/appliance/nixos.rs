@@ -175,6 +175,9 @@ async fn store(update: super::ManagedApplianceUpdate<NixosRelease>) -> Result<()
         // Manage replaces a waiting update only with a newer release.
         newer(&update.release, &prior.release)
             .map_err(|_| anyhow!("another appliance update is already staged"))?;
+        // Look first, so a request that cannot be swapped now (root is
+        // preparing or installing it) is not downloaded for nothing.
+        drop(replaceable(prior)?);
     }
     validate_directory(Path::new(UPDATE_CACHE_ROOT), 0, 0o755)?;
     validate_directory(Path::new(UPDATE_BUNDLE_ROOT), 985, 0o700)?;
@@ -223,11 +226,23 @@ async fn store(update: super::ManagedApplianceUpdate<NixosRelease>) -> Result<()
 }
 
 /// Puts a newer release in place of a staged update the root updater has
-/// not started installing. Preparing ahead does not count as started: the
-/// root updater drops what it prepared for a request that changed
-/// (`generation_update.drop_prepared`).
+/// not started installing. What root prepared ahead for it does not count:
+/// root drops it for a request that changed (`generation_update.drop_prepared`).
 fn replace_waiting(prior: &StoredUpdate, stored: &StoredUpdate) -> Result<()> {
-    let Some(_lease) = crate::maintenance::try_exclusive()? else {
+    let _lease = replaceable(prior)?;
+    super::write_atomic_json(Path::new(super::UPDATE_REQUEST_PATH), stored, 0o600)?;
+    let bundle = Path::new(UPDATE_BUNDLE_ROOT).join(format!("{}.tar.zst", prior.attempt_id));
+    match fs::remove_file(&bundle) {
+        Ok(()) => super::sync_directory(Path::new(UPDATE_BUNDLE_ROOT)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// The maintenance lock, held while the staged request is still `prior` and
+/// root has not started installing it.
+fn replaceable(prior: &StoredUpdate) -> Result<crate::maintenance::BuildLease> {
+    let Some(lease) = crate::maintenance::try_exclusive()? else {
         bail!("the staged appliance update is being prepared or installed")
     };
     let staged = super::read_optional_bounded_json::<StoredUpdate>(
@@ -246,13 +261,7 @@ fn replace_waiting(prior: &StoredUpdate, stored: &StoredUpdate) -> Result<()> {
         !started(status.as_ref(), prior.attempt_id),
         "the staged appliance update has started"
     );
-    super::write_atomic_json(Path::new(super::UPDATE_REQUEST_PATH), stored, 0o600)?;
-    let bundle = Path::new(UPDATE_BUNDLE_ROOT).join(format!("{}.tar.zst", prior.attempt_id));
-    match fs::remove_file(&bundle) {
-        Ok(()) => super::sync_directory(Path::new(UPDATE_BUNDLE_ROOT)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
-    }
+    Ok(lease)
 }
 
 /// Whether the root updater reported more than waiting for this attempt.
