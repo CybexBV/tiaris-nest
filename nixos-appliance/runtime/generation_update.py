@@ -406,14 +406,15 @@ def prepared_receipt_path(attempt):
 
 def waiting_for():
     """None when the signed policy lets the update start now, else the stage
-    it waits in: the Nest being busy (`nest_busy`)."""
+    it waits in: the Nest being busy (`nest_busy`); and why, in plain words,
+    as the policy check said it (its last line)."""
     result = subprocess.run([WINDOW, str(CONTROL / 'install-plan.json')], timeout=30,
                             capture_output=True, text=True)
-    if result.returncode == 0:
-        return None
-    if result.returncode != 75:
+    if result.returncode not in (0, 75):
         raise ValueError('invalid update policy')
-    return 'nest_busy'
+    lines = result.stdout.strip().splitlines()
+    waiting = None if result.returncode == 0 else 'nest_busy'
+    return waiting, lines[-1] if len(lines) > (waiting is not None) else ''
 
 
 def prepared_update():
@@ -441,14 +442,19 @@ def prepared_update():
     return prepared
 
 
-def started(attempt):
-    """Whether this attempt already reported activation. Reports only move
-    forward, so after a crash it never goes back to waiting."""
+def last_report(attempt):
+    """This attempt's last status report, else an empty one."""
     try:
         status = load(STATUS / 'appliance-update-status.json')
     except (OSError, ValueError):
-        return False
-    return status.get('attempt_id') == attempt and status.get('status') == 'preparing'
+        return {}
+    return status if status.get('attempt_id') == attempt else {}
+
+
+def started(attempt):
+    """Whether this attempt already reported activation. Reports only move
+    forward, so after a crash it never goes back to waiting."""
+    return last_report(attempt).get('status') == 'preparing'
 
 
 def request_identity(request):
@@ -607,7 +613,18 @@ def stage():
         if prepared is None:
             drop_prepared()
             prepared = prepare()
-        waiting = None if started(prepared['attempt_id']) else waiting_for()
+        attempt = prepared['attempt_id']
+        if started(attempt):
+            waiting = None
+        else:
+            # The journal says why the Nest starts its own update, and once
+            # per release and stage why it does not yet.
+            waiting, why = waiting_for()
+            release = prepared.get('target_release') or 'the requested release'
+            if waiting is None:
+                print(f'Starting the update to {release}, because {why or "the update policy allows it"}.', flush=True)
+            elif last_report(attempt).get('stage') != waiting:
+                print(f'Not starting the update to {release} yet, because {why or waiting}.', flush=True)
         if waiting:
             emit_status(prepared, 'waiting_window', waiting)
             return
