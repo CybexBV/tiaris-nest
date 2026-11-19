@@ -23,9 +23,15 @@ pub const PROTOCOL_SCHEMA: &str = "tiaris.nest.usb-installer.v1";
 /// protocol as `User-Agent: tiaris-usb-installer/<protocol> ...`; an older
 /// one gets `410` and tells the administrator to download a new stick.
 ///
-/// Protocol 2: the launch's session lasts a day. A protocol 1 stick refuses
-/// every launch that does not end within eleven minutes of its own clock.
-pub const MINIMUM_STICK_PROTOCOL: u32 = 2;
+/// Protocol 2 sticks check a boot grant against this Nest's clock (its `Date`
+/// header). Protocol 1 sticks used the computer's own clock and failed on a
+/// new computer with "The boot grant's time does not match this computer's
+/// clock" (Tiaris production report #29), so they are told to be made again.
+///
+/// Protocol 3 sticks hold no clock against a launch. A boot session lasts a
+/// day now, and a protocol 2 stick refuses every launch that does not end
+/// within eleven minutes, so it is told to be made again too.
+pub const MINIMUM_STICK_PROTOCOL: u32 = 3;
 const STICK_USER_AGENT_PREFIX: &str = "tiaris-usb-installer/";
 
 pub const ERROR_INVALID_REQUEST: &str = "invalid_request";
@@ -155,8 +161,8 @@ mod tests {
     #[test]
     fn stick_protocol_is_read_from_the_user_agent() {
         assert_eq!(
-            stick_protocol(&headers_with_agent("tiaris-usb-installer/1 (abc123)")),
-            Some(1)
+            stick_protocol(&headers_with_agent("tiaris-usb-installer/2 (abc123)")),
+            Some(2)
         );
         assert_eq!(
             stick_protocol(&headers_with_agent("tiaris-usb-installer/12")),
@@ -172,8 +178,14 @@ mod tests {
 
     #[test]
     fn only_a_stick_older_than_the_minimum_is_rejected() {
-        assert!(reject_outdated_stick(&headers_with_agent("tiaris-usb-installer/2")).is_none());
+        assert!(reject_outdated_stick(&headers_with_agent("tiaris-usb-installer/3")).is_none());
+        assert!(reject_outdated_stick(&headers_with_agent("tiaris-usb-installer/4")).is_none());
         assert!(reject_outdated_stick(&headers_with_agent("curl/8.0")).is_none());
+        // A stick that expects a ten-minute launch (protocol 2) is made again.
+        let rejected = reject_outdated_stick(&headers_with_agent("tiaris-usb-installer/2"))
+            .expect("protocol 2 is outdated");
+        assert_eq!(rejected.status(), StatusCode::GONE);
+        // A stick from before the Nest-clock check (protocol 1) is made again.
         let rejected = reject_outdated_stick(&headers_with_agent("tiaris-usb-installer/1"))
             .expect("protocol 1 is outdated");
         assert_eq!(rejected.status(), StatusCode::GONE);

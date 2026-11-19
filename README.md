@@ -358,7 +358,9 @@ November 2026); it answers the stick protocol:
   `GET /usb-installer/v1/select/<profile>` launches a menu choice as
   `/boot/select` does; `GET /usb-installer/v1/runtime` names the active
   runtime without creating a session. A stick older than
-  `MINIMUM_STICK_PROTOCOL` gets `410`.
+  `MINIMUM_STICK_PROTOCOL` (3: sticks that hold no clock against a launch,
+  whose session lasts a day) gets `410 usb_installer_outdated`, and its screen
+  says to download the USB installer again.
 
 A boot session lives 24 hours (`BOOT_SESSION_SECONDS` in `src/netboot.rs`), and
 its grant, the computer's permission to enroll with Tiaris, names that same
@@ -369,12 +371,13 @@ the installer sets its clock from the `Date` of this Nest's answers.
 The stick starts the runtime with `kexec`; the grant, enrollment and approval
 are those of network boot, and its Wi-Fi password never reaches Nest.
 
-`build-template.sh` writes the stick image beside the template ISO, as
-`tiaris-usb-installer.img` and its build record `tiaris-usb-installer.json`
-(checked against each other), when the pinned Tiaris revision builds a stick.
-Tiaris publishes that copy as a public download (Tiaris `docs/downloads.md`).
-It is not a release asset, not part of the installed Nest, and nothing signed
-changes: the release manifest keeps its exact keys.
+Every Nest release carries the stick. `build-template.sh` writes the image
+beside the template ISO, as `tiaris-usb-installer.img` and its build record
+`tiaris-usb-installer.json` (checked against each other). The release
+publishes it as the asset `tiaris-usb-installer-VERSION.img` and names it in
+the signed manifest (`usb_installer_image_v1`, see `RELEASES.md`). Tiaris
+mirrors that asset to its public downloads (Tiaris `docs/downloads.md`). It is
+not part of the installed Nest.
 
 ## Retired rootfs multicast
 
@@ -467,9 +470,10 @@ keeps serving: root independently verifies the bounded archive and the live
 SQLite migration inventory, imports and roots its closure, checks it against the
 release and rehearses the database (status `waiting_window`, stage
 `preparing_ahead`). Nothing touches boot state yet. Signed policy then admits
-the switch: **Update now**, the Nest being idle (mode `when_idle`, the default
-from Manage), or the maintenance window (mode `window`, and every v1 policy).
-While it waits the stage is `nest_busy` or `maintenance_window`. At the switch
+the switch: **Update now**, the Nest being idle, or the night period the policy
+names (the deadline for a Nest that is never idle). There are no modes: a policy
+signed earlier with mode `window` is read the same way. While it waits the stage
+is `nest_busy`. At the switch
 root checks the closure again, seals the next generation and selects it for one
 boot. Holds, active builds, maintenance leases and network transactions defer
 it. The service polls requests every 30 seconds.

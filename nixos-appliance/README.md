@@ -80,11 +80,13 @@ python3 tools/pack-system-closure.py \
   --metadata-output "$SIGNED_CLOSURE_METADATA"
 ```
 
-`$ISO_OUTPUT` receives the template ISO and its JSON record, and, when the pinned
-Tiaris revision builds a USB installer stick, `tiaris-usb-installer.img` and
-`tiaris-usb-installer.json` copied from the `usbInstaller` store path (unsigned,
-not release assets, not in the installed system; Tiaris publishes them as
-public downloads and the Nest does not serve them).
+`$ISO_OUTPUT` receives the template ISO and its JSON record, and the USB installer
+stick: `tiaris-usb-installer.img` and its build record `tiaris-usb-installer.json`,
+copied from the `usbInstaller` store path. Release signing publishes the image as
+`tiaris-usb-installer-VERSION.img` and names it in the manifest
+(`nest-release.py manifest --usb-installer-image ... --usb-installer-image-record ...`).
+It is not in the installed system and the Nest does not serve it. A pinned Tiaris
+revision without a stick does not build.
 
 ## Disk and state contract
 

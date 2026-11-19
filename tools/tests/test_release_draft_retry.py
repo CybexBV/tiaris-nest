@@ -15,6 +15,7 @@ ASSETS = [
     'tiaris-nest-x86_64-linux',
     'tiaris-nest-appliance-template-0.2.2-x86_64-linux.iso',
     'tiaris-nest-appliance-closure-0.2.2-x86_64-linux.tar.zst',
+    'tiaris-usb-installer-0.2.2.img',
     BUNDLE, 'tiaris-nest-release.json', 'tiaris-nest-release-compatibility.json',
     'SHA256SUMS', 'tiaris-nest-build-predecessor.json',
 ]
