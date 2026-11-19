@@ -10,7 +10,7 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     str::FromStr,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -178,6 +178,9 @@ struct AgentBootConfigResponse {
     /// The computers Tiaris knows, by hardware fingerprint (`boot_machines`).
     #[serde(default)]
     machines: Vec<ManagedBootMachine>,
+    /// `machines` names every computer Tiaris knows.
+    #[serde(default)]
+    machines_complete: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -875,17 +878,22 @@ async fn sync_boot_foundation(state: &AppState, managed: &mut ManagedState) -> R
         Ok(false) => {}
         Err(error) => retain_sync_failure(&mut first_failure, "boot event discovery", error),
     }
-    match fetch_boot_config(state, managed).await {
-        Ok(config) => {
-            if let Err(error) = apply_boot_config(state, &config).await {
-                retain_sync_failure(&mut first_failure, "boot desired configuration", error);
-            }
+    {
+        let mut newest = BOOT_CONFIG_SYNC.lock().await;
+        let started = Instant::now();
+        match fetch_boot_config(state, managed).await {
+            Ok(config) => match apply_boot_config(state, &config).await {
+                Ok(()) => *newest = Some(started),
+                Err(error) => {
+                    retain_sync_failure(&mut first_failure, "boot desired configuration", error)
+                }
+            },
+            Err(error) => retain_sync_failure(
+                &mut first_failure,
+                "boot desired configuration fetch",
+                error,
+            ),
         }
-        Err(error) => retain_sync_failure(
-            &mut first_failure,
-            "boot desired configuration fetch",
-            error,
-        ),
     }
     match report_boot_state(state, managed).await {
         Ok(()) => {
@@ -896,6 +904,63 @@ async fn sync_boot_foundation(state: &AppState, managed: &mut ManagedState) -> R
         Err(error) => retain_sync_failure(&mut first_failure, "boot state report", error),
     }
     first_failure.map_or(Ok(()), Err)
+}
+
+/// One fetch-and-apply of Manage's boot configuration at a time, so an older
+/// answer never replaces a newer one. Holds when the newest applied answer
+/// was asked for.
+static BOOT_CONFIG_SYNC: tokio::sync::Mutex<Option<Instant>> = tokio::sync::Mutex::const_new(None);
+const BOOT_CONFIG_REFRESH_WAIT: Duration = Duration::from_secs(5);
+
+/// Bring Manage's boot configuration up to date now, for a network boot that
+/// is about to be answered from the list of installed computers. A computer
+/// that just finished installing restarts within seconds, sooner than the
+/// regular sync. Returns whether the configuration is at least as new as
+/// this call; a network boot waits at most a few seconds for it.
+pub async fn refresh_boot_config(state: &AppState) -> bool {
+    if ensure_manage_enabled(state).is_err() {
+        return false;
+    }
+    let asked = Instant::now();
+    let Ok(mut newest) =
+        tokio::time::timeout(BOOT_CONFIG_REFRESH_WAIT, BOOT_CONFIG_SYNC.lock()).await
+    else {
+        return false;
+    };
+    // Another boot, or the regular sync, asked after this one arrived.
+    if newest.is_some_and(|started| started >= asked) {
+        return true;
+    }
+    let Ok(managed) = load_managed_state(state) else {
+        return false;
+    };
+    if require_activated_identity(&managed).is_err() {
+        return false;
+    }
+    let started = Instant::now();
+    let config = match tokio::time::timeout(
+        BOOT_CONFIG_REFRESH_WAIT,
+        fetch_boot_config(state, &managed),
+    )
+    .await
+    {
+        Ok(Ok(config)) => config,
+        Ok(Err(error)) => {
+            debug!(error = %safe_error(&error), "could not refresh the boot configuration for a network boot");
+            return false;
+        }
+        Err(_) => return false,
+    };
+    match apply_boot_config(state, &config).await {
+        Ok(()) => {
+            *newest = Some(started);
+            true
+        }
+        Err(error) => {
+            warn!(error = %safe_error(&error), "could not apply the boot configuration refreshed for a network boot");
+            false
+        }
+    }
 }
 
 fn retain_sync_failure(
@@ -2317,6 +2382,7 @@ async fn save_boot_machines(
             .machines
             .iter()
             .map(|machine| (machine.fingerprint.clone(), machine.installed)),
+        config.machines_complete,
     );
     crate::boot_machines::save(data_dir, &record).await
 }
@@ -4554,6 +4620,128 @@ mod tests {
         assert!(report.get("one_time_profile_id").is_none());
     }
 
+    /// A network boot that would get the installer on the list's word asks
+    /// Manage first: a computer that just finished installing restarts
+    /// within seconds, sooner than the regular sync.
+    #[tokio::test]
+    async fn a_network_boot_learns_at_once_that_a_computer_finished_installing() {
+        let root =
+            std::env::temp_dir().join(format!("tiaris-nest-boot-refresh-{}", Uuid::new_v4()));
+        let fingerprint = "a".repeat(64);
+        let body = json!({
+            "compatibility": {
+                "protocol_version": TIARIS_COMPONENT_PROTOCOL_VERSION,
+                "minimum_nest_protocol": 1,
+                "maximum_nest_protocol": TIARIS_COMPONENT_PROTOCOL_VERSION,
+                "manage_version": "0.1.0",
+                "manage_release": "test",
+            },
+            "settings": {
+                "public_base_url": "http://127.0.0.1",
+                "listen_addr": "127.0.0.1:8080",
+                "tftp_root": "/srv/tiaris-nest/tftp",
+                "http_root": "/srv/tiaris-nest/www",
+                "bootloader_filename": "ipxe.efi",
+                "menu_timeout_ms": 10_000,
+            },
+            "profiles": [],
+            "profiles_complete": true,
+            "clients": [],
+            "clients_complete": true,
+            "machines": [{"fingerprint": fingerprint, "installed": true}],
+            "machines_complete": true,
+        })
+        .to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let manage = tokio::spawn(async move {
+            let mut asked = 0;
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = vec![0u8; 8192];
+                let read = socket.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..read]).to_string();
+                assert!(
+                    request.starts_with("GET /v1/agent/devices/nest-123/boot/config "),
+                    "{request}"
+                );
+                asked += 1;
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                if asked == 2 {
+                    break;
+                }
+            }
+        });
+
+        let mut config = AppConfig::default();
+        config.manage.enabled = true;
+        config.manage.api_url = format!("http://{address}");
+        config.manage.organization_id = "org-123".to_string();
+        config.manage.state_path = root.join("manage-state.json");
+        config.paths.data_dir = root.join("data");
+        let state = AppState::new(config, managed_test_pool().await);
+        let signing = SigningKey::from_bytes(&[11_u8; 32]);
+        write_secure_json(
+            &state.config.manage.state_path,
+            &ManagedState {
+                device_id: Some("nest-123".to_string()),
+                private_key_b64: Some(STANDARD.encode(signing.to_bytes())),
+                ..ManagedState::default()
+            },
+        )
+        .unwrap();
+        let data_dir = &state.config.paths.data_dir;
+        let identity = crate::boot_machines::BootIdentity {
+            fingerprint: Some(fingerprint.clone()),
+            ..Default::default()
+        };
+        // The last regular sync: still being installed.
+        let installing = crate::boot_machines::Record {
+            machines: [(fingerprint.clone(), false)].into(),
+            machines_complete: true,
+            ..Default::default()
+        };
+        crate::boot_machines::save(data_dir, &installing)
+            .await
+            .unwrap();
+
+        assert!(refresh_boot_config(&state).await);
+        assert_eq!(
+            crate::boot_machines::load(data_dir).install_state(&identity),
+            crate::boot_machines::InstallState::Installed
+        );
+
+        // A second boot asks again: nothing newer was asked for since.
+        crate::boot_machines::save(data_dir, &installing)
+            .await
+            .unwrap();
+        assert!(refresh_boot_config(&state).await);
+        assert_eq!(
+            crate::boot_machines::load(data_dir).install_state(&identity),
+            crate::boot_machines::InstallState::Installed
+        );
+        manage.await.unwrap();
+
+        // Manage does not answer: the last list stands.
+        crate::boot_machines::save(data_dir, &installing)
+            .await
+            .unwrap();
+        assert!(!refresh_boot_config(&state).await);
+        assert_eq!(
+            crate::boot_machines::load(data_dir).install_state(&identity),
+            crate::boot_machines::InstallState::NotInstalled
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
     #[tokio::test]
     async fn managed_sync_keeps_the_computer_each_reinstall_is_for() {
         let pool = managed_test_pool().await;
@@ -4580,6 +4768,7 @@ mod tests {
             fingerprint: "c".repeat(64),
             installed: true,
         }];
+        config.machines_complete = true;
 
         let mut tx = pool.begin().await.unwrap();
         sync_profiles(&mut tx, &config.profiles, true)
@@ -4599,12 +4788,14 @@ mod tests {
         assert_eq!(named.fingerprints, vec![fingerprint]);
         assert!(named.required);
         assert_eq!(record.machines.get(&"c".repeat(64)), Some(&true));
+        assert!(record.machines_complete);
 
         // Once Manage withdraws the binding, the computer is forgotten too.
         config.clients[0].reinstall_request_id = None;
         config.clients[0].managed_device_id = None;
         config.clients[0].reinstall_machine = None;
         config.machines.clear();
+        config.machines_complete = false;
         let mut tx = pool.begin().await.unwrap();
         let profile_map = managed_profile_map(&mut tx).await.unwrap();
         sync_clients(&mut tx, &config.clients, &profile_map, true)
@@ -6000,6 +6191,7 @@ mod tests {
             deleted_client_ids: vec![],
             clients_complete: true,
             machines: vec![],
+            machines_complete: false,
         }
     }
 

@@ -3157,6 +3157,7 @@ mod tests {
     use super::*;
     include!("netboot_transport_tests.rs");
     include!("usb_installer_route_tests.rs");
+    include!("boot_install_state_route_tests.rs");
     use ed25519_dalek::SigningKey;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},

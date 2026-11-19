@@ -309,6 +309,41 @@ queued and converges when it next checks in. Nest reports only bounded error
 codes and never treats a wake receipt as proof that a workstation actually
 started.
 
+## What a network boot starts
+
+A computer that is not installed gets the installer every time it starts
+from the network, until it is installed. An installed computer starts from
+its disk. Tiaris decides which it is, not whether the Nest saw the MAC address
+before: the boot configuration lists the computers Tiaris knows by the
+fingerprint of their system UUID (`machines: [{fingerprint, installed}]`) and
+says whether that list is complete (`machines_complete`). `autoexec.ipxe`
+sends the UUID (`uuid=${uuid}`).
+
+| The computer | Starts |
+| --- | --- |
+| Has a profile assigned on its MAC (a reinstall Tiaris asked for, a custom profile) | that profile |
+| Listed as installed | its disk, then the menu |
+| Listed as not installed: waiting for approval on Add, being installed or reinstalled, or its installation failed halfway | the installer |
+| Not in a complete list: new, or removed or rejected in Tiaris | the installer |
+| Cannot tell: no usable system UUID, or no complete list on this Nest | the installer the first time the Nest sees its MAC, afterwards its disk, then the menu |
+
+- The installer here is the one default Nest installer profile. It only
+  starts the signed installer runtime; nothing is erased before an
+  administrator approves it in Tiaris. Without exactly one default installer
+  profile the computer gets the menu.
+- Tiaris lists a computer as installed as soon as its installation has
+  finished: it restarts within seconds, before the regular sync (every 30
+  seconds). So before the Nest starts the installer on the list's word, it
+  asks Tiaris for the newest boot configuration (`manage::refresh_boot_config`,
+  at most 5 seconds; concurrent boots share one request).
+- **No fresh list is the safe default.** When Tiaris does not answer, the
+  last list stands; the installer waits for Tiaris by itself. When the Nest
+  has no complete list at all, or the computer reports no usable system UUID,
+  the old rule applies (last row of the table), so an installed computer
+  never enters the installer by itself.
+- Requests without a MAC address and the Nest's own health check never start
+  anything by themselves.
+
 ## Laptops that share one network adapter
 
 Laptops without their own network port start through a USB adapter or dock
@@ -326,12 +361,13 @@ agent reports (`sha256("tiaris-hardware-v1\ndmi_product_uuid=<uuid>")`).
   reinstall is for gets it even when the MAC is registered to another
   laptop's serial. `GET /boot/<mac>/kexec.json` is unchanged: the computer's
   own agent asks for it on Manage's signed command.
-- **Known computers.** On another computer's adapter, a computer Tiaris knows
-  (the boot configuration's `machines`) starts its local disk first when it
-  is installed, and gets the menu without the "registered to another
-  computer" notice while it is being installed; so does a computer whose
-  serial this Nest knows from another adapter. Only a computer nobody knows
-  gets the notice.
+- **Known computers.** On another computer's adapter the list from Tiaris
+  decides as on a computer's own adapter: an installed computer starts its
+  local disk first, one that is not installed gets the installer. Where
+  Tiaris cannot tell, a computer whose serial this Nest knows from another
+  adapter gets the menu, and a computer nobody knows gets the menu with the
+  "registered to another computer" notice; neither enters the installer by
+  itself.
 - Without a usable UUID the serial rule decides as before. What Manage says
   is kept in the state file `boot-identity/boot-identity.json`, written before
   the boot configuration that needs it is committed.
@@ -350,14 +386,16 @@ network, or uses the Nest address file the administrator saves on it from the
 Console. The Nest does not serve or personalize the stick (it did until
 November 2026); it answers the stick protocol:
 
-- `GET /usb-installer/v1/boot?mac=&serial_hex=` answers what `/boot/<mac>`
-  would start, with the same identification, selection, one-time consumption
-  and boot events: a `launch` (the `tiaris.nest.kexec.v1` session plus the
-  runtime's component digests) or a `menu` of installer profiles.
-  `GET /usb-installer/v1/select/<profile>` launches a menu choice as
-  `/boot/select` does; `GET /usb-installer/v1/runtime` names the active
-  runtime without creating a session. A stick older than
-  `MINIMUM_STICK_PROTOCOL` gets `410`.
+- `GET /usb-installer/v1/boot?mac=&serial_hex=` answers with a `launch` (the
+  `tiaris.nest.kexec.v1` session plus the runtime's component digests), with
+  the identification, selection, one-time consumption and boot events of
+  `/boot/<mac>`. Where `/boot/<mac>` would start the disk, custom iPXE or the
+  menu, the stick gets the default installer profile: someone started the
+  stick on that computer on purpose. There is no menu; a Nest without exactly
+  one default installer profile answers `404 profile_unavailable`. A running
+  installer asks the same question to renew its boot grant.
+  `GET /usb-installer/v1/runtime` names the active runtime without creating a
+  session. A stick older than `MINIMUM_STICK_PROTOCOL` gets `410`.
 
 The stick starts the runtime with `kexec`; the grant, enrollment and approval
 are those of network boot, and its Wi-Fi password never reaches Nest.

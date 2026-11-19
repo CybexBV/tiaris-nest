@@ -38,10 +38,6 @@ pub fn router(state: AppState) -> Router {
         .route("/boot/select/:profile_id", get(boot::boot_select_profile))
         .route("/usb-installer/v1/boot", get(usb_installer::usb_boot))
         .route("/usb-installer/v1/runtime", get(usb_installer::usb_runtime))
-        .route(
-            "/usb-installer/v1/select/:profile_id",
-            get(usb_installer::usb_select),
-        )
         .route("/files/*path", get(files::boot_file))
         .route("/cache/*path", get(files::cache_file))
         .route(
@@ -622,6 +618,7 @@ mod tests {
                 (uuid_fingerprint(UUID_INSTALLING), false),
             ]
             .into(),
+            machines_complete: false,
         };
         crate::boot_machines::save(&state.config.paths.data_dir, &record)
             .await
@@ -716,7 +713,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn laptops_tiaris_knows_on_a_shared_dock_get_no_registered_to_another_notice() {
+    async fn laptops_tiaris_knows_on_a_shared_dock_start_as_on_their_own_adapter() {
         let state = test_state().await;
         reinstall_armed_on_a_shared_dock(&state).await;
         let notice = "This network adapter is registered to another computer";
@@ -731,19 +728,17 @@ mod tests {
         assert!(!installed.contains(notice));
         assert!(!installed.contains("reinstall laptop A"));
 
-        // Being installed: the menu, no local-disk probe, and a menu that
-        // would wait for a key starts the local disk after 15 seconds.
-        let (_, installing) = boot_body(
+        // Being installed: the installer, not the menu. This state has no
+        // verified installer runtime, so the installer fails closed.
+        let (status, installing) = boot_body(
             router(state.clone()),
             &format!("/boot/aa-bb-cc-dd-ee-ff?serial=5CG1234EEE&uuid={UUID_INSTALLING}"),
         )
         .await;
-        assert!(!installing.contains("known_local"));
-        assert!(!installing.contains(notice));
-        assert!(installing.contains("set menu-timeout 15000"));
-        assert!(installing.contains(&format!("&uuid={UUID_INSTALLING} ||")));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!installing.contains("item profile_"));
 
-        // Nothing known: the notice.
+        // Tiaris cannot say (no system UUID): the menu with the notice.
         let (_, unknown) = boot_body(
             router(state.clone()),
             "/boot/aa-bb-cc-dd-ee-ff?serial=5CG1234FFF",
@@ -751,6 +746,13 @@ mod tests {
         .await;
         assert!(unknown.contains(notice));
         assert!(unknown.contains("&uuid=${uuid} ||"));
+        // So does a computer the cut list does not name.
+        let (_, unlisted) = boot_body(
+            router(state.clone()),
+            &format!("/boot/aa-bb-cc-dd-ee-ff?serial=5CG1234FFF&uuid={UUID_B}"),
+        )
+        .await;
+        assert!(unlisted.contains(notice));
     }
 
     #[tokio::test]
