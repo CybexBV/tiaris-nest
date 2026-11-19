@@ -24,6 +24,7 @@ use crate::{
     db,
     error::AppError,
     models::{BootProfile, BootProfileType, normalize_mac},
+    setup_failures::SetupFailure,
     usb_installer::{
         self, ERROR_INTERNAL, ERROR_INVALID_REQUEST, ERROR_PROFILE_UNAVAILABLE,
         ERROR_RUNTIME_UNAVAILABLE, ERROR_SESSION_UNAVAILABLE, PROTOCOL_SCHEMA, UsbBootResponse,
@@ -107,6 +108,7 @@ async fn usb_boot_inner(
         selected_profile,
     };
     let Some((profile, source)) = chosen else {
+        crate::setup_failures::record(SetupFailure::ProfileUnavailable, &mac);
         record_boot_event(state, &event(None), connect, headers).await?;
         return Ok(error_response(
             StatusCode::NOT_FOUND,

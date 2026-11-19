@@ -33,6 +33,7 @@ pub(crate) mod release_transport;
 pub mod resources;
 pub mod routes;
 pub mod schema_evolution;
+pub mod setup_failures;
 pub mod site_check;
 pub mod software_cache;
 pub mod software_cache_upload;
