@@ -16,6 +16,16 @@ The outer `tiaris.nest.release.v1` remains stable:
   closure URL/size/SHA-256, system toplevel, NixOS release, Nest/Tiaris/nixpkgs
   revisions, SQLite migration inventory and five system version anchors.
 - `workstation_netboot`: the signed kernel, bootstrap initrd and store squashfs.
+- `usb_installer_image_v1`: the generic USB installer stick for computers,
+  asset `tiaris-usb-installer-VERSION.img`. Exactly `version`, `url`,
+  `size_bytes`, `sha256`, `manage_source_revision` (the pinned Tiaris revision
+  it was built from, equal to the closure's) and `signature`, over
+  `TIARIS-NEST-USB-INSTALLER-IMAGE-V1\n` and those five values, one per line
+  in the order version, revision, size, SHA-256, URL. Releases before it have
+  no stick; every release built by `release.yml` or the development release
+  script has one. The key is not in the compatibility asset's artifact set:
+  that asset binds the whole manifest by SHA-256. Signing refuses a stick whose
+  protocol is below the Nest's `MINIMUM_STICK_PROTOCOL`.
 
 The closure filename is
 `tiaris-nest-appliance-closure-VERSION-x86_64-linux.tar.zst`. Installer admission
@@ -58,6 +68,7 @@ python3 tools/nest-release.py verify \
   --appliance-system-closure dist/tiaris-nest-appliance-closure-VERSION-x86_64-linux.tar.zst \
   --workstation-netboot-bundle "$WORKSTATION_BUNDLE" \
   --workstation-netboot-tree "$WORKSTATION_TREE" \
+  --usb-installer-image dist/tiaris-usb-installer-VERSION.img \
   --expected-manage-origin "$TIARIS_NEST_BUILD_MANAGE_ORIGIN" \
   --trusted-public-key "$TIARIS_NEST_UPDATE_TRUSTED_PUBLIC_KEY"
 ```

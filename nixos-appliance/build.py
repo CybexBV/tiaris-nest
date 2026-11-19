@@ -131,8 +131,8 @@ USB_INSTALLER_FILES = ('tiaris-usb-installer.img', 'tiaris-usb-installer.json')
 def export_usb_installer(stick, output):
     """Copy the stick image and its build record beside the template ISO.
 
-    Unsigned and outside the release manifest: Tiaris publishes it as a public download
-    (Tiaris docs/downloads.md). The record must describe the image it sits beside."""
+    Release signing names the image in the manifest (`nest-release.py manifest
+    --usb-installer-image`). The record must describe the image it sits beside."""
     image, record = (Path(stick) / name for name in USB_INSTALLER_FILES)
     metadata = json.loads(record.read_text())
     if (metadata.get('image') != USB_INSTALLER_FILES[0] or metadata.get('size_bytes') != image.stat().st_size
@@ -220,10 +220,8 @@ def build(args):
             metadata_file.write_text(json.dumps(metadata, sort_keys=True, separators=(',', ':')) + '\n')
             publish(iso, output / (name + '.iso'))
             publish(metadata_file, output / (name + '.json'))
-            # A pinned Tiaris revision without a stick builds none; nothing else changes.
-            if json.loads(run('nix-instantiate', '--eval', '--strict', '--json', expression,
-                              '-A', 'usbInstallerAvailable')):
-                export_usb_installer(nix('usbInstaller'), output)
+            # Every release carries the stick: a Tiaris revision without one does not build.
+            export_usb_installer(nix('usbInstaller'), output)
         else:
             cache, metadata = nix('unsignedCache'), nix('buildMetadata')
             require_workstation_agent_cache(cache, nix('workstationAgent'))

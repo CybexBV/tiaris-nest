@@ -183,6 +183,7 @@ jobs:
             --appliance-system-closure "dist/tiaris-nest-appliance-closure-$version-x86_64-linux.tar.zst" \
             --workstation-netboot-bundle "dist/$TIARIS_NEST_WORKSTATION_BUNDLE_NAME" \
             --workstation-netboot-tree "$tree" \
+            --usb-installer-image "dist/tiaris-usb-installer-$version.img" \
             --trusted-public-key "$TIARIS_NEST_UPDATE_TRUSTED_PUBLIC_KEY"
           artifact_base="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/$TIARIS_NEST_RELEASE_TAG"
           python3 -B tools/nest-release.py verify-compatibility \
