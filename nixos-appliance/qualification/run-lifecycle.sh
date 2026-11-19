@@ -174,8 +174,10 @@ api() {
 check_delivery_policy() {
   local delivery_policy="$work_dir/delivery-policy.json"
   api GET '/v1/nest/delivery-policy' > "$delivery_policy"
-  test "$(jq -er '.allow_nest_source_builds' "$delivery_policy")" = false
-  test "$(jq -er '.source_builds_allowed' "$delivery_policy")" = false
+  # Nest-only delivery is the source-free policy (blueprint_delivery.source_free).
+  jq -e '.effective_mode == "nest_only" and .source_builds_allowed == false
+         and .effective_preparation_mode == "cached_only" and .emergency_override_mode == null' \
+    "$delivery_policy" >/dev/null
 }
 check_delivery_policy
 

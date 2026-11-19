@@ -35,8 +35,14 @@ class DeliveryTests(unittest.TestCase):
 
     def api(self, path, body=None):
         if path == '/v1/nest/delivery-policy':
-            return {'allow_nest_source_builds': self.policy_allowed,
-                    'source_builds_allowed': self.policy_allowed, 'allow_local_builds': False,
+            # Current Manage: local builds and the stored preparation mode stay
+            # permissive; only Nest-only delivery makes it source-free.
+            return {'mode': 'connected' if self.policy_allowed else 'nest_only',
+                    'effective_mode': 'connected' if self.policy_allowed else 'nest_only',
+                    'allow_nest_source_builds': True, 'allow_local_builds': True,
+                    'source_builds_allowed': self.policy_allowed,
+                    'preparation_mode': 'approved',
+                    'effective_preparation_mode': 'approved' if self.policy_allowed else 'cached_only',
                     'emergency_override_mode': None}
         if path.endswith('/workstation-netboot'):
             runtime = copy.deepcopy(self.manifest['workstation_netboot'])

@@ -12,6 +12,7 @@ import uuid
 
 from isolated_fixture import QMP, stop, private_state, SCOPE
 from isolated_manage_transport import http_error_details
+from blueprint_delivery import source_free
 
 def now():
     return datetime.datetime.now(datetime.timezone.utc)
@@ -242,7 +243,7 @@ def run(api, state, nest, manifest, catalog, output):
     runtime_path = f'/v1/nest/nodes/{nest.device}/workstation-netboot'
     require_runtime(api(runtime_path), descriptor)
     policy = api('/v1/nest/delivery-policy')
-    if policy['allow_nest_source_builds'] or policy['source_builds_allowed']:
+    if not source_free(policy):
         raise ValueError('Workstation qualification requires the source-free delivery policy')
     blueprints = {v['slug']: v for v in catalog['blueprints']}
     first = blueprints['standard_workstation']
@@ -341,7 +342,7 @@ def run(api, state, nest, manifest, catalog, output):
                 'system': after['facts_json']['blueprint_generation']['booted_system']})
         require_runtime(api(runtime_path), descriptor)
         policy = api('/v1/nest/delivery-policy')
-        if policy['allow_nest_source_builds'] or policy['source_builds_allowed']:
+        if not source_free(policy):
             raise ValueError('Source-free delivery policy changed during workstation qualification')
     output.write_text(json.dumps({'schema': 'tiaris.nest.published-workstation-qualification.v1', 'ok': True,
         'release_version': manifest['version'], 'runtime_version': descriptor['runtime_version'],

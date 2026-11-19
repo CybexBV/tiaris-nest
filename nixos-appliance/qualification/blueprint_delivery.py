@@ -29,11 +29,22 @@ def read_catalog(api):
     return CATALOG['catalog'](rows, configs)
 
 
+def source_free(policy):
+    """Manage's one delivery switch: Nest-only delivery is the source-free policy.
+
+    Since Manage made every other delivery value fixed (local builds are always
+    stored as on), Nest-only delivery is what turns source builds off
+    (`effective_preparation_mode` `cached_only`) and leaves computers no local
+    build or public-cache fallback.
+    """
+    return (policy.get('effective_mode') == 'nest_only'
+            and policy.get('source_builds_allowed') is False
+            and policy.get('effective_preparation_mode') == 'cached_only'
+            and policy.get('emergency_override_mode') is None)
+
+
 def source_free_policy(api):
-    policy = api('/v1/nest/delivery-policy')
-    if (any(policy.get(field) is not False for field in
-            ('allow_nest_source_builds', 'source_builds_allowed', 'allow_local_builds'))
-            or policy.get('emergency_override_mode') is not None):
+    if not source_free(api('/v1/nest/delivery-policy')):
         raise ValueError('Upgraded Blueprint qualification requires the source-disabled policy')
 
 
