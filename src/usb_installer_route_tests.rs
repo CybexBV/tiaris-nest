@@ -191,7 +191,7 @@ mod usb_installer_routes {
     }
 
     #[tokio::test]
-    async fn a_known_computer_assigned_elsewhere_gets_the_installer_menu() {
+    async fn a_computer_pxe_would_not_install_still_gets_the_installer_from_the_stick() {
         let fixture = RuntimeFilesystemFixture::new().await;
         active_runtime(&fixture).await;
         let enroll = installer_profile(&fixture.state, "Enroll", true, false).await;
@@ -200,36 +200,55 @@ mod usb_installer_routes {
         computer(&fixture.state, Some("5CG1234AAA"), Some(custom), None).await;
         let app = crate::routes::router(fixture.state.clone());
 
+        // Assigned to custom iPXE, and seen before: PXE would never start the
+        // installer here. Someone started the stick on it on purpose.
         let (status, body) = get(
-            app,
+            app.clone(),
             "/usb-installer/v1/boot?mac=aa:bb:cc:dd:ee:ff&serial_hex=35434731323334414141",
             Some(STICK_AGENT),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["action"], "menu");
-        assert_eq!(body["notice"], "known_computer");
-        // Only installer profiles; never the one-time reinstall profile,
-        // custom iPXE, or the local disk.
-        assert_eq!(
-            body["profiles"],
-            serde_json::json!([{"id": enroll, "name": "Enroll"}])
-        );
+        assert_eq!(body["action"], "launch");
+        assert!(body.get("profiles").is_none());
         let events = crate::db::list_boot_events(&fixture.state.db, 10)
             .await
             .unwrap();
         assert_eq!(events.len(), 1);
-        assert!(events[0].selected_profile_id.is_none());
+        assert_eq!(events[0].selected_profile_id, Some(enroll));
         assert!(events[0].known_device);
+
+        // An installed computer too, and the same one again: no menu.
+        let installed = "8f2d4c6a-1b3e-4d5f-9a7b-0c1d2e3f4a5b";
+        let record = crate::boot_machines::Record {
+            machines: [(crate::boot_identity::uuid_fingerprint(installed), true)].into(),
+            machines_complete: true,
+            ..Default::default()
+        };
+        crate::boot_machines::save(&fixture.state.config.paths.data_dir, &record)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let (status, body) = get(
+                app.clone(),
+                &format!("/usb-installer/v1/boot?mac=aa:bb:cc:dd:ee:01&uuid={installed}"),
+                Some(STICK_AGENT),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["action"], "launch");
+            let context = launch_context(app.clone(), &body["launch"]).await;
+            assert!(context["nest_boot_grant"]["claims"]["managed_device_id"].is_null());
+        }
         fixture.cleanup();
     }
 
     #[tokio::test]
-    async fn another_laptop_on_a_registered_adapter_gets_the_menu_without_its_reinstall() {
+    async fn another_laptop_on_a_registered_adapter_gets_the_installer_without_its_reinstall() {
         let fixture = RuntimeFilesystemFixture::new().await;
         active_runtime(&fixture).await;
         let reinstall = installer_profile(&fixture.state, "Reinstall", false, true).await;
-        let enroll = installer_profile(&fixture.state, "Enroll", true, false).await;
+        installer_profile(&fixture.state, "Enroll", true, false).await;
         let laptop_a = computer(&fixture.state, Some("5CG1234AAA"), None, Some(reinstall)).await;
         sqlx::query(
             "UPDATE devices SET managed_device_id = 'laptop-a', reinstall_request_id = ? WHERE id = ?",
@@ -241,26 +260,11 @@ mod usb_installer_routes {
         .unwrap();
         let app = crate::routes::router(fixture.state.clone());
 
-        // "5CG1234BBB": another laptop with laptop A's adapter.
+        // "5CG1234BBB": another laptop with laptop A's adapter. It gets the
+        // installer without laptop A's reinstall binding.
         let (status, body) = get(
             app.clone(),
             "/usb-installer/v1/boot?mac=aa:bb:cc:dd:ee:ff&serial_hex=35434731323334424242",
-            Some(STICK_AGENT),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["action"], "menu");
-        assert_eq!(body["notice"], "adapter_of_another_computer");
-        let row = crate::db::get_device_by_mac(&fixture.state.db, MAC)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(row.one_time_profile_id, Some(reinstall), "not consumed");
-
-        // Its menu choice launches without laptop A's reinstall binding.
-        let (status, body) = get(
-            app.clone(),
-            &format!("/usb-installer/v1/select/{enroll}?mac=aa:bb:cc:dd:ee:ff&serial_hex=35434731323334424242"),
             Some(STICK_AGENT),
         )
         .await;
@@ -269,16 +273,27 @@ mod usb_installer_routes {
         let context = launch_context(app.clone(), &body["launch"]).await;
         assert!(context["nest_boot_grant"]["claims"]["managed_device_id"].is_null());
         assert!(context["nest_boot_grant"]["claims"]["reinstall_request_id"].is_null());
+        let row = crate::db::get_device_by_mac(&fixture.state.db, MAC)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.one_time_profile_id, Some(reinstall), "not consumed");
+        assert_eq!(row.last_selected_profile_id, None);
 
         // Laptop A itself takes its one-time reinstall, bound to it.
         let (status, body) = get(
-            app,
+            app.clone(),
             "/usb-installer/v1/boot?mac=aa:bb:cc:dd:ee:ff&serial_hex=35434731323334414141",
             Some(STICK_AGENT),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["action"], "launch");
+        let context = launch_context(app, &body["launch"]).await;
+        assert_eq!(
+            context["nest_boot_grant"]["claims"]["managed_device_id"],
+            "laptop-a"
+        );
         let row = crate::db::get_device_by_mac(&fixture.state.db, MAC)
             .await
             .unwrap()
@@ -288,22 +303,31 @@ mod usb_installer_routes {
     }
 
     #[tokio::test]
-    async fn select_starts_only_installer_profiles_from_the_menu() {
+    async fn a_nest_without_one_default_installer_has_nothing_for_the_stick() {
         let fixture = RuntimeFilesystemFixture::new().await;
         active_runtime(&fixture).await;
-        let reinstall = installer_profile(&fixture.state, "Reinstall", false, true).await;
-        let custom = custom_profile(&fixture.state).await;
+        installer_profile(&fixture.state, "Reinstall", false, true).await;
+        custom_profile(&fixture.state).await;
         let app = crate::routes::router(fixture.state.clone());
-        for profile in [reinstall.to_string(), custom.to_string(), "0".to_string(), "x".to_string()] {
-            let (status, body) = get(
-                app.clone(),
-                &format!("/usb-installer/v1/select/{profile}?mac=aa:bb:cc:dd:ee:ff"),
-                Some(STICK_AGENT),
+        let (status, body) = get(
+            app.clone(),
+            "/usb-installer/v1/boot?mac=aa:bb:cc:dd:ee:ff",
+            Some(STICK_AGENT),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "profile_unavailable");
+        // The stick's menu and its choice are gone.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/usb-installer/v1/select/1?mac=aa:bb:cc:dd:ee:ff")
+                    .body(Body::empty())
+                    .unwrap(),
             )
-            .await;
-            assert_eq!(status, StatusCode::NOT_FOUND, "{profile}");
-            assert_eq!(body["error"], "profile_unavailable");
-        }
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
         fixture.cleanup();
     }
 

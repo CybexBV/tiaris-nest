@@ -9,8 +9,12 @@
 //! - for each network reinstall it arms, the fingerprints of the computer the
 //!   reinstall is for, and whether that MAC is shared by several computers
 //!   (then a boot that cannot prove to be that computer never gets it);
-//! - the fingerprints of the computers Tiaris knows, and whether each one is
-//!   installed or still being installed.
+//! - the fingerprints of the computers Tiaris knows, whether each one is
+//!   installed or still being installed, and whether that list is complete.
+//!
+//! That list decides what a network boot starts (`InstallState`): an
+//! installed computer starts from its disk, a computer that is not installed
+//! gets the installer every time, until it is installed.
 //!
 //! This is kept as a state file, not in SQLite: Nests before schema evolution
 //! refuse a release that adds migrations (`docs/sqlite-schema-evolution.md`).
@@ -50,6 +54,26 @@ pub struct Record {
     /// The computers Tiaris knows, by fingerprint: `true` when installed.
     #[serde(default)]
     pub machines: BTreeMap<String, bool>,
+    /// `machines` names every computer Tiaris knows: one it does not name is
+    /// not installed. False until Manage says so, and when the list was cut.
+    #[serde(default)]
+    pub machines_complete: bool,
+}
+
+/// Whether the computer behind a network boot is installed, as far as Tiaris
+/// knows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstallState {
+    /// Tiaris lists it as installed: it starts from its disk.
+    Installed,
+    /// Tiaris lists it as being installed (waiting for approval, installing,
+    /// failed halfway, being reinstalled), or has a complete list without
+    /// it (new, removed or rejected): it gets the installer.
+    NotInstalled,
+    /// The boot reports no usable system UUID, or this Nest has no complete
+    /// list from Tiaris: the Nest falls back on whether it saw the MAC
+    /// address before.
+    CannotTell,
 }
 
 /// The computer one network reinstall is for.
@@ -110,12 +134,17 @@ impl Record {
         }
     }
 
-    /// `Some(installed)` when Tiaris knows the computer behind this boot.
-    pub fn known_machine(&self, identity: &BootIdentity) -> Option<bool> {
-        identity
-            .fingerprint
-            .as_deref()
-            .and_then(|fingerprint| self.machines.get(fingerprint).copied())
+    /// Whether the computer behind this boot is installed.
+    pub fn install_state(&self, identity: &BootIdentity) -> InstallState {
+        let Some(fingerprint) = identity.fingerprint.as_deref() else {
+            return InstallState::CannotTell;
+        };
+        match self.machines.get(fingerprint) {
+            Some(true) => InstallState::Installed,
+            Some(false) => InstallState::NotInstalled,
+            None if self.machines_complete => InstallState::NotInstalled,
+            None => InstallState::CannotTell,
+        }
     }
 }
 
@@ -134,8 +163,12 @@ pub fn merge(
     named: &[(&str, Option<NamedReinstall<'_>>)],
     live_request_ids: &BTreeSet<String>,
     machines: impl IntoIterator<Item = (String, bool)>,
+    machines_complete: bool,
 ) -> Record {
-    let mut record = Record::default();
+    let mut record = Record {
+        machines_complete,
+        ..Record::default()
+    };
     let mentioned: BTreeSet<&str> = named.iter().map(|(request_id, _)| *request_id).collect();
     for (request_id, reinstall) in named {
         let Some(reinstall) = reinstall else {
@@ -172,8 +205,9 @@ pub fn merge(
         }
     }
     for (fingerprint, installed) in machines {
-        if record.machines.len() >= MAX_MACHINES {
-            break;
+        if record.machines.len() >= MAX_MACHINES && !record.machines.contains_key(&fingerprint) {
+            record.machines_complete = false;
+            continue;
         }
         if is_fingerprint(&fingerprint) {
             // A computer that is installed and also being installed again
@@ -204,11 +238,14 @@ pub async fn save(data_dir: &Path, record: &Record) -> Result<()> {
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{BootIdentity, NamedReinstall, Record, ReinstallCheck, load, merge, save};
+    use super::{
+        BootIdentity, InstallState, NamedReinstall, Record, ReinstallCheck, load, merge, save,
+    };
     use crate::boot_identity::uuid_fingerprint;
 
     const UUID_A: &str = "4c4c4544-0042-3510-8051-b4c04f4e3732";
     const UUID_B: &str = "6a1e2f3c-9b8d-4e7f-a1b2-c3d4e5f60718";
+    const UUID_OTHER: &str = "8f2d4c6a-1b3e-4d5f-9a7b-0c1d2e3f4a5b";
 
     fn identity(uuid: Option<&str>, serial: Option<&str>) -> BootIdentity {
         BootIdentity::from_reported(uuid, serial.map(str::to_string))
@@ -227,6 +264,7 @@ mod tests {
             )],
             &BTreeSet::from(["req-a".to_string()]),
             [],
+            false,
         )
     }
 
@@ -292,6 +330,7 @@ mod tests {
                 (uuid_fingerprint(UUID_A), false),
                 ("short".to_string(), true),
             ],
+            true,
         );
         assert_eq!(merged.reinstalls["req-a"], previous.reinstalls["req-a"]);
         assert_eq!(
@@ -303,35 +342,72 @@ mod tests {
 
         // A reinstall the configuration carries without a computer, or whose
         // binding left every row, is forgotten.
-        let forgotten = merge(&merged, &[("req-a", None)], &BTreeSet::new(), []);
+        let forgotten = merge(&merged, &[("req-a", None)], &BTreeSet::new(), [], false);
         assert!(forgotten.reinstalls.is_empty());
-        let unnamed = merge(&merged, &[("req-a", None)], &live, []);
+        assert!(!forgotten.machines_complete);
+        let unnamed = merge(&merged, &[("req-a", None)], &live, [], false);
         assert_eq!(unnamed.reinstalls.len(), 1);
         assert!(unnamed.reinstalls.contains_key("req-b"));
     }
 
     #[test]
-    fn known_machines_are_found_by_the_boot_uuid() {
-        let record = merge(
+    fn the_list_from_tiaris_says_whether_a_computer_is_installed() {
+        let machines = [
+            (uuid_fingerprint(UUID_A), true),
+            (uuid_fingerprint(UUID_B), false),
+        ];
+        let complete = merge(
             &Record::default(),
             &[],
             &BTreeSet::new(),
-            [
-                (uuid_fingerprint(UUID_A), true),
-                (uuid_fingerprint(UUID_B), false),
-            ],
+            machines.clone(),
+            true,
         );
         assert_eq!(
-            record.known_machine(&identity(Some(UUID_A), None)),
-            Some(true)
+            complete.install_state(&identity(Some(UUID_A), None)),
+            InstallState::Installed
         );
         assert_eq!(
-            record.known_machine(&identity(Some(&UUID_B.to_uppercase()), None)),
-            Some(false)
+            complete.install_state(&identity(Some(&UUID_B.to_uppercase()), None)),
+            InstallState::NotInstalled
+        );
+        // A complete list without the computer: Tiaris does not know it, or
+        // an administrator removed it.
+        assert_eq!(
+            complete.install_state(&identity(Some(UUID_OTHER), None)),
+            InstallState::NotInstalled
+        );
+        // Without a usable system UUID the list cannot say.
+        assert_eq!(
+            complete.install_state(&identity(None, Some("5CG1234AAA"))),
+            InstallState::CannotTell
         );
         assert_eq!(
-            record.known_machine(&identity(None, Some("5CG1234AAA"))),
-            None
+            complete.install_state(&identity(
+                Some("00000000-0000-0000-0000-000000000000"),
+                None
+            )),
+            InstallState::CannotTell
+        );
+
+        // A list that was cut, and no list at all, still name the computers
+        // they hold; about any other computer they say nothing.
+        let cut = merge(&Record::default(), &[], &BTreeSet::new(), machines, false);
+        assert_eq!(
+            cut.install_state(&identity(Some(UUID_A), None)),
+            InstallState::Installed
+        );
+        assert_eq!(
+            cut.install_state(&identity(Some(UUID_B), None)),
+            InstallState::NotInstalled
+        );
+        assert_eq!(
+            cut.install_state(&identity(Some(UUID_OTHER), None)),
+            InstallState::CannotTell
+        );
+        assert_eq!(
+            Record::default().install_state(&identity(Some(UUID_A), None)),
+            InstallState::CannotTell
         );
     }
 

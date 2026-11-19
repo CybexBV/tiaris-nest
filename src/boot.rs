@@ -17,20 +17,21 @@ pub enum SelectionSource {
 /// What the Nest knows about the computer that receives the boot menu.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MenuContext {
-    /// A new or MAC-less request, or a health check: show the menu.
+    /// A computer that is not installed, a MAC-less request or a health
+    /// check: show the menu.
     Unrecognized,
-    /// A known computer: try its local disk before showing the menu.
-    KnownComputer,
-    /// It is not the computer registered for this MAC, so it boots through
-    /// another computer's network adapter, and nothing says which computer it
-    /// is: show the menu with a notice, without probing the local disk first.
-    /// A menu that would wait indefinitely boots the local disk after 15
-    /// seconds instead, so an installed laptop on a shared adapter still
-    /// starts unattended.
+    /// An installed computer: try its local disk before showing the menu.
+    InstalledComputer,
+    /// Tiaris cannot say whether it is installed, it is not the computer
+    /// registered for this MAC, so it boots through another computer's
+    /// network adapter, and nothing says which computer it is: show the menu
+    /// with a notice, without probing the local disk first. A menu that
+    /// would wait indefinitely boots the local disk after 15 seconds
+    /// instead, so an installed laptop on a shared adapter still starts
+    /// unattended.
     AdapterOfAnotherComputer,
-    /// Another computer's network adapter, but a computer Tiaris knows (while
-    /// it is installed) or this Nest knows from another adapter: the same
-    /// menu without the notice.
+    /// The same, but this Nest knows the computer's serial from another
+    /// adapter: the same menu without the notice.
     KnownOnSharedAdapter,
 }
 
@@ -59,6 +60,9 @@ const IPXE_MENU_SHARED_ADAPTER_NOTICE: &str =
     "This network adapter is registered to another computer";
 const SHARED_ADAPTER_MENU_TIMEOUT_MS: u32 = 15_000;
 
+/// The profile a boot starts by itself: the one assigned to the computer's
+/// row, else the sole default installer profile when the computer is offered
+/// the installer, else none (the menu).
 pub fn choose_profile<'a>(
     device: Option<&Device>,
     enabled_profiles: &'a [BootProfile],
@@ -82,12 +86,10 @@ pub fn choose_profile<'a>(
                 };
             }
         }
-
-        return menu_selection();
     }
 
     if allow_automatic_enrollment {
-        if let Some(profile) = unambiguous_default_enrollment(enabled_profiles) {
+        if let Some(profile) = default_installer_profile(enabled_profiles) {
             return ProfileSelection {
                 profile: Some(profile),
                 source: SelectionSource::AutomaticEnrollment,
@@ -105,7 +107,9 @@ fn menu_selection<'a>() -> ProfileSelection<'a> {
     }
 }
 
-fn unambiguous_default_enrollment(profiles: &[BootProfile]) -> Option<&BootProfile> {
+/// The installer a computer gets without anyone choosing: the default Nest
+/// installer profile, when exactly one is enabled.
+pub fn default_installer_profile(profiles: &[BootProfile]) -> Option<&BootProfile> {
     let mut defaults = profiles.iter().filter(|profile| {
         profile.enabled
             && profile.is_default
@@ -139,9 +143,9 @@ pub fn render_menu(
     let menu_profiles = menu_profiles(profiles);
     let mut script = String::with_capacity(2048 + (menu_profiles.len() * 256));
     script.push_str("#!ipxe\n");
-    if context == MenuContext::KnownComputer {
-        // A previously seen workstation can return through PXE when network
-        // boot is ahead of its disk in firmware order. UEFI must regain
+    if context == MenuContext::InstalledComputer {
+        // An installed workstation returns through PXE when network boot is
+        // ahead of its disk in firmware order. UEFI must regain
         // control so it can advance to the installed NixOS boot entry; BIOS
         // can still probe the conventional local-disk drive directly.
         append_local_attempt(&mut script, "known_local", "known_menu");
@@ -206,16 +210,6 @@ pub fn render_menu(
     script.push_str("goto local\n\n");
     script.push_str(":end\n");
     script
-}
-
-/// The profiles a USB installer stick can start: the menu's Nest installer
-/// profiles, in menu order. The stick cannot run custom iPXE, and booting the
-/// local disk is what removing the stick does.
-pub fn installer_menu_profiles(profiles: &[BootProfile]) -> Vec<&BootProfile> {
-    menu_profiles(profiles)
-        .into_iter()
-        .filter(|profile| profile.profile_type == BootProfileType::NestInstaller)
-        .collect()
 }
 
 fn menu_profiles(profiles: &[BootProfile]) -> Vec<&BootProfile> {
@@ -589,16 +583,20 @@ mod tests {
     }
 
     #[test]
-    fn known_unassigned_device_gets_menu_instead_of_automatic_enrollment() {
+    fn an_unassigned_computer_gets_the_installer_only_when_it_is_offered() {
         let mut installer = profile(2, BootProfileType::NestInstaller);
         installer.is_default = true;
         let profiles = vec![profile(1, BootProfileType::LocalDisk), installer];
         let device = device(None, None);
 
-        let selection = choose_profile(Some(&device), &profiles, true);
-
+        let selection = choose_profile(Some(&device), &profiles, false);
         assert_eq!(selection.source, SelectionSource::Menu);
         assert!(selection.profile.is_none());
+
+        // A computer the Nest saw before that is not installed.
+        let selection = choose_profile(Some(&device), &profiles, true);
+        assert_eq!(selection.source, SelectionSource::AutomaticEnrollment);
+        assert_eq!(selection.profile.unwrap().id, 2);
     }
 
     #[test]
@@ -775,7 +773,7 @@ mod tests {
                 uuid: None,
             },
             0,
-            MenuContext::KnownComputer,
+            MenuContext::InstalledComputer,
         );
 
         let local_handoff = script

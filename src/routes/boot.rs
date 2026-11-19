@@ -10,7 +10,7 @@ use serde::Deserialize;
 use crate::{
     AppState, boot as boot_logic,
     boot_identity::{serial_from_hex, usable_serial},
-    boot_machines::{self, BootIdentity, ReinstallCheck},
+    boot_machines::{self, BootIdentity, InstallState, ReinstallCheck},
     db,
     error::{AppError, AppResult},
     models::{BootProfile, BootProfileType, Device, NewBootEvent, normalize_mac},
@@ -224,24 +224,17 @@ async fn build_boot_script(
 ) -> AppResult<String> {
     let mac = normalized_optional_mac(mac)?;
     let client = identify_boot_client(state, mac, identity, checker).await?;
+    let profiles = db::list_enabled_profiles(&state.db).await?;
+    let selection = choose_boot_profile(&profiles, &client, checker);
+    let context = menu_context(&client, checker);
     let BootClient {
         mac,
         identity,
         serial,
         device,
         known_device,
-        other_computer,
+        ..
     } = client;
-
-    let profiles = db::list_enabled_profiles(&state.db).await?;
-    let selection = choose_boot_profile(
-        &profiles,
-        device.as_ref(),
-        known_device,
-        other_computer.is_some(),
-        mac.as_deref(),
-        checker,
-    );
 
     let selected_profile = selection.profile.cloned();
     let selected_script = if let Some(profile) = selected_profile.as_ref() {
@@ -259,12 +252,16 @@ async fn build_boot_script(
         {
             Ok(script) => Some(script),
             Err(error) => {
-                if selection.source == boot_logic::SelectionSource::AutomaticEnrollment {
+                if selection.source == boot_logic::SelectionSource::AutomaticEnrollment
+                    && !known_device
+                {
                     if let Some(device) = device.as_ref() {
-                        // A transient runtime/session failure must not turn a
-                        // fresh MAC into a permanent manual-menu recovery. The
-                        // conditional delete preserves any row claimed by a
-                        // concurrent managed sync or operator assignment.
+                        // Where the Nest cannot tell whether a computer is
+                        // installed, only a new MAC gets the installer: a
+                        // transient runtime/session failure must not leave
+                        // this one behind as seen before. The conditional
+                        // delete preserves any row claimed by a concurrent
+                        // managed sync or operator assignment.
                         let _ =
                             db::remove_unclaimed_auto_discovered_device(&state.db, device.id).await;
                     }
@@ -299,23 +296,6 @@ async fn build_boot_script(
         Ok(selected_script.expect("selected profile has a rendered script"))
     } else {
         let runtime = state.runtime_settings();
-        // Nest does not need to guess whether installation finished. A real,
-        // known MAC first boots local drive 0x80; UEFI falls back to its next
-        // BootOrder entry if direct chaining fails, while legacy BIOS falls
-        // through to the menu. Health checks and MAC-less requests never hand
-        // off automatically. Neither does a computer booting through another
-        // computer's adapter, unless Tiaris knows it as installed: on UEFI the
-        // handoff would leave a blank laptop in firmware without ever showing
-        // it the menu.
-        let context = match other_computer {
-            Some(OtherComputer::Installed) => boot_logic::MenuContext::KnownComputer,
-            Some(OtherComputer::Known) => boot_logic::MenuContext::KnownOnSharedAdapter,
-            Some(OtherComputer::Unknown) => boot_logic::MenuContext::AdapterOfAnotherComputer,
-            None if automatic_local_handoff_allowed(checker, known_device, mac.as_deref()) => {
-                boot_logic::MenuContext::KnownComputer
-            }
-            None => boot_logic::MenuContext::Unrecognized,
-        };
         // Menu links carry only a usable serial and UUID; otherwise iPXE
         // re-sends its own, so a truncated or placeholder value never reaches
         // selection.
@@ -343,18 +323,20 @@ pub(super) struct BootClient {
     /// The bounded serial for boot events and menu links.
     pub serial: Option<String>,
     pub device: Option<Device>,
+    /// The Nest saw this MAC address before. It decides only where Tiaris
+    /// cannot say whether the computer is installed.
     pub known_device: bool,
+    /// Whether Tiaris lists the computer as installed.
+    pub install: InstallState,
     /// Another computer boots through this MAC's network adapter.
     pub other_computer: Option<OtherComputer>,
 }
 
-/// Who boots through another computer's network adapter.
+/// Who boots through another computer's network adapter, where Tiaris cannot
+/// say whether it is installed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum OtherComputer {
-    /// Tiaris knows it as an installed computer.
-    Installed,
-    /// Tiaris knows it while it is being installed, or this Nest knows its
-    /// serial from another adapter.
+    /// This Nest knows its serial from another adapter.
     Known,
     /// Nothing says which computer it is.
     Unknown,
@@ -375,12 +357,15 @@ pub(super) async fn identify_boot_client(
         serial,
         device: None,
         known_device: false,
+        install: InstallState::CannotTell,
         other_computer: None,
     };
     if checker {
         return Ok(client);
     }
     if let Some(mac) = client.mac.as_deref() {
+        // First: the newest list may change this MAC's row too.
+        client.install = install_state(state, &client.identity).await;
         match resolve_mac_request(state, mac, &client.identity).await? {
             Some((device, known)) => {
                 client.known_device = known;
@@ -418,25 +403,82 @@ async fn device_by_serial_alone(
     Ok(Some(found))
 }
 
+/// Whether Tiaris lists the computer behind a boot as installed. Before the
+/// Nest offers the installer on the list's word, it asks Tiaris for the
+/// newest list: a computer that just finished installing restarts within
+/// seconds, sooner than the regular sync. When Tiaris does not answer, the
+/// last list stands.
+async fn install_state(state: &AppState, identity: &BootIdentity) -> InstallState {
+    let data_dir = &state.config.paths.data_dir;
+    let install = boot_machines::load(data_dir).install_state(identity);
+    if install == InstallState::NotInstalled && crate::manage::refresh_boot_config(state).await {
+        return boot_machines::load(data_dir).install_state(identity);
+    }
+    install
+}
+
+/// What a network boot starts by itself: the profile assigned to the MAC's
+/// row, else the installer for a computer that is not installed.
 pub(super) fn choose_boot_profile<'a>(
     profiles: &'a [BootProfile],
-    device: Option<&Device>,
-    known_device: bool,
-    other_computer: bool,
-    mac: Option<&str>,
+    client: &BootClient,
     checker: bool,
 ) -> boot_logic::ProfileSelection<'a> {
-    let selection_device = if known_device { device } else { None };
-    // A first request from a new MAC may enter the sole default enrollment
-    // profile automatically. This only starts the signed installer runtime;
-    // destructive installation still requires explicit approval in Tiaris.
-    // A computer that is not the one registered for its MAC is booting
-    // through another computer's network adapter. It is neither that
-    // computer nor provably new: it gets the menu, so an installed laptop
-    // passing through a shared adapter never enters the installer by itself.
-    let allow_automatic_enrollment =
-        automatic_enrollment_allowed(checker, known_device, other_computer, mac);
-    boot_logic::choose_profile(selection_device, profiles, allow_automatic_enrollment)
+    let selection_device = if client.known_device {
+        client.device.as_ref()
+    } else {
+        None
+    };
+    boot_logic::choose_profile(
+        selection_device,
+        profiles,
+        installer_offered(client, checker),
+    )
+}
+
+/// Whether the computer gets the sole default installer profile by itself.
+/// This only starts the signed installer runtime; nothing is erased before
+/// an administrator approves it in Tiaris.
+///
+/// A computer Tiaris lists as not installed gets it every time it starts
+/// from the network, until it is installed; an installed one never does.
+/// Where Tiaris cannot say (no usable system UUID, or no complete list on
+/// this Nest), the Nest falls back on its own memory: only a MAC address it
+/// never saw gets the installer, and a computer on another computer's
+/// adapter gets the menu, so an installed computer never enters the
+/// installer by itself.
+fn installer_offered(client: &BootClient, checker: bool) -> bool {
+    if checker || client.mac.is_none() {
+        return false;
+    }
+    match client.install {
+        InstallState::NotInstalled => true,
+        InstallState::Installed => false,
+        InstallState::CannotTell => !client.known_device && client.other_computer.is_none(),
+    }
+}
+
+/// What the menu does before it shows, for a boot that starts no profile by
+/// itself. An installed computer starts from its disk first: UEFI falls back
+/// to its next BootOrder entry if direct chaining fails, legacy BIOS falls
+/// through to the menu. A computer that is not installed gets the menu at
+/// once: on UEFI the handoff would leave a blank disk in firmware without
+/// ever showing it. Health checks and MAC-less requests never hand off.
+fn menu_context(client: &BootClient, checker: bool) -> boot_logic::MenuContext {
+    use boot_logic::MenuContext;
+    if checker || client.mac.is_none() {
+        return MenuContext::Unrecognized;
+    }
+    match (client.install, client.other_computer) {
+        (InstallState::Installed, _) => MenuContext::InstalledComputer,
+        (InstallState::NotInstalled, _) => MenuContext::Unrecognized,
+        (InstallState::CannotTell, Some(OtherComputer::Known)) => MenuContext::KnownOnSharedAdapter,
+        (InstallState::CannotTell, Some(OtherComputer::Unknown)) => {
+            MenuContext::AdapterOfAnotherComputer
+        }
+        (InstallState::CannotTell, None) if client.known_device => MenuContext::InstalledComputer,
+        (InstallState::CannotTell, None) => MenuContext::Unrecognized,
+    }
 }
 
 /// Records which profile a computer received: a one-time profile is
@@ -497,15 +539,6 @@ pub(super) async fn record_boot_event(
     Ok(())
 }
 
-fn automatic_enrollment_allowed(
-    checker: bool,
-    known_device: bool,
-    other_computer: bool,
-    mac: Option<&str>,
-) -> bool {
-    !checker && !known_device && !other_computer && mac.is_some()
-}
-
 /// Which computer a request with a MAC address is: the MAC's row and
 /// whether it existed, or `None` when another computer is booting through
 /// that network adapter (the row is left untouched). A network reinstall armed
@@ -562,26 +595,15 @@ async fn resolve_mac_request(
     }
 }
 
-/// Who boots through another computer's adapter: a computer Tiaris knows by
-/// its system UUID, one whose serial this Nest knows from another adapter,
-/// or nobody known.
+/// Who boots through another computer's adapter: a computer whose serial
+/// this Nest knows from another adapter, or nobody known.
 async fn other_computer(state: &AppState, identity: &BootIdentity) -> AppResult<OtherComputer> {
-    let record = boot_machines::load(&state.config.paths.data_dir);
-    match record.known_machine(identity) {
-        Some(true) => return Ok(OtherComputer::Installed),
-        Some(false) => return Ok(OtherComputer::Known),
-        None => {}
-    }
     if let Some(serial) = identity.serial.as_deref().and_then(usable_serial) {
         if db::serial_is_registered(&state.db, &serial).await? {
             return Ok(OtherComputer::Known);
         }
     }
     Ok(OtherComputer::Unknown)
-}
-
-fn automatic_local_handoff_allowed(checker: bool, known_device: bool, mac: Option<&str>) -> bool {
-    !checker && known_device && mac.is_some()
 }
 
 async fn render_selected_profile(
@@ -756,39 +778,107 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue, header};
 
     use super::{
-        BootQuery, automatic_enrollment_allowed, automatic_local_handoff_allowed,
-        boot_profile_id_from_path, clean_optional, ipxe_response, is_local_checker_request,
-        remote_ip, user_agent,
+        BootClient, BootQuery, OtherComputer, boot_profile_id_from_path, clean_optional,
+        installer_offered, ipxe_response, is_local_checker_request, menu_context, remote_ip,
+        user_agent,
+    };
+    use crate::{
+        boot::MenuContext,
+        boot_machines::{BootIdentity, InstallState},
     };
 
-    #[test]
-    fn automatic_enrollment_is_limited_to_a_real_first_mac_request() {
-        let mac = Some("aa:bb:cc:dd:ee:ff");
-        assert!(automatic_enrollment_allowed(false, false, false, mac));
-        assert!(!automatic_enrollment_allowed(true, false, false, mac));
-        assert!(!automatic_enrollment_allowed(false, true, false, mac));
-        assert!(!automatic_enrollment_allowed(false, false, true, mac));
-        assert!(!automatic_enrollment_allowed(false, false, false, None));
+    fn client(
+        install: InstallState,
+        known_device: bool,
+        other_computer: Option<OtherComputer>,
+    ) -> BootClient {
+        BootClient {
+            mac: Some("aa:bb:cc:dd:ee:ff".to_string()),
+            identity: BootIdentity::default(),
+            serial: None,
+            device: None,
+            known_device,
+            install,
+            other_computer,
+        }
     }
 
     #[test]
-    fn automatic_local_handoff_is_limited_to_a_real_known_mac_request() {
-        assert!(automatic_local_handoff_allowed(
-            false,
-            true,
-            Some("aa:bb:cc:dd:ee:ff")
+    fn a_computer_that_is_not_installed_gets_the_installer_every_time() {
+        use InstallState::{CannotTell, Installed, NotInstalled};
+        // Tiaris decides, whether or not the Nest saw the MAC before and
+        // whichever adapter the computer boots through.
+        for known in [false, true] {
+            for other in [
+                None,
+                Some(OtherComputer::Known),
+                Some(OtherComputer::Unknown),
+            ] {
+                assert!(installer_offered(
+                    &client(NotInstalled, known, other),
+                    false
+                ));
+                assert!(!installer_offered(&client(Installed, known, other), false));
+            }
+        }
+        // Where Tiaris cannot say, only a MAC the Nest never saw gets it,
+        // and never a computer on another computer's adapter.
+        assert!(installer_offered(&client(CannotTell, false, None), false));
+        assert!(!installer_offered(&client(CannotTell, true, None), false));
+        assert!(!installer_offered(
+            &client(CannotTell, false, Some(OtherComputer::Unknown)),
+            false
         ));
-        assert!(!automatic_local_handoff_allowed(
-            true,
-            true,
-            Some("aa:bb:cc:dd:ee:ff")
-        ));
-        assert!(!automatic_local_handoff_allowed(
-            false,
-            false,
-            Some("aa:bb:cc:dd:ee:ff")
-        ));
-        assert!(!automatic_local_handoff_allowed(false, true, None));
+        // Never for a health check or a request without a MAC address.
+        assert!(!installer_offered(&client(NotInstalled, false, None), true));
+        let mut without_mac = client(NotInstalled, false, None);
+        without_mac.mac = None;
+        assert!(!installer_offered(&without_mac, false));
+    }
+
+    #[test]
+    fn only_an_installed_computer_starts_from_its_disk_before_the_menu() {
+        use InstallState::{CannotTell, Installed, NotInstalled};
+        let shared = Some(OtherComputer::Unknown);
+        assert_eq!(
+            menu_context(&client(Installed, false, None), false),
+            MenuContext::InstalledComputer
+        );
+        assert_eq!(
+            menu_context(&client(Installed, false, shared), false),
+            MenuContext::InstalledComputer
+        );
+        assert_eq!(
+            menu_context(&client(NotInstalled, true, None), false),
+            MenuContext::Unrecognized
+        );
+        // Where Tiaris cannot say: a MAC seen before counts as installed.
+        assert_eq!(
+            menu_context(&client(CannotTell, true, None), false),
+            MenuContext::InstalledComputer
+        );
+        assert_eq!(
+            menu_context(&client(CannotTell, false, None), false),
+            MenuContext::Unrecognized
+        );
+        assert_eq!(
+            menu_context(&client(CannotTell, false, shared), false),
+            MenuContext::AdapterOfAnotherComputer
+        );
+        assert_eq!(
+            menu_context(
+                &client(CannotTell, false, Some(OtherComputer::Known)),
+                false
+            ),
+            MenuContext::KnownOnSharedAdapter
+        );
+        assert_eq!(
+            menu_context(&client(Installed, true, None), true),
+            MenuContext::Unrecognized
+        );
+        let mut without_mac = client(Installed, true, None);
+        without_mac.mac = None;
+        assert_eq!(menu_context(&without_mac, false), MenuContext::Unrecognized);
     }
 
     #[test]

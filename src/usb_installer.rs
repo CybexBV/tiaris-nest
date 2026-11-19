@@ -4,7 +4,9 @@
 //! (Tiaris `docs/design/usb-installer.md`). It reaches this Nest over a USB
 //! Ethernet adapter, built-in Ethernet or Wi-Fi and asks for exactly what iPXE
 //! would load: the same selection rules, the same signed boot session, the
-//! same runtime. It then starts that runtime with `kexec`.
+//! same runtime. It then starts that runtime with `kexec`. It has no menu:
+//! the Nest always answers with its installer, also for a computer that is
+//! installed, because someone started the stick on it on purpose.
 //!
 //! The stick is generic: one image for every Nest, downloaded from Tiaris.
 //! It finds its Nest on the local network or from the Nest address file the
@@ -41,9 +43,6 @@ pub const ERROR_RUNTIME_UNAVAILABLE: &str = "runtime_unavailable";
 pub const ERROR_SESSION_UNAVAILABLE: &str = "session_unavailable";
 pub const ERROR_INTERNAL: &str = "internal_error";
 
-pub const NOTICE_KNOWN_COMPUTER: &str = "known_computer";
-pub const NOTICE_ADAPTER_OF_ANOTHER_COMPUTER: &str = "adapter_of_another_computer";
-
 /// The existing `tiaris.nest.kexec.v1` launch plus the identity of the runtime
 /// it starts, so the stick can verify the kernel and initrd it downloads.
 #[derive(Clone, Debug, Serialize)]
@@ -64,29 +63,13 @@ impl UsbLaunch {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub struct UsbMenuProfile {
-    pub id: i64,
-    pub name: String,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(tag = "action", rename_all = "snake_case")]
-pub enum UsbBootAction {
-    Launch {
-        launch: Box<UsbLaunch>,
-    },
-    Menu {
-        notice: Option<&'static str>,
-        profiles: Vec<UsbMenuProfile>,
-    },
-}
-
+/// The answer to the stick's one question: always the installer's launch.
 #[derive(Clone, Debug, Serialize)]
 pub struct UsbBootResponse {
     pub schema: &'static str,
-    #[serde(flatten)]
-    pub action: UsbBootAction,
+    /// Always `launch`.
+    pub action: &'static str,
+    pub launch: Box<UsbLaunch>,
 }
 
 #[derive(Clone, Debug, Serialize)]
