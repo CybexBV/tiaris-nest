@@ -2762,19 +2762,6 @@ async fn signed_request_for_config(
     })
 }
 
-/// A signed Nest agent request whose caller streams a body of the given
-/// SHA-256 (hex) itself, for bodies too large to hold in memory.
-pub(crate) fn signed_streaming_request(
-    config: &AppConfig,
-    method: Method,
-    path: &str,
-    body_sha256: &str,
-) -> Result<reqwest::RequestBuilder> {
-    ensure_manage_enabled_config(config)?;
-    let managed = load_managed_state_from_config(config)?;
-    signed_request_with_digest(config, &managed, method, path, body_sha256)
-}
-
 fn signed_request_with_digest(
     config: &AppConfig,
     managed: &ManagedState,
