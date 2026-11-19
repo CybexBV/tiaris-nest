@@ -11,38 +11,48 @@
 //! agent reports (`sha256("tiaris-hardware-v1\ndmi_product_uuid=<uuid>")`).
 //! The Nest hashes the UUID iPXE reports the same way, so Manage can name the
 //! computer a reinstall is for, and the computers it knows, by fingerprint.
+//!
+//! The placeholders (serial numbers and system UUIDs many boards share) are
+//! one list for the Nest, the agent and Manage:
+//! `protocol/hardware-identity-placeholders.json`, a byte-identical copy of
+//! the file at the same path in `CybexHQ/tiaris`. Both repositories pin its
+//! SHA-256 in a test, and a development Nest release compares the two files.
 
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::sync::OnceLock;
 
 const MAX_SERIAL_CHARS: usize = 128;
 /// iPXE sends the serial as `${serial:hexraw}`; anything longer than this
 /// could never be a usable serial.
 const MAX_SERIAL_HEX_CHARS: usize = 1024;
 
-/// Values firmware vendors leave in SMBIOS instead of a real serial number,
-/// compared case-insensitively.
-const PLACEHOLDER_SERIALS: &[&str] = &[
-    "default string",
-    "default",
-    "to be filled by o.e.m.",
-    "oem",
-    "system serial number",
-    "chassis serial number",
-    "base board serial number",
-    "serial number",
-    "not specified",
-    "not applicable",
-    "not available",
-    "n/a",
-    "na",
-    "none",
-    "unknown",
-    "invalid",
-    "0123456789",
-    "1234567890",
-    "123456789",
-    "12345678",
-];
+/// The placeholder list, exactly as `CybexHQ/tiaris` holds it.
+const PLACEHOLDERS_JSON: &str = include_str!("../protocol/hardware-identity-placeholders.json");
+
+/// Values firmware vendors leave in SMBIOS instead of a real serial number
+/// (compared case-insensitively) or system UUID: every unit of a model has
+/// them, so they name no single computer.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Placeholders {
+    schema: String,
+    system_uuids: Vec<String>,
+    serial_numbers: Vec<String>,
+}
+
+fn placeholders() -> &'static Placeholders {
+    static PLACEHOLDERS: OnceLock<Placeholders> = OnceLock::new();
+    PLACEHOLDERS.get_or_init(|| {
+        let placeholders: Placeholders = serde_json::from_str(PLACEHOLDERS_JSON)
+            .expect("protocol/hardware-identity-placeholders.json is valid");
+        assert_eq!(
+            placeholders.schema,
+            "tiaris.hardware-identity-placeholders.v1"
+        );
+        placeholders
+    })
+}
 
 /// The serial number as stored and compared, or `None` when the value cannot
 /// identify a computer: empty, longer than 128 characters, a known
@@ -56,8 +66,10 @@ pub fn usable_serial(value: &str) -> Option<String> {
     if trimmed.is_empty() || trimmed.chars().count() > MAX_SERIAL_CHARS {
         return None;
     }
-    let lowercase = trimmed.to_lowercase();
-    if PLACEHOLDER_SERIALS.contains(&lowercase.as_str()) {
+    if placeholders()
+        .serial_numbers
+        .contains(&trimmed.to_lowercase())
+    {
         return None;
     }
     let mut alphanumerics = trimmed
@@ -107,14 +119,6 @@ pub fn serial_from_hex(value: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// System UUIDs firmware vendors ship on every unit of a model, so they name
-/// no single computer.
-const PLACEHOLDER_UUIDS: &[&str] = &[
-    "03000200-0400-0500-0006-000700080009",
-    "00020003-0004-0005-0006-000700080009",
-    "12345678-1234-5678-90ab-cddeefaabbcc",
-];
-
 /// The SMBIOS system UUID as the Tiaris agent normalises it (trimmed and
 /// lowercase), or `None` when it cannot identify a computer: empty, not hex
 /// and dashes, fewer than 12 hex digits, all zeros or all `f`, or a known
@@ -132,7 +136,7 @@ pub fn usable_uuid(value: &str) -> Option<String> {
     if hex.len() < 12
         || hex.iter().all(|ch| *ch == '0')
         || hex.iter().all(|ch| *ch == 'f')
-        || PLACEHOLDER_UUIDS.contains(&uuid.as_str())
+        || placeholders().system_uuids.contains(&uuid)
     {
         return None;
     }
@@ -158,9 +162,41 @@ pub fn is_fingerprint(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_fingerprint, same_serial, serial_from_hex, stored_by_old_menu_link, usable_serial,
-        usable_uuid, uuid_fingerprint,
+        PLACEHOLDERS_JSON, is_fingerprint, placeholders, same_serial, serial_from_hex,
+        stored_by_old_menu_link, usable_serial, usable_uuid, uuid_fingerprint,
     };
+    use sha2::{Digest, Sha256};
+
+    /// `CybexHQ/tiaris` pins the same value for its copy
+    /// (`protocol/hardware_identity.rs`, `PLACEHOLDERS_SHA256`). Change the
+    /// list in both repositories, then both pins.
+    const PLACEHOLDERS_SHA256: &str =
+        "d3bf3ee3534f6e204faa9cdd08e887377c66b8c98b933affa12a50228a0ec74b";
+
+    #[test]
+    fn the_placeholder_list_is_the_one_the_agent_and_manage_hold() {
+        assert_eq!(
+            hex::encode(Sha256::digest(PLACEHOLDERS_JSON.as_bytes())),
+            PLACEHOLDERS_SHA256,
+            "the placeholder list changed: copy it to CybexHQ/tiaris and update both pins"
+        );
+    }
+
+    #[test]
+    fn every_listed_placeholder_is_not_usable_in_any_case() {
+        let listed = placeholders();
+        assert!(!listed.system_uuids.is_empty() && !listed.serial_numbers.is_empty());
+        for uuid in &listed.system_uuids {
+            assert_eq!(uuid, &uuid.trim().to_ascii_lowercase(), "{uuid}");
+            assert_eq!(usable_uuid(uuid), None, "{uuid}");
+            assert_eq!(usable_uuid(&uuid.to_uppercase()), None, "{uuid}");
+        }
+        for serial in &listed.serial_numbers {
+            assert_eq!(serial, &serial.trim().to_lowercase(), "{serial}");
+            assert_eq!(usable_serial(serial), None, "{serial}");
+            assert_eq!(usable_serial(&serial.to_uppercase()), None, "{serial}");
+        }
+    }
 
     #[test]
     fn real_serials_are_usable_and_trimmed() {
