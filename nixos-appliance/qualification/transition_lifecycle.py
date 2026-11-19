@@ -2,7 +2,6 @@
 import base64
 import datetime
 import hashlib
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -15,18 +14,6 @@ import uuid
 import release_acceptance
 import release_predecessor
 import rollback_transport_gate
-
-try:
-    import schedule_admission
-except ModuleNotFoundError as error:
-    if error.name != 'schedule_admission':
-        raise
-    # Some unit tests load this file directly without placing its sibling
-    # directory on sys.path. Load the same reviewed helper by exact path.
-    _spec = importlib.util.spec_from_file_location(
-        'transition_schedule_admission', Path(__file__).with_name('schedule_admission.py'))
-    schedule_admission = importlib.util.module_from_spec(_spec)
-    _spec.loader.exec_module(schedule_admission)
 
 BLUEPRINT_DELIVERY = runpy.run_path(str(Path(__file__).with_name('blueprint_delivery.py')))
 
@@ -278,7 +265,7 @@ def rollback_failure(output, stage, error, timings, gate, node, candidate_reset,
 def run(api, fixture, candidate, candidate_body, previous, previous_body, evidence,
         evidence_digest, transport_url, output, source, rollback=False, *, clock=time.monotonic,
         sleep=time.sleep, now=lambda: datetime.datetime.now(UTC), timeout=3600,
-        exercise_admission=False, before_evidence=None):
+        before_evidence=None):
     before = fixture.wait_ready(api)
     if before.get('device_id') != evidence['device_id'] or fixture.device != evidence['device_id']:
         raise ValueError('Running predecessor identity differs from its fixture')
@@ -287,8 +274,6 @@ def run(api, fixture, candidate, candidate_body, previous, previous_body, eviden
     seen_before = timestamp(before['nest_reported_at'])
     gate = rollback_transport_gate.Gate(fixture, before) if rollback else None
     prefix = f'/v1/nest/nodes/{fixture.device}'
-    admission = (schedule_admission.AdmissionExercise(api, fixture.device, clock=clock,
-        sleep=sleep, now=now, timeout=min(timeout, 300)) if exercise_admission else None)
     gate_stage_seconds = {}
     gate_revalidated = False
     failure_stage = 'preflight'
@@ -301,10 +286,7 @@ def run(api, fixture, candidate, candidate_body, previous, previous_body, eviden
         request = {'request_id': str(uuid.uuid4()), 'expires_at': (now() + datetime.timedelta(hours=1)).strftime('%Y-%m-%dT%H:%M:%SZ'),
             'expected': expected, 'candidate': {'release_manifest_json_b64': base64.b64encode(candidate_body).decode(),
             'release_manifest_sha256': hashlib.sha256(candidate_body).hexdigest(), 'package_transport_url': transport_url}}
-        if admission:
-            admission.prepare(request)
-        else:
-            initialize_schedule(api, prefix)
+        initialize_schedule(api, prefix)
         if gate:
             failure_stage = 'candidate_gate_install'
             stage_started = clock()
@@ -322,11 +304,7 @@ def run(api, fixture, candidate, candidate_body, previous, previous_body, eviden
             failure_stage = 'candidate_gate_inert'
             gate.assert_inert()
         started = now()
-        if admission:
-            admission.mark_queue_started()
         attempt = verify_admission(api(prefix + '/qualification-updates', request), request, candidate, fixture.device)
-        admission_evidence = (admission.activate(attempt, expected, candidate['version'],
-            candidate['appliance_release_v1']['system_closure']['sha256'], started) if admission else None)
     except BaseException as error:
         if gate:
             try:
@@ -336,8 +314,6 @@ def run(api, fixture, candidate, candidate_body, previous, previous_body, eviden
                 pass  # Recording failure must never prevent the stop attempt.
             fixture.stop()
             gate.remove()
-        if admission:
-            admission.cleanup(False)
         raise
     deadline = clock() + timeout
     first_reset = fallback_reset = None
@@ -483,14 +459,8 @@ def run(api, fixture, candidate, candidate_body, previous, previous_body, eviden
                 # Only the upgraded appliance owns the candidate's source-paired
                 # runtime/cache. This is mandatory before writing update evidence.
                 result['blueprint_delivery'] = BLUEPRINT_DELIVERY['qualify_current'](api, fixture.device, candidate)
-            if admission:
-                result['q07_admission'] = admission_evidence
             release_acceptance.validate_transition(candidate, result['candidate_manifest_sha256'], previous,
                 result['predecessor_manifest_sha256'], result, source, phase)
-            if admission:
-                admission.mark_terminal()
-                admission.cleanup(True)
-                admission = None
             if before_evidence is not None:
                 before_evidence()
             write_evidence(output, result)
@@ -513,5 +483,3 @@ def run(api, fixture, candidate, candidate_body, previous, previous_body, eviden
     finally:
         if gate and gate_cleanup:
             gate.remove()
-        if admission:
-            admission.cleanup(False)
