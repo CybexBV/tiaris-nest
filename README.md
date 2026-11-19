@@ -359,6 +359,12 @@ November 2026); it answers the stick protocol:
   runtime without creating a session. A stick older than
   `MINIMUM_STICK_PROTOCOL` gets `410`.
 
+A boot session lives 24 hours (`BOOT_SESSION_SECONDS` in `src/netboot.rs`), and
+its grant, the computer's permission to enroll with Tiaris, names that same
+end: an installer may wait for hours on a slow link or for an administrator.
+Only this Nest's clock and Tiaris's judge the end, never the computer's own;
+the installer sets its clock from the `Date` of this Nest's answers.
+
 The stick starts the runtime with `kexec`; the grant, enrollment and approval
 are those of network boot, and its Wi-Fi password never reaches Nest.
 
@@ -469,7 +475,8 @@ it. The service polls requests every 30 seconds.
 
 Idle means nothing kept the Nest busy for 10 minutes: no request from a
 computer in flight or served (boot, netboot, installer, USB stick, cache; health
-probes do not count), no unexpired boot grant and no queued or running build.
+probes do not count), no computer that started the installer in the last ten
+minutes and no queued or running build.
 The daemon writes this to `/run/tiaris-nest/activity.json`
 every 20 seconds (`src/activity.rs`). A missing or stale report counts as busy
 until the Nest has been up for 30 minutes: then the daemon serves nothing.

@@ -22,7 +22,10 @@ pub const PROTOCOL_SCHEMA: &str = "tiaris.nest.usb-installer.v1";
 /// The oldest stick protocol this Nest still answers. A stick reports its
 /// protocol as `User-Agent: tiaris-usb-installer/<protocol> ...`; an older
 /// one gets `410` and tells the administrator to download a new stick.
-pub const MINIMUM_STICK_PROTOCOL: u32 = 1;
+///
+/// Protocol 2: the launch's session lasts a day. A protocol 1 stick refuses
+/// every launch that does not end within eleven minutes of its own clock.
+pub const MINIMUM_STICK_PROTOCOL: u32 = 2;
 const STICK_USER_AGENT_PREFIX: &str = "tiaris-usb-installer/";
 
 pub const ERROR_INVALID_REQUEST: &str = "invalid_request";
@@ -169,10 +172,10 @@ mod tests {
 
     #[test]
     fn only_a_stick_older_than_the_minimum_is_rejected() {
-        assert!(reject_outdated_stick(&headers_with_agent("tiaris-usb-installer/1")).is_none());
+        assert!(reject_outdated_stick(&headers_with_agent("tiaris-usb-installer/2")).is_none());
         assert!(reject_outdated_stick(&headers_with_agent("curl/8.0")).is_none());
-        let rejected = reject_outdated_stick(&headers_with_agent("tiaris-usb-installer/0"))
-            .expect("protocol 0 is outdated");
+        let rejected = reject_outdated_stick(&headers_with_agent("tiaris-usb-installer/1"))
+            .expect("protocol 1 is outdated");
         assert_eq!(rejected.status(), StatusCode::GONE);
     }
 }
