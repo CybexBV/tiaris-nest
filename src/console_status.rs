@@ -15,7 +15,10 @@ use std::{
     fs,
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::Path,
-    sync::OnceLock,
+    sync::{
+        OnceLock,
+        atomic::{AtomicU8, Ordering},
+    },
     time::Duration,
 };
 use tokio::{process::Command, sync::Notify};
@@ -101,6 +104,50 @@ pub enum AttentionCode {
     ServiceFailed,
     TiarisUnreachable,
     NotReady,
+    NestReplaced,
+    NestRemoved,
+}
+
+/// Tiaris retired this Nest's identity: another Nest replaced it, or it was
+/// removed. Manage says so when it refuses a signed request from this Nest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Retirement {
+    Replaced,
+    Removed,
+}
+
+impl Retirement {
+    /// The `diagnostic_code` Manage sends with the refusal.
+    pub fn from_diagnostic_code(code: &str) -> Option<Self> {
+        match code {
+            "nest_replaced" => Some(Self::Replaced),
+            "nest_removed" => Some(Self::Removed),
+            _ => None,
+        }
+    }
+}
+
+static RETIREMENT: AtomicU8 = AtomicU8::new(0);
+
+/// Record what Manage last said about this Nest's identity: retired, or
+/// (`None`) accepted again. The screen shows a retirement until then.
+pub fn record_retirement(retirement: Option<Retirement>) {
+    let value = match retirement {
+        None => 0,
+        Some(Retirement::Replaced) => 1,
+        Some(Retirement::Removed) => 2,
+    };
+    if RETIREMENT.swap(value, Ordering::Relaxed) != value {
+        notify_changed();
+    }
+}
+
+fn current_retirement() -> Option<Retirement> {
+    match RETIREMENT.load(Ordering::Relaxed) {
+        1 => Some(Retirement::Replaced),
+        2 => Some(Retirement::Removed),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -187,6 +234,8 @@ pub struct Observation {
     pub identity: Identity,
     pub pxe: Option<Pxe>,
     pub active_installs: Option<u32>,
+    /// Tiaris refused this Nest because it was replaced or removed.
+    pub retired: Option<Retirement>,
 }
 
 /// Consecutive-check memory ported from the retired console script.
@@ -211,6 +260,14 @@ impl ReadinessTracker {
             first_boot_active: true,
         });
         let mut status = base_status(observation);
+
+        // Nothing else on this screen matters for a Nest Tiaris retired.
+        if let Some(retirement) = observation.retired {
+            self.reset();
+            status.state = ConsoleState::Attention;
+            status.attention = Some(retired_attention(retirement, &name));
+            return status;
+        }
 
         if let Some(unit) = units.failed.first() {
             let label = unit_label(unit);
@@ -361,6 +418,31 @@ fn base_status(observation: &Observation) -> ConsoleStatus {
         booted_at: identity.booted_at.map(timestamp),
         system: identity.system.clone(),
         attention: None,
+    }
+}
+
+fn retired_attention(retirement: Retirement, name: &str) -> Attention {
+    let (code, title, detail) = match retirement {
+        Retirement::Replaced => (
+            AttentionCode::NestReplaced,
+            format!("{name} was replaced"),
+            "Another Nest took over its place in Tiaris, and Tiaris refuses this one. Switch this server off, or install it again from the Nest ISO to add it as a new Nest.",
+        ),
+        Retirement::Removed => (
+            AttentionCode::NestRemoved,
+            format!("{name} was removed from Tiaris"),
+            "Tiaris refuses this Nest. Switch this server off, or install it again from the Nest ISO to add it again.",
+        ),
+    };
+    Attention {
+        code,
+        title: bounded(&title, 80),
+        detail: bounded(detail, 240),
+        since: None,
+        check: Some(CheckRow {
+            label: "Connection to Tiaris".to_string(),
+            value: "Refused".to_string(),
+        }),
     }
 }
 
@@ -720,6 +802,7 @@ pub fn spawn(state: AppState) {
                     .and_then(Value::as_str)
                     .and_then(Pxe::parse),
                 active_installs,
+                retired: current_retirement(),
             };
             let status = tracker.evaluate(&observation);
             if let Err(error) = write_status(path, &status) {
