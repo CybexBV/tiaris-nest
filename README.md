@@ -357,17 +357,20 @@ November 2026); it answers the stick protocol:
   `GET /usb-installer/v1/select/<profile>` launches a menu choice as
   `/boot/select` does; `GET /usb-installer/v1/runtime` names the active
   runtime without creating a session. A stick older than
-  `MINIMUM_STICK_PROTOCOL` gets `410`.
+  `MINIMUM_STICK_PROTOCOL` (2: sticks that check the boot grant against the
+  Nest's clock) gets `410 usb_installer_outdated`, and its screen says to
+  download the USB installer again.
 
 The stick starts the runtime with `kexec`; the grant, enrollment and approval
 are those of network boot, and its Wi-Fi password never reaches Nest.
 
-`build-template.sh` writes the stick image beside the template ISO, as
-`tiaris-usb-installer.img` and its build record `tiaris-usb-installer.json`
-(checked against each other), when the pinned Tiaris revision builds a stick.
-Tiaris publishes that copy as a public download (Tiaris `docs/downloads.md`).
-It is not a release asset, not part of the installed Nest, and nothing signed
-changes: the release manifest keeps its exact keys.
+Every Nest release carries the stick. `build-template.sh` writes the image
+beside the template ISO, as `tiaris-usb-installer.img` and its build record
+`tiaris-usb-installer.json` (checked against each other). The release
+publishes it as the asset `tiaris-usb-installer-VERSION.img` and names it in
+the signed manifest (`usb_installer_image_v1`, see `RELEASES.md`). Tiaris
+mirrors that asset to its public downloads (Tiaris `docs/downloads.md`). It is
+not part of the installed Nest.
 
 ## Retired rootfs multicast
 
