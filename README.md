@@ -517,10 +517,18 @@ root checks the closure again, seals the next generation and selects it for one
 boot. Holds, active builds, maintenance leases and network transactions defer
 it. The service polls requests every 30 seconds.
 
+When Manage hands a newer release while an update waits, the daemon swaps the
+staged request for it under the maintenance lock, unless root has started
+installing the older one; root then drops what it prepared for the older one
+and prepares the newer one. The Nest advertises this as
+`appliance_update_replace_v1`.
+
 Idle means nothing kept the Nest busy for 10 minutes: no request from a
-computer in flight or served (boot, netboot, installer, USB stick, cache; health
-probes do not count), no computer that started the installer in the last ten
-minutes and no queued or running build.
+computer in flight or served (boot, netboot, installer, USB stick, cache), no
+computer that started the installer in the last ten minutes and no queued or
+running build. Health probes and the Nest's own requests do not count: nginx
+passes each client's address to the daemon, and a request from the Nest's own
+loopback address (its readiness check of the boot URL) serves no computer.
 The daemon writes this to `/run/tiaris-nest/activity.json`
 every 20 seconds (`src/activity.rs`). A missing or stale report counts as busy
 until the Nest has been up for 30 minutes: then the daemon serves nothing.

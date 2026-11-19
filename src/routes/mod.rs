@@ -2,7 +2,7 @@ pub mod boot;
 pub mod files;
 pub mod usb_installer;
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use axum::{
     Router,
@@ -109,6 +109,31 @@ async fn healthz(
         )
             .into_response()
     }
+}
+
+/// The address of the client nginx served. nginx sets `X-Forwarded-For` to
+/// the client's own address and drops what the client sent
+/// (`nixos-appliance/module.nix`), so this is known only for a request that
+/// reached the daemon on loopback with that header.
+pub(crate) fn forwarded_client(headers: &HeaderMap, connect: Option<SocketAddr>) -> Option<IpAddr> {
+    if !connect.is_some_and(|address| address.ip().is_loopback()) {
+        return None;
+    }
+    headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())?
+        .split(',')
+        .rev()
+        .find_map(|part| part.trim().parse::<IpAddr>().ok())
+}
+
+/// A request this Nest made to itself, such as its readiness check of the
+/// boot URL: nginx served it to a loopback address, which no computer has.
+/// Only the address decides; a marker such as `tiaris_check=1` never makes a
+/// computer's request the Nest's own. A loopback request that did not pass
+/// nginx says nothing about its client and is not counted as the Nest's own.
+pub(crate) fn is_own_request(headers: &HeaderMap, connect: Option<SocketAddr>) -> bool {
+    forwarded_client(headers, connect).is_some_and(|client| client.is_loopback())
 }
 
 fn is_direct_loopback_request(headers: &HeaderMap, connect: Option<SocketAddr>) -> bool {

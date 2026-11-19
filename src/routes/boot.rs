@@ -1,4 +1,4 @@
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 
 use axum::{
     extract::{ConnectInfo, Path, Query, State},
@@ -725,45 +725,18 @@ fn user_agent(headers: &HeaderMap) -> Option<String> {
 }
 
 fn remote_ip(connect: Option<SocketAddr>, headers: &HeaderMap) -> Option<String> {
-    let peer_is_loopback = connect.map(|addr| addr.ip().is_loopback()).unwrap_or(false);
-    if peer_is_loopback {
-        if let Some(forwarded) = headers
-            .get("x-forwarded-for")
-            .and_then(|value| value.to_str().ok())
-            .and_then(last_valid_forwarded_ip)
-        {
-            return Some(forwarded);
-        }
-    }
-
-    connect.map(|addr| addr.ip().to_string())
+    super::forwarded_client(headers, connect)
+        .or_else(|| connect.map(|addr| addr.ip()))
+        .map(|ip| ip.to_string())
 }
 
+/// The Nest's own readiness check: the marker, from the Nest itself.
 fn is_local_checker_request(
     query: &BootQuery,
     headers: &HeaderMap,
     connect: Option<SocketAddr>,
 ) -> bool {
-    if !matches!(query.tiaris_check.as_deref(), Some("1")) {
-        return false;
-    }
-    if !connect.map(|addr| addr.ip().is_loopback()).unwrap_or(false) {
-        return false;
-    }
-    headers
-        .get("x-forwarded-for")
-        .and_then(|value| value.to_str().ok())
-        .and_then(last_valid_forwarded_ip)
-        .and_then(|ip| ip.parse::<IpAddr>().ok())
-        .map(|ip| ip.is_loopback())
-        .unwrap_or(true)
-}
-
-fn last_valid_forwarded_ip(value: &str) -> Option<String> {
-    value
-        .split(',')
-        .rev()
-        .find_map(|part| part.trim().parse::<IpAddr>().ok().map(|ip| ip.to_string()))
+    matches!(query.tiaris_check.as_deref(), Some("1")) && super::is_own_request(headers, connect)
 }
 
 fn clean_text(value: &str, max_chars: usize) -> Option<String> {
@@ -1000,6 +973,11 @@ mod tests {
         let loopback: SocketAddr = "127.0.0.1:50200".parse().unwrap();
         let remote: SocketAddr = "192.0.2.55:50200".parse().unwrap();
 
+        // Without nginx's header a loopback request says nothing of its client.
+        assert!(!is_local_checker_request(&query, &headers, Some(loopback)));
+        assert!(!is_local_checker_request(&query, &headers, Some(remote)));
+
+        headers.insert("x-forwarded-for", HeaderValue::from_static("127.0.0.1"));
         assert!(is_local_checker_request(&query, &headers, Some(loopback)));
         assert!(!is_local_checker_request(&query, &headers, Some(remote)));
 

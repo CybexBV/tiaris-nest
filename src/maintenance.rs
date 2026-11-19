@@ -128,6 +128,39 @@ pub async fn acquire_build_lease() -> Result<BuildLease> {
     }
 }
 
+/// Hold the maintenance barrier alone, or `None` while the root updater or a
+/// build holds it or an update transaction waits for recovery. The daemon
+/// replaces a staged update only under it, so the root updater never prepares
+/// or installs a request while it changes.
+pub fn try_exclusive() -> Result<Option<BuildLease>> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open("/run/lock/tiaris-nest/maintenance.lock")?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.nlink() != 1
+        || metadata.uid() != 0
+        || metadata.gid() != 985
+        || metadata.mode() & 0o007 != 0
+    {
+        bail!("unsafe maintenance barrier")
+    }
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::WouldBlock {
+            return Ok(None);
+        }
+        return Err(error.into());
+    }
+    let lease = BuildLease(Some(file));
+    if generation_recovery_pending(Path::new(CONTROL)) {
+        return Ok(None);
+    }
+    Ok(Some(lease))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

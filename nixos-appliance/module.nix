@@ -124,6 +124,10 @@ in {
       defaultListenAddresses = [ "0.0.0.0" ];
       virtualHosts."_" = {
         default = true;
+        # The daemon tells a computer from the Nest's own readiness check by
+        # this address (src/routes/mod.rs, `is_own_request`); it replaces
+        # whatever the client sent.
+        extraConfig = "proxy_set_header X-Forwarded-For $remote_addr;";
         locations."/".proxyPass = "http://127.0.0.1:8080";
         locations."~ \"^/boot-session/[A-Za-z0-9_-]{22}/context\\.cpio$\"" = { proxyPass = "http://127.0.0.1:8080"; extraConfig = "access_log off;"; };
         locations."= /files/assets/pxe-menu.png".alias = "${a.package}/share/tiaris-nest/assets/pxe-menu.png";

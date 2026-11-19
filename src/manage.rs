@@ -140,6 +140,9 @@ struct PeerContract {
     /// Manage accepts `boot_machine_identity_v1` (`boot_machines`).
     #[serde(default)]
     accepts_boot_machine_identity: bool,
+    /// Manage accepts `appliance_update_replace_v1`.
+    #[serde(default)]
+    accepts_update_replace: bool,
     runtime_epoch: bool,
     report_protocol: u32,
 }
@@ -243,6 +246,9 @@ struct AgentNestConfigResponse {
     /// not advertise it (an older Manage rejects the report).
     #[serde(default)]
     boot_machine_identity_supported: bool,
+    /// Manage accepts `appliance_update_replace_v1`, the same way.
+    #[serde(default)]
+    appliance_update_replace_supported: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1130,6 +1136,7 @@ async fn sync_nest_foundation(
                 accepts_when_idle: desired.update_when_idle_supported,
                 accepts_site_check: desired.site_check_supported,
                 accepts_boot_machine_identity: desired.boot_machine_identity_supported,
+                accepts_update_replace: desired.appliance_update_replace_supported,
                 runtime_epoch: desired
                     .compatibility
                     .as_ref()
@@ -1165,6 +1172,7 @@ async fn sync_nest_foundation(
             when_idle: peer.accepts_when_idle,
             site_check: peer.accepts_site_check,
             boot_machine_identity: peer.accepts_boot_machine_identity,
+            update_replace: peer.accepts_update_replace,
         },
         peer.report_protocol,
     )
@@ -1198,6 +1206,7 @@ fn peer_contract_after_failed_fetch(
         accepts_when_idle: false,
         accepts_site_check: false,
         accepts_boot_machine_identity: false,
+        accepts_update_replace: false,
         runtime_epoch: false,
         report_protocol: TIARIS_COMPONENT_PROTOCOL_VERSION,
     })
@@ -2866,6 +2875,7 @@ struct PeerReportSupport {
     when_idle: bool,
     site_check: bool,
     boot_machine_identity: bool,
+    update_replace: bool,
 }
 
 fn nest_capabilities(
@@ -2888,6 +2898,9 @@ fn nest_capabilities(
     }
     if peer_support.boot_machine_identity {
         capabilities.push(crate::boot_machines::CAPABILITY);
+    }
+    if peer_support.update_replace && capabilities.contains(&crate::appliance::nixos::CAPABILITY) {
+        capabilities.push(crate::appliance::nixos::REPLACE_CAPABILITY);
     }
     capabilities
 }
@@ -3784,6 +3797,7 @@ mod tests {
             accepts_when_idle: true,
             accepts_site_check: true,
             accepts_boot_machine_identity: true,
+            accepts_update_replace: true,
             runtime_epoch: true,
             report_protocol: TIARIS_DETECTED_COMMITS_PROTOCOL_VERSION,
         };
@@ -5283,6 +5297,7 @@ mod tests {
             when_idle: false,
             site_check: false,
             boot_machine_identity: false,
+            update_replace: false,
         };
         let legacy = nest_capabilities(false, support(&older));
         let modern = nest_capabilities(false, support(&newer));
@@ -5308,6 +5323,7 @@ mod tests {
             when_idle: false,
             site_check,
             boot_machine_identity: false,
+            update_replace: false,
         };
         assert!(!nest_capabilities(false, support(false)).contains(&crate::site_check::CAPABILITY));
         assert!(nest_capabilities(false, support(true)).contains(&crate::site_check::CAPABILITY));
@@ -5333,6 +5349,7 @@ mod tests {
             when_idle: false,
             site_check: false,
             boot_machine_identity,
+            update_replace: false,
         };
         assert!(
             !nest_capabilities(false, support(false)).contains(&crate::boot_machines::CAPABILITY)
