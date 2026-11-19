@@ -114,7 +114,7 @@ fn read_installed() -> Result<InstalledState> {
     ensure!(
         state.schema == "tiaris.nest.installed-appliance.v3"
             && state.base_os == "nixos"
-            && state.base_os_version == release_v3::NIXOS_VERSION
+            && state.base_os_version == state.release.base_os_version
             && state.at_rest_protection == "none"
             && state.system_toplevel == state.release.system_toplevel
             && state.system_closure_sha256 == state.release.system_closure.sha256,
@@ -935,8 +935,8 @@ mod tests {
             release_id: "0.2.30".into(),
             source_revision: "a".repeat(40),
             base_os: "nixos".into(),
-            base_os_version: release_v3::NIXOS_VERSION.into(),
-            nixpkgs_revision: release_v3::pinned_nixpkgs_revision().into(),
+            base_os_version: "26.05".into(),
+            nixpkgs_revision: "c".repeat(40),
             manage_source_revision: "b".repeat(40),
             system_toplevel: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-system".into(),
             system_closure: SystemClosure {
