@@ -21,8 +21,6 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["clock", "serde"] }
 chrono-tz = "0.10"
 clap = { version = "4.5", features = ["derive", "env"] }
-# X25519 for state backups (already in the graph through ed25519-dalek).
-curve25519-dalek = "4"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 hex = "0.4"
 # Wraps response bodies to count downloads in flight (already in the graph through axum).
@@ -30,8 +28,6 @@ http-body = "1"
 libc = "0.2"
 mime_guess = "2.0"
 rand = "0.8"
-# AEAD and HKDF for state backups (already in the graph through rustls).
-ring = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 # The site check's TLS probe keeps the certificate an intercepting proxy
 # presents (already in the graph through reqwest).
