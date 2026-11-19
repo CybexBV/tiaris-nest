@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Only a root-verified signed policy can authorize an update: Update now, the
-Nest being idle (mode when_idle) or the maintenance window (mode window, and
-every schema v1 policy). Exit 0 allows it; exit 75 prints what it waits for."""
+"""Only a root-verified signed policy can authorize an update. The Nest
+installs it when it is idle, and in the policy's night period at the latest;
+"Update now" skips the wait for one attempt. There are no modes: a policy that
+still names `window` (signed before 19 November 2026) is read the same way.
+Exit 0 allows it; exit 75 prints what it waits for."""
 import datetime
 import json
 from pathlib import Path
@@ -60,9 +62,10 @@ def waiting_for(policy, request, now, is_idle=idle):
             and immediate['release_id'] == release['release_id']
             and immediate['system_closure_sha256'] == release['system_closure']['sha256']):
         return None
-    if policy.get('mode', 'window') == 'when_idle':
-        return None if is_idle(now) else 'nest_busy'
-    return None if in_window(policy['schedule'], now) else 'maintenance_window'
+    # The night deadline: a Nest that is never idle updates in the night anyway.
+    if is_idle(now) or in_window(policy['schedule'], now):
+        return None
+    return 'nest_busy'
 
 
 def allowed(policy, request, now, is_idle=idle):
@@ -71,14 +74,12 @@ def allowed(policy, request, now, is_idle=idle):
 
 def main():
     if not (INBOX / 'update-schedule.json').exists() and not (CONTROL / 'update-schedule.json').exists():
-        print('maintenance_window')
+        print('nest_busy')
         return 75
     verified = run('/usr/bin/tiaris-nest', 'verify-appliance-update-policy')
     if verified != str(CONTROL / 'update-schedule.json'):
         raise ValueError('invalid verified policy path')
     policy = load(Path(verified), maximum=64 * 1024)
-    if policy.get('mode', 'window') not in ('when_idle', 'window'):
-        raise ValueError('unknown update mode')
     request = load(INBOX / 'appliance-update-request.json', owner=UID)
     waiting = waiting_for(policy, request, datetime.datetime.now(datetime.timezone.utc))
     if waiting is None:

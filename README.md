@@ -461,9 +461,10 @@ keeps serving: root independently verifies the bounded archive and the live
 SQLite migration inventory, imports and roots its closure, checks it against the
 release and rehearses the database (status `waiting_window`, stage
 `preparing_ahead`). Nothing touches boot state yet. Signed policy then admits
-the switch: **Update now**, the Nest being idle (mode `when_idle`, the default
-from Manage), or the maintenance window (mode `window`, and every v1 policy).
-While it waits the stage is `nest_busy` or `maintenance_window`. At the switch
+the switch: **Update now**, the Nest being idle, or the night period the policy
+names (the deadline for a Nest that is never idle). There are no modes: a policy
+signed earlier with mode `window` is read the same way. While it waits the stage
+is `nest_busy`. At the switch
 root checks the closure again, seals the next generation and selects it for one
 boot. Holds, active builds, maintenance leases and network transactions defer
 it. The service polls requests every 30 seconds.

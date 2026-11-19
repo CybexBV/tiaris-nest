@@ -63,7 +63,7 @@ class ReadBoundary(unittest.TestCase):
 
     def test_unknown_generations_are_omitted(self):
         with patch.object(state, 'save') as save:
-            state.emit_status({'attempt_id': 'attempt'}, 'waiting_window', 'maintenance_window')
+            state.emit_status({'attempt_id': 'attempt'}, 'waiting_window', 'nest_busy')
             value = save.call_args.args[1]
             self.assertNotIn('candidate_system_generation', value)
             self.assertNotIn('resulting_system_generation', value)
@@ -78,7 +78,8 @@ class MaintenancePolicy(unittest.TestCase):
         return {'schedule': {'weekdays': weekdays, 'start': start, 'duration_minutes': duration, 'timezone': timezone}}
 
     def check(self, policy, timestamp):
-        return window.allowed(policy, self.request, datetime.datetime.fromisoformat(timestamp))
+        """Whether a Nest that is busy may update at `timestamp`: the night deadline."""
+        return window.allowed(policy, self.request, datetime.datetime.fromisoformat(timestamp), lambda now: False)
 
     def test_saturday_window_crosses_sunday_boundary(self):
         policy = self.policy([6], '23:30', 120)
@@ -101,7 +102,7 @@ class MaintenancePolicy(unittest.TestCase):
             changed['run_now'][key] = 'different'
             self.assertFalse(self.check(changed, '2026-09-20T12:00:00+00:00'))
 
-    def test_when_idle_waits_only_for_a_busy_nest_and_run_now_skips_it(self):
+    def test_waits_for_an_idle_nest_until_the_night_and_run_now_skips_it(self):
         policy = self.policy([0], '02:00', 60)
         policy['mode'] = 'when_idle'
         at = datetime.datetime.fromisoformat('2026-09-23T12:00:00+00:00')
@@ -109,12 +110,27 @@ class MaintenancePolicy(unittest.TestCase):
         self.assertEqual(window.waiting_for(policy, self.request, at, lambda now: False), 'nest_busy')
         policy['run_now'] = {'attempt_id': 'a', 'release_id': '1.2.3', 'system_closure_sha256': 'digest'}
         self.assertIsNone(window.waiting_for(policy, self.request, at, lambda now: False))
-        # Schema v1 and mode window keep the schedule, whatever the activity.
-        for mode in (None, 'window'):
-            changed = self.policy([0], '02:00', 60)
+
+    def test_a_nest_that_is_never_idle_updates_in_the_night(self):
+        # Every night, 02:00 for two hours, as Manage signs it.
+        policy = self.policy(list(range(7)), '02:00', 120)
+        policy['mode'] = 'when_idle'
+        busy = lambda now: False
+        for moment, expected in (('2026-09-23T01:59:00+00:00', 'nest_busy'), ('2026-09-23T02:00:00+00:00', None),
+                                 ('2026-09-23T03:59:00+00:00', None), ('2026-09-23T04:00:00+00:00', 'nest_busy')):
+            at = datetime.datetime.fromisoformat(moment)
+            self.assertEqual(window.waiting_for(policy, self.request, at, busy), expected, moment)
+
+    def test_there_are_no_modes_any_more(self):
+        # A policy signed before 19 November 2026 may name `window` or no mode
+        # (schema v1): the Nest reads it like any other.
+        at = datetime.datetime.fromisoformat('2026-09-23T12:00:00+00:00')
+        for mode in (None, 'window', 'when_idle'):
+            policy = self.policy([0], '02:00', 60)
             if mode:
-                changed['mode'] = mode
-            self.assertEqual(window.waiting_for(changed, self.request, at, lambda now: True), 'maintenance_window')
+                policy['mode'] = mode
+            self.assertIsNone(window.waiting_for(policy, self.request, at, lambda now: True))
+            self.assertEqual(window.waiting_for(policy, self.request, at, lambda now: False), 'nest_busy')
 
 
 class NestActivity(unittest.TestCase):
@@ -216,14 +232,12 @@ class PrepareThenSwitch(unittest.TestCase):
 
     def test_prepares_before_waiting_and_switches_only_when_allowed(self):
         self.assertEqual(self.run_stage(None, 'nest_busy'), ['prepare', 'gate', ('waiting_window', 'nest_busy')])
-        self.assertEqual(self.run_stage(self.prepared, 'maintenance_window'), ['gate', ('waiting_window', 'maintenance_window')])
         self.assertEqual(self.run_stage(self.prepared, None), ['gate', 'activate'])
         # After a crash during activation the report never goes back to waiting.
         self.assertEqual(self.run_stage(self.prepared, 'nest_busy', started=True), ['activate'])
 
     def test_the_gate_names_what_it_waits_for(self):
-        for code, output, expected in ((0, '', None), (75, 'nest_busy\n', 'nest_busy'),
-                                       (75, 'maintenance_window\n', 'maintenance_window'), (75, '', 'maintenance_window')):
+        for code, output, expected in ((0, '', None), (75, 'nest_busy\n', 'nest_busy'), (75, '', 'nest_busy')):
             with patch.object(update.subprocess, 'run', return_value=SimpleNamespace(returncode=code, stdout=output)):
                 self.assertEqual(update.waiting_for(), expected)
         with patch.object(update.subprocess, 'run', return_value=SimpleNamespace(returncode=1, stdout='')):

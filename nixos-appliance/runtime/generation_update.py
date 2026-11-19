@@ -395,7 +395,6 @@ def free_space(verified):
 
 WINDOW = '/usr/lib/tiaris-nest/tiaris-nest-appliance-update-window'
 PREPARED_SCHEMA = 'tiaris.nest.prepared-appliance-update.v1'
-WAITING_STAGES = ('maintenance_window', 'nest_busy')
 
 
 def prepared_receipt_path(attempt):
@@ -404,15 +403,14 @@ def prepared_receipt_path(attempt):
 
 def waiting_for():
     """None when the signed policy lets the update start now, else the stage
-    it waits in: the maintenance window, or the Nest being busy."""
+    it waits in: the Nest being busy (`nest_busy`)."""
     result = subprocess.run([WINDOW, str(CONTROL / 'install-plan.json')], timeout=30,
                             capture_output=True, text=True)
     if result.returncode == 0:
         return None
     if result.returncode != 75:
         raise ValueError('invalid update policy')
-    reason = result.stdout.strip()
-    return reason if reason in WAITING_STAGES else 'maintenance_window'
+    return 'nest_busy'
 
 
 def prepared_update():
@@ -574,8 +572,8 @@ def activate(prepared):
 
 
 def stage():
-    """Prepare as soon as an update arrives, wait for what the signed policy
-    names (Update now, the Nest being idle, or the window), then switch."""
+    """Prepare as soon as an update arrives, wait until the signed policy lets
+    it start (Update now, the Nest being idle, or the night), then switch."""
     if not REQUEST.exists():
         return
     with maintenance_lock():
