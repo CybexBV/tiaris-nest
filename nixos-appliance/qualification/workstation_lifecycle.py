@@ -326,8 +326,9 @@ def run(api, state, nest, manifest, catalog, output):
                           next(v for v in catalog['blueprints']
                                if v['slug'] not in ('standard_workstation', 'dock_workstation'))):
             if blueprint != first:
+                # Manage applies the Blueprint's current release; no request names a version.
                 api(prefix + '/operations/apply-blueprint', {'request_id': str(uuid.uuid4()),
-                    'blueprint_id': blueprint['id'], 'blueprint_revision_id': blueprint['current_revision_id']})
+                    'blueprint_id': blueprint['id']})
                 converge(blueprint, installed, after_apply=True)
             before = device()
             requested = now()
