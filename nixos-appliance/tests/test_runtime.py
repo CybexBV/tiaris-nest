@@ -223,7 +223,8 @@ class PrepareThenSwitch(unittest.TestCase):
                 patch.object(update, 'prepared_update', return_value=prepared), \
                 patch.object(update, 'drop_prepared', side_effect=lambda: calls.append('drop')), \
                 patch.object(update, 'prepare', side_effect=lambda: calls.append('prepare') or self.prepared), \
-                patch.object(update, 'waiting_for', side_effect=lambda: calls.append('gate') or waiting), \
+                patch.object(update, 'waiting_for', side_effect=lambda: calls.append('gate') or (waiting, 'why')), \
+                patch.object(update, 'last_report', return_value={}), \
                 patch.object(update, 'started', return_value=started), \
                 patch.object(update, 'activate', side_effect=lambda receipt: calls.append('activate')), \
                 patch.object(update, 'emit_status', side_effect=lambda receipt, status, stage, *a: calls.append((status, stage))):
@@ -253,7 +254,10 @@ class PrepareThenSwitch(unittest.TestCase):
         self.assertEqual(sorted(path.name for path in self.roots.iterdir()), ['good-7'])
 
     def test_the_gate_names_what_it_waits_for(self):
-        for code, output, expected in ((0, '', None), (75, 'nest_busy\n', 'nest_busy'), (75, '', 'nest_busy')):
+        for code, output, expected in ((0, '', (None, '')), (0, 'the Nest is idle (quiet)\n', (None, 'the Nest is idle (quiet)')),
+                                       (75, 'nest_busy\n', ('nest_busy', '')), (75, '', ('nest_busy', '')),
+                                       (75, 'nest_busy\nthe Nest is busy (it is building apps)\n',
+                                        ('nest_busy', 'the Nest is busy (it is building apps)'))):
             with patch.object(update.subprocess, 'run', return_value=SimpleNamespace(returncode=code, stdout=output)):
                 self.assertEqual(update.waiting_for(), expected)
         with patch.object(update.subprocess, 'run', return_value=SimpleNamespace(returncode=1, stdout='')):

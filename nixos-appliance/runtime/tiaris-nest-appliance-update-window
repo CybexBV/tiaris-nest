@@ -3,7 +3,8 @@
 installs it when it is idle, and in the policy's night period at the latest;
 "Update now" skips the wait for one attempt. There are no modes: a policy that
 still names `window` (signed before 19 November 2026) is read the same way.
-Exit 0 allows it; exit 75 prints what it waits for."""
+Exit 0 allows it; exit 75 prints what it waits for. Either way the last line
+says why, in plain words, for the journal."""
 import datetime
 import json
 from pathlib import Path
@@ -37,9 +38,19 @@ def timestamp(value):
     return parsed.replace(tzinfo=datetime.timezone.utc)
 
 
-def idle(now, activity=ACTIVITY, uptime=uptime_seconds):
-    """Idle once nothing kept the Nest busy for QUIET_SECONDS. A missing or
-    stale report fails closed until the Nest has run for a while."""
+# What the daemon reports as keeping the Nest busy, in plain words.
+BUSY_WORDS = {
+    'serving_computers': 'it is serving computers',
+    'computers_starting': 'computers are starting or installing from it',
+    'building_apps': 'it is building apps',
+    'activity_unknown': 'it could not read its own activity',
+}
+
+
+def activity(now, activity=ACTIVITY, uptime=uptime_seconds):
+    """Whether the Nest is idle, and why, in plain words. Idle once nothing
+    kept the Nest busy for QUIET_SECONDS. A missing or stale report fails
+    closed until the Nest has run for a while."""
     try:
         report = load(activity, owner=UID, maximum=4 * 1024)
         if report['schema'] != 'tiaris.nest.activity.v1' or not isinstance(report['busy'], list):
@@ -48,24 +59,46 @@ def idle(now, activity=ACTIVITY, uptime=uptime_seconds):
         since = report['idle_since']
         since = None if since is None else timestamp(since)
     except (OSError, ValueError, KeyError, TypeError):
-        return uptime() >= UNREPORTED_UPTIME_SECONDS
-    if not -60 <= age <= STALE_SECONDS:
-        return uptime() >= UNREPORTED_UPTIME_SECONDS
-    return not report['busy'] and since is not None and (now - since).total_seconds() >= QUIET_SECONDS
+        age, report = None, None
+    if report is None or not -60 <= age <= STALE_SECONDS:
+        minutes = UNREPORTED_UPTIME_SECONDS // 60
+        if uptime() >= UNREPORTED_UPTIME_SECONDS:
+            return True, f'its activity report is missing or old, and it has run for more than {minutes} minutes'
+        return False, f'its activity report is missing or old, and it started less than {minutes} minutes ago'
+    if report['busy']:
+        words = sorted({BUSY_WORDS.get(str(reason), str(reason)) for reason in report['busy']})
+        return False, ' and '.join(words)
+    quiet = None if since is None else (now - since).total_seconds()
+    if quiet is None or quiet < QUIET_SECONDS:
+        return False, f'it was busy less than {QUIET_SECONDS // 60} minutes ago'
+    return True, f'nothing kept it busy for {int(quiet // 60)} minutes'
 
 
-def waiting_for(policy, request, now, is_idle=idle):
-    """None when the update may start, else the status stage it waits in."""
+def idle(now, activity_path=ACTIVITY, uptime=uptime_seconds):
+    return activity(now, activity_path, uptime)[0]
+
+
+def decide(policy, request, now, describe=activity):
+    """None when the update may start, else the status stage it waits in;
+    and why, in plain words."""
     immediate = policy.get('run_now')
     release = request['release']
     if immediate and (immediate['attempt_id'] == request['attempt_id']
             and immediate['release_id'] == release['release_id']
             and immediate['system_closure_sha256'] == release['system_closure']['sha256']):
-        return None
+        return None, 'someone chose Update now for it'
+    is_idle, words = describe(now)
+    if is_idle:
+        return None, 'the Nest is idle (' + words + ')'
     # The night deadline: a Nest that is never idle updates in the night anyway.
-    if is_idle(now) or in_window(policy['schedule'], now):
-        return None
-    return 'nest_busy'
+    if in_window(policy['schedule'], now):
+        return None, 'it is the night, when the Nest updates even when busy (' + words + ')'
+    return 'nest_busy', 'the Nest is busy (' + words + ')'
+
+
+def waiting_for(policy, request, now, is_idle=idle):
+    """None when the update may start, else the status stage it waits in."""
+    return decide(policy, request, now, lambda now: (is_idle(now), ''))[0]
 
 
 def allowed(policy, request, now, is_idle=idle):
@@ -81,10 +114,12 @@ def main():
         raise ValueError('invalid verified policy path')
     policy = load(Path(verified), maximum=64 * 1024)
     request = load(INBOX / 'appliance-update-request.json', owner=UID)
-    waiting = waiting_for(policy, request, datetime.datetime.now(datetime.timezone.utc))
+    waiting, why = decide(policy, request, datetime.datetime.now(datetime.timezone.utc))
     if waiting is None:
+        print(why)
         return 0
     print(waiting)
+    print(why)
     return 75
 
 
