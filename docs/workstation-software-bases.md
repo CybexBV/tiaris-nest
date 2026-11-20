@@ -68,11 +68,11 @@ Manage offers it as a software update.
   fork-only commit diverges from the branch. Any failure, including the
   API's rate limit, records `blocked`, `provenance_unverified`.
 - **Retries and time.** A recorded commit is evaluated again when its
-  evaluation, provenance or disk check failed at least a day ago, and when
-  it is blocked and another Nest build or shipped Tiaris source evaluated it
-  (an update of the Nest may be what it waited for; that look happens at
-  startup after the update); a
-  request from Manage repeats only the channel lookup. One commit's
+  evaluation, provenance or disk check failed at least a day ago. At startup
+  the record of every commit another Nest build held back is removed and the
+  channel is read again at once: an update of the Nest may be what the
+  commit waited for. A ready commit stays ready. A request from Manage
+  repeats only the channel lookup. One commit's
   evaluation is bounded to 60 minutes (`evaluation_failed`, `time limit`).
 - **Disk.** The check needs 4 GiB free in the build work directory
   (`insufficient_disk` otherwise, retried daily). Each dry run keeps its
@@ -100,9 +100,10 @@ Manage offers it as a software update.
   `buildCommand` instead of a package's build phases, like every
   `runCommand`: the unpacking of each vendored crate of the Tiaris
   packages, whose versions come and go in the public cache); and no
-  reference builds a derivation of the same role at the pin. The role is the name up to its version, as Nix's `parseDrvName`
-  splits it (`initrd-linux-6.18.64` and `initrd-linux-6.18.40` are one
-  role; every `nixos-system-…` is `nixos-system`). What the pin builds on a
+  reference builds a derivation of the same role at the pin. The role is
+  the name up to its version, as Nix's `parseDrvName` splits it
+  (`initrd-linux-6.18.64` and `initrd-linux-6.18.40` are one role; every
+  `nixos-system-…` is `nixos-system`). What the pin builds on a
   Nest (the Tiaris packages, the initrd, generated configuration) is what
   the Tiaris release was made and tested with, so the same kind of work at
   the commit is expected. What is left is real new compilation, for
@@ -116,8 +117,7 @@ Manage offers it as a software update.
   (`reference_blueprints_missing`; the plain profiles are still checked), a
   verdict of another Nest build (`rederivation_pending`: a ready commit
   stays ready across Nest updates) and the bound of 256 Tiaris package
-  derivations. A record with one of those reasons is not used: its commit is
-  evaluated again.
+  derivations. A record with one of those reasons is removed at startup.
 - **Where it is kept.** Not in SQLite: NixOS appliances refuse an update
   whose migration inventory differs from the installed release's, so the
   schema stays that of the published releases (`release/sqlite-migrations.sha256`).
