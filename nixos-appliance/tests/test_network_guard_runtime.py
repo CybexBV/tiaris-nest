@@ -195,7 +195,8 @@ class RecoverySshUnitGraph(unittest.TestCase):
             'retryStartsRecoverySsh', 'sshFailureDoesNotFailFirstBoot', 'firstBootDoesNotWaitForSsh',
             'sshRequiresMaterializedTrust', 'sshRequiresFirewall', 'firewallFollowsFirstBoot',
             'nestRetriesFirstBoot', 'networkRuntimeCanRetryWithoutNest', 'networkRetryTimerRemainsEnabled',
-            'startUpChecksDoNotWaitForTheNetwork', 'nothingRequiresTheNetworkGuard'})
+            'startUpChecksDoNotWaitForTheNetwork', 'nothingRequiresTheNetworkGuard',
+            'bootFileServerWaitsForTheNetworkAndNeverGivesUp'})
         self.assertTrue(all(value is True for value in checks.values()), checks)
 
     def test_sshd_keeps_requiring_materialized_trust_and_firewall(self):

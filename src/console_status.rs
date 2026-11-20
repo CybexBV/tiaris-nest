@@ -174,6 +174,11 @@ pub struct ConsoleStatus {
     pub updated_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stage: Option<Stage>,
+    /// This start finishes the setup: the Nest has not reported to Tiaris in
+    /// an earlier start. The console continues the install steps only then;
+    /// a later restart shows a plain starting line.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub first_setup: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -244,11 +249,24 @@ pub struct ReadinessTracker {
     non_ready_checks: u32,
     non_ready_since: Option<DateTime<Utc>>,
     attention: Option<(AttentionCode, String, DateTime<Utc>)>,
+    /// A report to Tiaris from an earlier start was seen: setup is done. Kept
+    /// for the daemon's life, because this start's own report replaces the
+    /// receipt that showed it.
+    set_up_before: bool,
 }
 
 impl ReadinessTracker {
     /// Precedence: attention > starting > healthy.
     pub fn evaluate(&mut self, observation: &Observation) -> ConsoleStatus {
+        if observation.last_contact.is_some() && !observation.contacted_this_boot {
+            self.set_up_before = true;
+        }
+        let mut status = self.evaluate_state(observation);
+        status.first_setup = status.state == ConsoleState::Starting && !self.set_up_before;
+        status
+    }
+
+    fn evaluate_state(&mut self, observation: &Observation) -> ConsoleStatus {
         let name = observation
             .identity
             .name
@@ -412,6 +430,7 @@ fn base_status(observation: &Observation) -> ConsoleStatus {
         state: ConsoleState::Starting,
         updated_at: timestamp(observation.now),
         stage: None,
+        first_setup: false,
         name: identity.name.clone(),
         organization: identity.organization.clone(),
         tiaris_host: identity.tiaris_host.clone(),

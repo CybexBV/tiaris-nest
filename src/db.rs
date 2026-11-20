@@ -2844,10 +2844,6 @@ fn terminal_build_progress_message(status: &str, metadata: Option<&Value>) -> St
             Some("insufficient_swap") => "Nest swap is below the required minimum".to_string(),
             Some("insufficient_disk_space") => "Nest disk space is insufficient".to_string(),
             Some("package_build_failed") => "A package failed to build".to_string(),
-            Some("source_build_blocked") => {
-                "Blocked: requires building from source (not allowed for this Blueprint)"
-                    .to_string()
-            }
             Some("nix_daemon_unavailable") => "Nix daemon is unavailable".to_string(),
             Some("network_unavailable") => "Nest could not reach the network".to_string(),
             Some("evaluation_failed") => "The configuration could not be evaluated".to_string(),

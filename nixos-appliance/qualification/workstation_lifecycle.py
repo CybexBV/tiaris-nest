@@ -12,7 +12,6 @@ import uuid
 
 from isolated_fixture import QMP, stop, private_state, SCOPE
 from isolated_manage_transport import http_error_details
-from blueprint_delivery import source_free
 
 def now():
     return datetime.datetime.now(datetime.timezone.utc)
@@ -242,15 +241,13 @@ def run(api, state, nest, manifest, catalog, output):
     descriptor = manifest['workstation_netboot']
     runtime_path = f'/v1/nest/nodes/{nest.device}/workstation-netboot'
     require_runtime(api(runtime_path), descriptor)
-    policy = api('/v1/nest/delivery-policy')
-    if not source_free(policy):
-        raise ValueError('Workstation qualification requires the source-free delivery policy')
     blueprints = {v['slug']: v for v in catalog['blueprints']}
     first = blueprints['standard_workstation']
     boot_base = f'/v1/boot/servers/{nest.device}'
-    profiles = api(boot_base + '/profiles?limit=100&offset=0')
-    enabled = [v for v in profiles['profiles'] if v['enabled'] and v['profile_type'] == 'nest_installer']
-    if profiles['total'] > 100 or len(enabled) != 1:
+    # The Nest's own page lists its boot profiles; no route of their own is needed.
+    profiles = api(f'/v1/nest/nodes/{nest.device}')['profiles']
+    enabled = [v for v in profiles if v['enabled'] and v['profile_type'] == 'nest_installer']
+    if len(enabled) != 1:
         raise ValueError('New private Nest must have exactly one enabled installer profile')
     started = now()
     checks = []
@@ -341,9 +338,6 @@ def run(api, state, nest, manifest, catalog, output):
                 'boot_id_before': before['facts_json']['boot_id'], 'boot_id_after': after['facts_json']['boot_id'],
                 'system': after['facts_json']['blueprint_generation']['booted_system']})
         require_runtime(api(runtime_path), descriptor)
-        policy = api('/v1/nest/delivery-policy')
-        if not source_free(policy):
-            raise ValueError('Source-free delivery policy changed during workstation qualification')
     output.write_text(json.dumps({'schema': 'tiaris.nest.published-workstation-qualification.v1', 'ok': True,
         'release_version': manifest['version'], 'runtime_version': descriptor['runtime_version'],
         'bundle_sha256': descriptor['sha256'], 'descriptor_sha256': descriptor_digest(descriptor),
