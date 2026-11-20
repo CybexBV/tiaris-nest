@@ -19,7 +19,17 @@ let
     assert lib.hasPrefix "-----BEGIN CERTIFICATE-----\n" text;
     assert !lib.hasInfix "PRIVATE KEY" text;
     builtins.path { path = builtins.toPath journeyCaCertificate; name = "tiaris-journey-ca.crt"; };
-  journeyTrust = lib.optional (journeyCa != null) { security.pki.certificateFiles = [ journeyCa ]; };
+  journeyTrust = lib.optional (journeyCa != null) {
+    security.pki.certificateFiles = [ journeyCa ];
+    # The journey keeps each machine's serial log as evidence: the ISO and the
+    # installed Nest write their journal there (nobody can sign in to look).
+    boot.kernelParams = [ "console=ttyS0,115200" "console=tty0" ];
+    services.journald.extraConfig = ''
+      ForwardToConsole=yes
+      TTYPath=/dev/ttyS0
+      MaxLevelConsole=info
+    '';
+  };
   package = import ./package.nix { inherit pkgs manageOrigin; journeySystemRoots = journeyCa != null; };
   migrations = pkgs.runCommand "tiaris-nest-sqlite-migrations" { nativeBuildInputs = [ pkgs.python3 ]; } ''
     mkdir -p $out
