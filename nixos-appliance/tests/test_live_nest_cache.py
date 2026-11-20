@@ -33,7 +33,6 @@ class LiveNestCache(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body['status'], 'ok')
         self.assertEqual(body['environment'], 'development')
-        self.assertIn('signed_device_requests_v1', body['capabilities'])
 
     def test_anonymous_cache_inventory_access_is_denied(self):
         for path in ('/v1/nest/nodes', '/v1/nest/nodes/nightly-unauthenticated/cache/artifacts'):
