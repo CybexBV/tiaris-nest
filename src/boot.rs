@@ -53,12 +53,64 @@ pub struct ProfileSelection<'a> {
 const IPXE_MENU_BACKGROUND_PATH: &str = "assets/pxe-menu.png";
 const IPXE_MENU_TITLE: &str = "TIARIS";
 const IPXE_MENU_SUBTITLE: &str = "PXE BOOT - NEST BOOT - X86_64 - UEFI";
-const IPXE_MENU_TIMEOUT_COPY: &str =
-    "Booting the highlighted entry automatically - press any key to pause";
 const IPXE_MENU_FOOTER: &str = "tiaris-nest - pxe - x86_64 - uefi";
-const IPXE_MENU_SHARED_ADAPTER_NOTICE: &str =
-    "This network adapter is registered to another computer";
 const SHARED_ADAPTER_MENU_TIMEOUT_MS: u32 = 15_000;
+
+/// The language of what a person reads on a computer that starts from the
+/// network: the organization's, which Manage names in the boot
+/// configuration (`nl` or `en`). English until Manage has said so. The
+/// firmware console shows plain ASCII only.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Language {
+    #[default]
+    English,
+    Dutch,
+}
+
+impl Language {
+    pub fn from_code(code: Option<&str>) -> Self {
+        match code {
+            Some("nl") => Self::Dutch,
+            _ => Self::English,
+        }
+    }
+
+    fn words(self) -> &'static Words {
+        match self {
+            Self::English => &ENGLISH,
+            Self::Dutch => &DUTCH,
+        }
+    }
+}
+
+/// Every sentence of the network-start menu, in one language.
+struct Words {
+    local_disk: &'static str,
+    timeout: &'static str,
+    shared_adapter: &'static str,
+    /// Below the notice, when the menu offers an installer.
+    shared_adapter_next: &'static str,
+    failed: &'static str,
+    starting_disk: &'static str,
+}
+
+const ENGLISH: Words = Words {
+    local_disk: "Boot local disk",
+    timeout: "Booting the highlighted entry automatically - press any key to pause",
+    shared_adapter: "This network adapter is registered to another computer",
+    shared_adapter_next: "To install this computer, choose the installer below",
+    failed: "Tiaris Nest could not start that; starting from the disk instead",
+    starting_disk: "Starting the installed system",
+};
+
+const DUTCH: Words = Words {
+    local_disk: "Start vanaf de schijf",
+    timeout: "Het gekozen item start vanzelf - druk op een toets om te wachten",
+    shared_adapter: "Deze netwerkadapter hoort bij een andere computer",
+    shared_adapter_next: "Kies hieronder de installatie om deze computer te installeren",
+    failed: "De Tiaris Nest kon dat niet starten; de computer start nu vanaf de schijf",
+    starting_disk: "De computer start vanaf de schijf",
+};
 
 /// The profile a boot starts by itself: the one assigned to the computer's
 /// row, else the sole default installer profile when the computer is offered
@@ -130,7 +182,9 @@ pub fn render_menu(
     identity: MenuIdentity<'_>,
     timeout_ms: u32,
     context: MenuContext,
+    language: Language,
 ) -> String {
+    let words = language.words();
     let shared_adapter = matches!(
         context,
         MenuContext::AdapterOfAnotherComputer | MenuContext::KnownOnSharedAdapter
@@ -148,23 +202,29 @@ pub fn render_menu(
         // ahead of its disk in firmware order. UEFI must regain
         // control so it can advance to the installed NixOS boot entry; BIOS
         // can still probe the conventional local-disk drive directly.
-        append_local_attempt(&mut script, "known_local", "known_menu");
+        append_local_attempt(&mut script, "known_local", "known_menu", language);
         script.push_str("\n:known_menu\n");
     }
     append_ipxe_menu_theme(&mut script, public_base_url);
     let _ = writeln!(script, "set tiaris-title {IPXE_MENU_TITLE}");
     let _ = writeln!(script, "set tiaris-subtitle {IPXE_MENU_SUBTITLE}");
     if timeout_ms > 0 {
-        let _ = writeln!(script, "set tiaris-timeout-copy {IPXE_MENU_TIMEOUT_COPY}");
+        let _ = writeln!(script, "set tiaris-timeout-copy {}", words.timeout);
         let _ = writeln!(script, "set menu-timeout {timeout_ms}");
     }
     script.push_str("menu ${tiaris-title}\n");
     script.push_str("item --gap ${tiaris-subtitle}\n");
     if context == MenuContext::AdapterOfAnotherComputer {
-        let _ = writeln!(script, "item --gap {IPXE_MENU_SHARED_ADAPTER_NOTICE}");
+        let _ = writeln!(script, "item --gap {}", words.shared_adapter);
+        if menu_profiles
+            .iter()
+            .any(|profile| profile.profile_type == BootProfileType::NestInstaller)
+        {
+            let _ = writeln!(script, "item --gap {}", words.shared_adapter_next);
+        }
     }
     script.push_str("item --gap\n");
-    script.push_str("item --key l local Boot local disk\n");
+    let _ = writeln!(script, "item --key l local {}", words.local_disk);
 
     for profile in &menu_profiles {
         let _ = writeln!(
@@ -203,9 +263,9 @@ pub fn render_menu(
     }
 
     script.push_str(":local\n");
-    script.push_str(&render_local_body());
+    script.push_str(&render_local_body(language));
     script.push_str("\n:failed\n");
-    script.push_str("echo Tiaris Nest failed to load the selected profile\n");
+    let _ = writeln!(script, "echo {}", words.failed);
     script.push_str("sleep 5\n");
     script.push_str("goto local\n\n");
     script.push_str(":end\n");
@@ -270,14 +330,14 @@ pub fn profile_has_boot_action(profile: &BootProfile) -> bool {
     }
 }
 
-pub fn render_profile_script(profile: &BootProfile, _public_base_url: &str) -> AppResult<String> {
+pub fn render_profile_script(profile: &BootProfile, language: Language) -> AppResult<String> {
     let mut script = String::new();
     script.push_str("#!ipxe\n");
     script.push_str(&format!("echo Tiaris Nest: {}\n", ipxe_text(&profile.name)));
 
     match profile.profile_type {
         BootProfileType::LocalDisk => {
-            script.push_str(&render_local_body());
+            script.push_str(&render_local_body(language));
         }
         BootProfileType::NestInstaller => {
             script.push_str("echo Nest installer profiles require a per-client boot session\n");
@@ -300,17 +360,22 @@ pub fn render_profile_script(profile: &BootProfile, _public_base_url: &str) -> A
     Ok(script)
 }
 
-fn render_local_body() -> String {
+fn render_local_body(language: Language) -> String {
     let mut script = String::new();
-    append_local_attempt(&mut script, "local", "local_exit");
+    append_local_attempt(&mut script, "local", "local_exit", language);
     script.push_str(":local_exit\n");
     script.push_str("echo Returning failure to firmware for local boot\n");
     script.push_str("exit 1\n");
     script
 }
 
-fn append_local_attempt(script: &mut String, label_prefix: &str, failure_label: &str) {
-    let _ = writeln!(script, "echo Starting the installed system");
+fn append_local_attempt(
+    script: &mut String,
+    label_prefix: &str,
+    failure_label: &str,
+    language: Language,
+) {
+    let _ = writeln!(script, "echo {}", language.words().starting_disk);
     let _ = writeln!(
         script,
         "iseq ${{platform}} efi && goto {label_prefix}_efi || goto {label_prefix}_bios"
@@ -388,7 +453,9 @@ fn query_value(value: Option<&str>, fallback: &str) -> String {
 mod tests {
     use crate::models::{BootProfile, BootProfileType, Device};
 
-    use super::{MenuContext, MenuIdentity, SelectionSource, choose_profile, render_menu};
+    use super::{
+        Language, MenuContext, MenuIdentity, SelectionSource, choose_profile, render_menu,
+    };
 
     fn profile(id: i64, profile_type: BootProfileType) -> BootProfile {
         BootProfile {
@@ -533,6 +600,7 @@ mod tests {
             },
             10_000,
             MenuContext::Unrecognized,
+            Language::English,
         );
         assert!(!menu.contains("Reinstall workstation-01"));
         assert!(menu.contains("Default Enrollment"));
@@ -617,6 +685,7 @@ mod tests {
             },
             0,
             MenuContext::Unrecognized,
+            Language::English,
         );
         assert!(script.starts_with("#!ipxe"));
         assert!(script.contains("chain --autofree http://boot.local:8080/boot/select/2"));
@@ -650,6 +719,7 @@ mod tests {
             },
             0,
             MenuContext::Unrecognized,
+            Language::English,
         );
 
         assert!(script.contains("set tiaris-title TIARIS"));
@@ -683,6 +753,7 @@ mod tests {
             },
             8000,
             MenuContext::Unrecognized,
+            Language::English,
         );
 
         assert!(script.contains("set menu-timeout 8000"));
@@ -715,6 +786,7 @@ mod tests {
             },
             0,
             MenuContext::Unrecognized,
+            Language::English,
         );
 
         assert!(script.contains("profile_3"));
@@ -751,6 +823,7 @@ mod tests {
             },
             0,
             MenuContext::Unrecognized,
+            Language::English,
         );
 
         assert!(!script.contains('\x1b'));
@@ -774,6 +847,7 @@ mod tests {
             },
             0,
             MenuContext::InstalledComputer,
+            Language::English,
         );
 
         let local_handoff = script
@@ -808,6 +882,7 @@ mod tests {
             },
             0,
             MenuContext::AdapterOfAnotherComputer,
+            Language::English,
         );
 
         assert!(!script.contains("known_local"));
@@ -834,8 +909,67 @@ mod tests {
             },
             5000,
             MenuContext::AdapterOfAnotherComputer,
+            Language::English,
         );
         assert!(configured.contains("set menu-timeout 5000\n"));
+    }
+
+    /// A Dutch organization reads no English sentence at a network start,
+    /// and the notice says what to do next when the menu has an installer.
+    #[test]
+    fn the_menu_speaks_the_organizations_language() {
+        let mut installer = profile(2, BootProfileType::NestInstaller);
+        installer.name = "Tiaris installeren".to_string();
+        let with_installer = vec![profile(1, BootProfileType::LocalDisk), installer];
+        let without_installer = vec![profile(1, BootProfileType::LocalDisk)];
+        let menu = |profiles: &[BootProfile], context, language| {
+            render_menu(
+                "http://boot.local:8080",
+                profiles,
+                MenuIdentity::default(),
+                0,
+                context,
+                language,
+            )
+        };
+        let shared = MenuContext::AdapterOfAnotherComputer;
+
+        let dutch = menu(&with_installer, shared, Language::Dutch);
+        for line in [
+            "item --gap Deze netwerkadapter hoort bij een andere computer\n",
+            "item --gap Kies hieronder de installatie om deze computer te installeren\n",
+            "item --key l local Start vanaf de schijf\n",
+            "set tiaris-timeout-copy Het gekozen item start vanzelf",
+            "echo De Tiaris Nest kon dat niet starten",
+        ] {
+            assert!(dutch.contains(line), "{line}\n{dutch}");
+        }
+        let english = menu(&with_installer, shared, Language::English);
+        for sentence in [
+            "registered to another computer",
+            "choose the installer below",
+            "Boot local disk",
+            "press any key",
+            "could not start that",
+            "Starting the installed system",
+        ] {
+            assert!(english.contains(sentence), "{sentence}");
+            assert!(!dutch.contains(sentence), "{sentence}\n{dutch}");
+        }
+        assert!(
+            menu(
+                &with_installer,
+                MenuContext::InstalledComputer,
+                Language::Dutch
+            )
+            .contains("echo De computer start vanaf de schijf\n")
+        );
+        // Without an installer in the menu the notice promises none.
+        assert!(!menu(&without_installer, shared, Language::Dutch).contains("Kies hieronder"));
+        assert_eq!(Language::from_code(Some("nl")), Language::Dutch);
+        for other in [Some("en"), Some("de"), None] {
+            assert_eq!(Language::from_code(other), Language::English);
+        }
     }
 
     #[test]
@@ -854,6 +988,7 @@ mod tests {
             },
             0,
             MenuContext::Unrecognized,
+            Language::English,
         );
 
         assert!(
@@ -874,6 +1009,7 @@ mod tests {
             MenuIdentity::default(),
             0,
             MenuContext::KnownOnSharedAdapter,
+            Language::English,
         );
 
         assert!(!script.contains("known_local"));
@@ -895,6 +1031,7 @@ mod tests {
             },
             0,
             MenuContext::Unrecognized,
+            Language::English,
         );
 
         assert!(!script.contains("known_local"));

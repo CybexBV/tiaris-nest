@@ -181,6 +181,10 @@ struct AgentBootConfigResponse {
     /// `machines` names every computer Tiaris knows.
     #[serde(default)]
     machines_complete: bool,
+    /// The organization's language (`nl` or `en`), for the network-start
+    /// menu. A Manage from before it sends none: English.
+    #[serde(default)]
+    language: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2324,6 +2328,7 @@ async fn apply_boot_config(state: &AppState, config: &AgentBootConfigResponse) -
         public_base_url: settings.public_base_url,
         bootloader_filename: settings.bootloader_filename,
         menu_timeout_ms: settings.menu_timeout_ms,
+        menu_language: crate::boot::Language::from_code(config.language.as_deref()),
     });
     Ok(())
 }
@@ -4644,6 +4649,7 @@ mod tests {
             "clients_complete": true,
             "machines": [{"fingerprint": fingerprint, "installed": true}],
             "machines_complete": true,
+            "language": "nl",
         })
         .to_string();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4707,10 +4713,20 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(
+            state.runtime_settings().menu_language,
+            crate::boot::Language::English,
+            "English until Manage names the organization's language"
+        );
         assert!(refresh_boot_config(&state).await);
         assert_eq!(
             crate::boot_machines::load(data_dir).install_state(&identity),
             crate::boot_machines::InstallState::Installed
+        );
+        // The same answer names the organization's language for the menu.
+        assert_eq!(
+            state.runtime_settings().menu_language,
+            crate::boot::Language::Dutch
         );
 
         // A second boot asks again: nothing newer was asked for since.
@@ -6174,6 +6190,7 @@ mod tests {
             clients_complete: true,
             machines: vec![],
             machines_complete: false,
+            language: None,
         }
     }
 
