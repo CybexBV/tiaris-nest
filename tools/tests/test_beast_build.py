@@ -1,5 +1,6 @@
 import importlib.util
 from pathlib import Path
+import re
 import unittest
 import shutil
 import subprocess
@@ -29,6 +30,16 @@ class BuildIsolationTests(unittest.TestCase):
         self.assertIn('type=bind,src=/dedicated/nix,dst=/nix', args)
         self.assertIn('TIARIS_NEST_BUILD_MANAGE_ORIGIN=https://manage.cybex.net', args)
 
+
+    def test_every_file_the_build_script_leaves_in_scratch_is_returned(self):
+        # The signing step reads these from RUNNER_TEMP. The first release with
+        # the USB installer stick failed there: its build record stayed behind
+        # in the container's scratch.
+        workflow = (ROOT / '.github/workflows/release.yml').read_text()
+        script = workflow.split("<<'BUILD'\n", 1)[1].split('\n          BUILD\n', 1)[0]
+        left = set(re.findall(r'^\s*(?:mv|install) [^\n]*"\$RUNNER_TEMP/([^"/\n]+)"$',
+                              script.replace('\\\n', ' '), flags=re.MULTILINE))
+        self.assertEqual(left, set(builder.RETURNED_FILES))
 
     def test_readonly_nix_tree_copy_is_disposable_without_changing_source(self):
         with tempfile.TemporaryDirectory() as temporary:
