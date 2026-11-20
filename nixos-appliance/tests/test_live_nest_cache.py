@@ -34,8 +34,9 @@ class LiveNestCache(unittest.TestCase):
         self.assertEqual(body['status'], 'ok')
         self.assertEqual(body['environment'], 'development')
 
-    def test_anonymous_cache_inventory_access_is_denied(self):
-        for path in ('/v1/nest/nodes', '/v1/nest/nodes/nightly-unauthenticated/cache/artifacts'):
+    def test_anonymous_nest_inventory_access_is_denied(self):
+        # Manage removed the per-Nest cache artifact list (20 November 2026); a Nest's build jobs remain.
+        for path in ('/v1/nest/nodes', '/v1/nest/nodes/nightly-unauthenticated/build/jobs'):
             with self.subTest(path=path):
                 status, _, _ = self.request(path)
                 self.assertEqual(status, 401)
