@@ -28,6 +28,11 @@ PUBLIC_ENV = ('TIARIS_NEST_BUILD_MANAGE_ORIGIN', 'TIARIS_NEST_UPDATE_TRUSTED_PUB
               'GITHUB_REF_NAME', 'BUILD_VERSION', 'BUILD_BUNDLE', 'BUILD_RUNTIME',
               'BUILD_MANAGE_REVISION', 'BUILD_NIXPKGS_REVISION', 'BUILD_HAS_PREDECESSOR',
               'BUILD_REUSE_RUNTIME')
+# The single files the build script leaves in the container's scratch for the
+# steps after it (signing). The scratch is thrown away: a file that is not
+# listed here never reaches them.
+RETURNED_FILES = ('tiaris-nest-bootstrap', 'tiaris-nest-appliance-template-metadata.json',
+                  'tiaris-usb-installer-record.json')
 
 
 def run(*args, **kwargs):
@@ -123,7 +128,7 @@ def main():
             name = 'tiaris-nest-build-' + directory.name
             try:
                 run(*command(image, name, source, scratch, output, STATE, os.environ))
-                for filename in ('tiaris-nest-bootstrap', 'tiaris-nest-appliance-template-metadata.json'):
+                for filename in RETURNED_FILES:
                     shutil.copyfile(scratch / filename, runner_temp / filename)
                 # A reused workstation runtime is not rebuilt, so it has no tree.
                 if os.environ.get('BUILD_REUSE_RUNTIME') != 'true':
