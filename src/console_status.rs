@@ -81,8 +81,6 @@ pub enum Stage {
 #[serde(rename_all = "snake_case")]
 pub enum Pxe {
     Active,
-    Standby,
-    External,
     Unavailable,
 }
 
@@ -90,8 +88,6 @@ impl Pxe {
     fn parse(status: &str) -> Option<Self> {
         match status {
             "active" => Some(Self::Active),
-            "standby" => Some(Self::Standby),
-            "external" => Some(Self::External),
             "unavailable" => Some(Self::Unavailable),
             _ => None,
         }
@@ -576,7 +572,7 @@ async fn observe_health(state: &AppState) -> bool {
             crate::pxe_discovery::status()
                 .get("status")
                 .and_then(Value::as_str),
-            Some("active" | "standby" | "external")
+            Some("active")
         )
 }
 

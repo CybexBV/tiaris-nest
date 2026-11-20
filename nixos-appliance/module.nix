@@ -112,8 +112,6 @@ in {
     # smaller budgets require the performance qualification gate first.
     systemd.services.nix-daemon.serviceConfig.MemoryAccounting = true;
     environment.systemPackages = [ a.package runtime pkgs.iproute2 pkgs.iputils pkgs.curl pkgs.jq pkgs.nftables pkgs.dnsmasq pkgs.openssh pkgs.python3 pkgs.tftp-hpa ];
-    # The privileged supervisor intentionally refuses symlink configuration.
-    environment.etc."tiaris-nest/pxe-discovery.json" = { text = ''{"mode":"automatic"}''; mode = "0644"; };
     services.openssh = {
       enable = true;
       settings = { PasswordAuthentication = false; KbdInteractiveAuthentication = false; PermitRootLogin = "no"; PubkeyAuthentication = true; AllowUsers = [ "tiaris-support" ]; TrustedUserCAKeys = "/etc/ssh/tiaris-nest-ca.pub"; AuthorizedPrincipalsFile = "/etc/ssh/tiaris-nest-principals"; AllowAgentForwarding = true; AllowTcpForwarding = "yes"; GatewayPorts = "no"; PermitTunnel = "no"; X11Forwarding = false; };

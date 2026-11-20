@@ -351,8 +351,8 @@ fn system_and_boot_time_are_read_from_their_sources() {
 
 #[test]
 fn pxe_statuses_outside_the_contract_are_omitted() {
-    assert_eq!(Pxe::parse("standby"), Some(Pxe::Standby));
-    assert_eq!(Pxe::parse("starting"), None);
+    assert_eq!(Pxe::parse("active"), Some(Pxe::Active));
+    assert_eq!(Pxe::parse("standby"), None);
     let mut current = observation(0);
     current.pxe = None;
     current.active_installs = None;

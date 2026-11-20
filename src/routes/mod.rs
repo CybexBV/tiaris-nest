@@ -93,12 +93,10 @@ async fn healthz(
         crate::readiness::probe(&state).await
     };
     let discovery_ready = !crate::appliance::is_managed_appliance()
-        || matches!(
-            crate::pxe_discovery::status()
-                .get("status")
-                .and_then(serde_json::Value::as_str),
-            Some("active" | "standby" | "external")
-        );
+        || crate::pxe_discovery::status()
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("active");
     if readiness.ready && discovery_ready {
         ([(header::CONTENT_TYPE, "text/plain")], "ok\n").into_response()
     } else {

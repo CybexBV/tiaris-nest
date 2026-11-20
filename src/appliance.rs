@@ -771,10 +771,7 @@ async fn local_health(readiness: crate::readiness::ApplianceReadiness) -> Value 
         Value::Bool(readiness.public_boot_url),
     );
     let pxe = crate::pxe_discovery::status();
-    let pxe_ok = matches!(
-        pxe.get("status").and_then(Value::as_str),
-        Some("active" | "standby" | "external")
-    );
+    let pxe_ok = pxe.get("status").and_then(Value::as_str) == Some("active");
     let status =
         if readiness.ready && pxe_ok && checks.values().all(|value| value == &Value::Bool(true)) {
             "healthy"

@@ -101,35 +101,14 @@ pub(crate) fn network_boot(
             BOOT_SERVICE_REMEDY.into(),
         );
     };
-    match pxe.status.as_str() {
-        "external" => {
-            return check(
-                id,
-                Status::NotApplicable,
-                "external_pxe",
-                "This Nest leaves network boot to your own PXE service.".into(),
-                String::new(),
-            );
-        }
-        "starting" => {
-            return check(
-                id,
-                Status::CouldNotCheck,
-                "boot_service_starting",
-                "The Nest is still choosing which Nest answers network boot.".into(),
-                String::new(),
-            );
-        }
-        "active" | "standby" => {}
-        _ => {
-            return check(
-                id,
-                Status::Fail,
-                "boot_service_unavailable",
-                code(&pxe.reason),
-                BOOT_SERVICE_REMEDY.into(),
-            );
-        }
+    if pxe.status != "active" {
+        return check(
+            id,
+            Status::Fail,
+            "boot_service_unavailable",
+            code(&pxe.reason),
+            BOOT_SERVICE_REMEDY.into(),
+        );
     }
     let Some(probe) = probe.filter(|probe| {
         probe.outcome == "ok" && (0..=BOOT_PROBE_MAX_AGE).contains(&(now - probe.checked_at))
@@ -174,15 +153,6 @@ pub(crate) fn network_boot(
             "boot_answer_dropped",
             format!("{computers} asked to start from the network but never received the Nest's answer."),
             "Something between the Nest and the computers drops the Nest's boot answers, usually a switch DHCP guard (DHCP snooping). Mark the Nest's switch port as trusted, or allow DHCP replies from the Nest's address.".into(),
-        );
-    }
-    if pxe.status == "standby" {
-        return check(
-            id,
-            Status::Pass,
-            "peer_answers",
-            "Another Nest of yours answers network boot on this network.".into(),
-            String::new(),
         );
     }
     pass(id, "boot_answer_served")
