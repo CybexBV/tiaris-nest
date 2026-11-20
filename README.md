@@ -369,6 +369,11 @@ agent reports (`sha256("tiaris-hardware-v1\ndmi_product_uuid=<uuid>")`).
   adapter gets the menu, and a computer nobody knows gets the menu with the
   "registered to another computer" notice; neither enters the installer by
   itself.
+- **Language.** The menu's own sentences (the shared-adapter notice and what
+  to do next, the disk entry, the countdown) follow the organization's
+  language, which Manage names in the boot configuration (`language`: `nl` or
+  `en`). It is kept in memory like the menu timeout: a Nest that has not
+  synced since it started, or a Manage that names none, shows English.
 - Without a usable UUID the serial rule decides as before. What Manage says
   is kept in the state file `boot-identity/boot-identity.json`, written before
   the boot configuration that needs it is committed.
