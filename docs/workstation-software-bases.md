@@ -159,16 +159,12 @@ admits.
 - **Admission.** A Blueprint job is admitted at the release pin or at a ready
   detected commit (`target_not_allowed` otherwise). A job without a
   Blueprint is admitted at its target flake's nixpkgs pin, and a
-  `nixpkgs_commit` it names must be that pin. The preflight selects its
-  profile by the admitted commit: the built-in profile at the built-in
-  commit, the persisted profile at a ready detected commit, and none
-  otherwise, which stops a source-disabled job with `source_build_blocked`.
-- **A Blueprint that blocks at the commit.** Its job fails with
-  `error_kind: source_build_blocked` and `source_build_candidates` (the
-  first 50 derivations it would compile or that have no reviewed
-  counterpart); its result metadata names the job's Blueprint and revision
-  and `nixpkgs_revision`/`nixpkgs_flake` of the commit, narHash-pinned. A job
-  at a commit that is not ready fails with `target_not_allowed`.
+  `nixpkgs_commit` it names must be that pin. A job's result metadata names
+  its Blueprint and revision and `nixpkgs_revision`/`nixpkgs_flake` of the
+  commit, narHash-pinned. A job at a commit that is not ready fails with
+  `target_not_allowed`. Every job may compile ("Nest only" delivery and its
+  strict source check were removed on 20 November 2026); a build spec's
+  `allow_source_builds` is accepted and ignored.
 
 The first real channel commit, 6f06d204 (2026-10-29), evaluated with the
 pin's Nix 2.34.7: with the Tiaris source as shipped today (no reference
@@ -200,7 +196,7 @@ it (`src/software_updates/findings.rs`, Manage design section 4):
   job's out-link when it ends, so the nightly garbage collection removes the
   closure and its derivations from the store. A release or candidate whose
   closure or derivations are gone is built again from its own job, with the
-  same validation, admission, memory lease and source policy as its worker,
+  same validation, admission and memory lease as its worker,
   into the job's out-link, which is removed once the scan is done. While the
   Nest has no memory for that build the scan waits; a failed build fails the
   scan with the closure's reason.
@@ -325,9 +321,12 @@ python3 tools/software-base-tracker.py check --output-dir out \
 
 ## Building a second commit
 
-A base is useful only once Nest can build it, and Nest builds without compiling
-from source. Its source-build preflight (`src/build.rs`) accepts a derivation
-that would build locally only when it is one of the reviewed materializers:
+A base is useful only once Nest can build it. Since 20 November 2026 every
+Nest build may compile ("Nest only" delivery and its strict source check were
+removed), and what follows is the classifier the software-update check still
+uses to tell a commit's reviewed local work from new compilation. It
+(`src/build.rs`) admits a derivation that would build locally only when it is
+one of the reviewed materializers:
 exact stdenv, bash, perl, link-farm and substitution builder store paths,
 reviewed tool inputs, and the normalized fingerprints of the NixOS and desktop
 generator scripts of the built-in Blueprints. All of these values belong to

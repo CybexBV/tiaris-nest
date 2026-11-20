@@ -10,10 +10,6 @@
 
 use crate::nix_log::derivation_display_name;
 
-use super::{
-    SOURCE_BUILD_CANDIDATE_CAP, extract_would_build_derivations, source_build_blocked_message,
-};
-
 /// At most this many names travel in one report.
 const FAILED_PACKAGE_CAP: usize = 20;
 const FAILED_PACKAGE_NAME_MAX_BYTES: usize = 211;
@@ -67,18 +63,6 @@ pub(super) fn classify_nix_build_failure(logs: &str, oom_killed: bool) -> NixBui
         return NixBuildFailure::plain(
             "network_unavailable",
             "Nest could not reach the network to download software; check its internet connection and retry",
-        );
-    }
-    if lower.contains("unable to start any build") {
-        let candidates: Vec<String> =
-            extract_would_build_derivations(logs, SOURCE_BUILD_CANDIDATE_CAP)
-                .paths
-                .iter()
-                .map(|path| derivation_display_name(path))
-                .collect();
-        return NixBuildFailure::plain(
-            "source_build_blocked",
-            source_build_blocked_message(&candidates),
         );
     }
     let failed_packages = extract_failed_packages(&plain_log);

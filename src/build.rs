@@ -27,7 +27,7 @@ use crate::{
     config::{AppConfig, BuildTargetConfig, pinned_nixpkgs_revision},
     db, manage_source,
     models::BuildJob,
-    nix_log::{InternalJsonParser, derivation_display_name},
+    nix_log::InternalJsonParser,
     protected_material,
     redact::{contains_sensitive_key_value, redact_sensitive_key_values},
     subprocess::{PIPE_DRAIN_TIMEOUT, ProcessGroup, run_bounded_command},
@@ -136,12 +136,10 @@ pub struct BuildSpec {
     pub software_package_refs: Vec<String>,
     #[serde(default)]
     pub build_input: Option<BlueprintBuildInput>,
-    /// When false (the default, including when the field is absent), the build
-    /// must come entirely from binary substitution: a pre-flight cache-coverage
-    /// check fails the job when the closure would compile real packages from
-    /// source (trivial per-system glue derivations are exempt).
-    #[serde(default)]
-    pub allow_source_builds: bool,
+    /// Ignored: every build may compile ("Nest only" delivery was removed on
+    /// 20 November 2026). Manage still sends it for Nests released before.
+    #[serde(default, rename = "allow_source_builds")]
+    pub ignored_allow_source_builds: Option<bool>,
     /// Copy the verified closure from an approved sibling Nest instead of
     /// building it. Lives outside `build_input`, so the cohort identity
     /// (`input_config_hash`) and the installer-target identity are unchanged;
@@ -230,7 +228,6 @@ struct ValidatedBuildSpec {
     source_lock_sha256: Option<String>,
     software_package_refs: Vec<String>,
     build_input: Option<ValidatedBlueprintBuildInput>,
-    allow_source_builds: bool,
     closure_source: Option<ValidatedClosureSource>,
 }
 
@@ -734,105 +731,6 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
         job.id,
         detected.as_ref().map(|ready| ready.nar_hash.as_str()),
     )?;
-    if !spec.allow_source_builds {
-        db::update_build_job_progress(
-            &state.db,
-            job.id,
-            Some(18),
-            "checking_cache",
-            "Checking binary cache coverage",
-        )
-        .await?;
-        // The profile follows the commit `admit_build_target` accepted, never
-        // the job's own text. A commit without a reviewed profile cannot
-        // build source-free.
-        let Some(profile) = WorkstationBuildProfile::for_build(
-            admitted_commit.as_deref(),
-            detected.as_ref().map(|ready| &ready.profile),
-        ) else {
-            db::finish_build_job(
-                &state.db,
-                job.id,
-                "failed",
-                "",
-                &format!(
-                    "Nest has no reviewed build profile for nixpkgs commit {}, so this source-disabled build was stopped",
-                    admitted_commit.as_deref().unwrap_or("(none)")
-                ),
-                "",
-                "",
-                0,
-                None,
-                Some(admitted_result_metadata(
-                    &state.config,
-                    &job,
-                    &target,
-                    admitted_commit.as_deref(),
-                    detected.as_ref().map(|ready| ready.nar_hash.as_str()),
-                    Some("source_build_blocked"),
-                )),
-            )
-            .await?;
-            return Ok(());
-        };
-        match preflight_source_build_check_for_profile(&state.config, &command, profile).await {
-            Ok(offenders) if !offenders.is_empty() => {
-                let mut metadata = admitted_result_metadata(
-                    &state.config,
-                    &job,
-                    &target,
-                    admitted_commit.as_deref(),
-                    detected.as_ref().map(|ready| ready.nar_hash.as_str()),
-                    Some("source_build_blocked"),
-                );
-                if let Some(map) = metadata.as_object_mut() {
-                    map.insert("source_build_candidates".to_string(), json!(offenders));
-                }
-                db::finish_build_job(
-                    &state.db,
-                    job.id,
-                    "failed",
-                    "",
-                    &source_build_blocked_message(&offenders),
-                    "",
-                    "",
-                    0,
-                    None,
-                    Some(metadata),
-                )
-                .await?;
-                return Ok(());
-            }
-            Ok(_) => {}
-            Err(err) => {
-                let error = format!(
-                    "Nest could not verify binary cache coverage, so this source-disabled build was stopped safely: {}",
-                    safe_error(&err)
-                );
-                db::finish_build_job(
-                    &state.db,
-                    job.id,
-                    "failed",
-                    "",
-                    &error,
-                    "",
-                    "",
-                    0,
-                    None,
-                    Some(admitted_result_metadata(
-                        &state.config,
-                        &job,
-                        &target,
-                        admitted_commit.as_deref(),
-                        detected.as_ref().map(|ready| ready.nar_hash.as_str()),
-                        Some("source_policy_preflight_failed"),
-                    )),
-                )
-                .await?;
-                return Ok(());
-            }
-        }
-    }
     let log = SharedLog::new(state.config.build.max_log_bytes);
     db::update_build_job_progress(
         &state.db,
@@ -1333,7 +1231,6 @@ fn validate_build_spec(config: &AppConfig, job: &BuildJob) -> Result<ValidatedBu
         source_lock_sha256,
         software_package_refs,
         build_input,
-        allow_source_builds: spec.allow_source_builds,
         closure_source,
     })
 }
@@ -2183,7 +2080,6 @@ fn parse_memory_event(raw: &str, event: &str) -> Option<u64> {
     })
 }
 
-const SOURCE_BUILD_CANDIDATE_CAP: usize = 50;
 const PREFLIGHT_DRY_RUN_TIMEOUT_SECS: u64 = 600;
 const PREFLIGHT_DERIVATION_SHOW_TIMEOUT_SECS: u64 = 120;
 const PREFLIGHT_DERIVATION_SHOW_CHUNK: usize = 100;
@@ -2200,7 +2096,7 @@ const DISABLE_IFD_NIX_OPTION: [&str; 3] = ["--option", "allow-import-from-deriva
 const REJECT_FLAKE_CONFIG_NIX_OPTION: [&str; 3] = ["--option", "accept-flake-config", "false"];
 const REQUIRE_BUILD_SANDBOX_NIX_OPTION: [&str; 3] = ["--option", "sandbox", "true"];
 
-fn append_source_policy_nix_options(args: &mut Vec<String>, allow_source_builds: bool) {
+fn append_build_isolation_nix_options(args: &mut Vec<String>) {
     // Nest is a trusted Nix client because it exports and signs closures.
     // Pin the daemon-side sandbox and refuse flake-supplied client settings on
     // every path so a Blueprint cannot use that trust to relax isolation.
@@ -2214,25 +2110,29 @@ fn append_source_policy_nix_options(args: &mut Vec<String>, allow_source_builds:
             .iter()
             .map(|value| value.to_string()),
     );
-    if !allow_source_builds {
-        args.extend(DISABLE_IFD_NIX_OPTION.iter().map(|value| value.to_string()));
-        // Some nixpkgs wrappers prefer local materialization even when their
-        // exact output is in the signed binary cache. Ask Nix to consider those
-        // substitutes before classifying the remaining local derivations.
-        // This neither permits source compilation nor trusts unsigned outputs.
-        args.extend(
-            [
-                "--option",
-                "always-allow-substitutes",
-                "true",
-                "--option",
-                "require-sigs",
-                "true",
-            ]
-            .iter()
-            .map(|value| value.to_string()),
-        );
-    }
+}
+
+/// The isolation options plus what a dry run of the software-update check
+/// needs: no import-from-derivation, and substitutes considered first.
+fn append_dry_run_nix_options(args: &mut Vec<String>) {
+    append_build_isolation_nix_options(args);
+    args.extend(DISABLE_IFD_NIX_OPTION.iter().map(|value| value.to_string()));
+    // Some nixpkgs wrappers prefer local materialization even when their
+    // exact output is in the signed binary cache. Ask Nix to consider those
+    // substitutes before classifying the remaining local derivations. This
+    // neither builds anything nor trusts unsigned outputs.
+    args.extend(
+        [
+            "--option",
+            "always-allow-substitutes",
+            "true",
+            "--option",
+            "require-sigs",
+            "true",
+        ]
+        .iter()
+        .map(|value| value.to_string()),
+    );
 }
 
 #[derive(Clone, Copy)]
@@ -2340,121 +2240,6 @@ fn extract_would_build_derivations(text: &str, cap: usize) -> WouldBuildDerivati
     parsed
 }
 
-fn source_build_blocked_message(candidates: &[String]) -> String {
-    let advice = "Review the listed derivations. For an administrator-authored Blueprint, \
-                  preserve its package choices unless an administrator selects a cache-backed \
-                  equivalent, chooses a pinned nixpkgs revision with substitutes, or explicitly \
-                  enables \"Allow building from source\" in the organization Software delivery policy.";
-    if candidates.is_empty() {
-        return format!(
-            "Blocked: this build requires compiling derivations from source, \
-             which is disabled by the organization Software delivery policy. {advice}"
-        );
-    }
-    let shown = candidates
-        .iter()
-        .take(5)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(", ");
-    let suffix = if candidates.len() > 5 {
-        format!(" (+{} more)", candidates.len() - 5)
-    } else {
-        String::new()
-    };
-    format!(
-        "Blocked: {} derivation(s) are not available from the binary cache and would be \
-         compiled from source: {shown}{suffix}. {advice}",
-        candidates.len()
-    )
-}
-
-/// Dry-run the build and return display names of derivations that would be
-/// compiled from source. Only structurally constrained NixOS-generated glue
-/// and plain, hash-verified downloads are exempt — an empty result means the
-/// closure is fully substitutable apart from that bounded local materialization.
-#[cfg(test)]
-async fn preflight_source_build_check(
-    config: &AppConfig,
-    command: &NixBuildCommand,
-) -> Result<Vec<String>> {
-    preflight_source_build_check_for_profile(config, command, WorkstationBuildProfile::builtin())
-        .await
-}
-
-/// The preflight with the commit identities of the job's nixpkgs commit.
-async fn preflight_source_build_check_for_profile(
-    config: &AppConfig,
-    command: &NixBuildCommand,
-    profile: &WorkstationBuildProfile,
-) -> Result<Vec<String>> {
-    preflight_source_build_check_with_profile_and_limits(
-        config,
-        command,
-        profile,
-        PreflightLimits::default(),
-    )
-    .await
-}
-
-#[cfg(test)]
-async fn preflight_source_build_check_with_limits(
-    config: &AppConfig,
-    command: &NixBuildCommand,
-    limits: PreflightLimits,
-) -> Result<Vec<String>> {
-    preflight_source_build_check_with_profile_and_limits(
-        config,
-        command,
-        WorkstationBuildProfile::builtin(),
-        limits,
-    )
-    .await
-}
-
-async fn preflight_source_build_check_with_profile_and_limits(
-    config: &AppConfig,
-    command: &NixBuildCommand,
-    profile: &WorkstationBuildProfile,
-    limits: PreflightLimits,
-) -> Result<Vec<String>> {
-    tokio::fs::create_dir_all(&config.build.work_dir)
-        .await
-        .with_context(|| {
-            format!(
-                "create build work directory {}",
-                config.build.work_dir.display()
-            )
-        })?;
-    let mut store_nonce = [0u8; 16];
-    OsRng.fill_bytes(&mut store_nonce);
-    let store_root = config
-        .build
-        .work_dir
-        .join(format!("source-policy-store-{}", hex::encode(store_nonce)));
-    tokio::fs::create_dir(&store_root)
-        .await
-        .with_context(|| format!("create isolated preflight store {}", store_root.display()))?;
-    let result = preflight_unadmitted_in_store(config, command, profile, &store_root, limits)
-        .await
-        .map(|unadmitted| {
-            let mut offenders = unadmitted
-                .paths
-                .iter()
-                .map(|path| derivation_display_name(path))
-                .collect::<Vec<_>>();
-            offenders.truncate(SOURCE_BUILD_CANDIDATE_CAP);
-            offenders
-        });
-    let cleanup = remove_source_policy_store(&store_root).await;
-    match (result, cleanup) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error)
-            .with_context(|| format!("remove isolated preflight store {}", store_root.display())),
-    }
-}
-
 async fn remove_source_policy_store(store_root: &Path) -> Result<()> {
     let cleanup_path = store_root.to_path_buf();
     let display_path = cleanup_path.display().to_string();
@@ -2504,12 +2289,11 @@ fn make_source_policy_directories_owner_writable(path: &Path) -> std::io::Result
     })
 }
 
-/// Local derivations a source-disabled build would need that the profile does
-/// not admit, in dry-run order, with the `nix derivation show` record of each.
+/// Local derivations a build would need that the profile does not admit, in
+/// dry-run order, with the `nix derivation show` record of each.
 pub(crate) struct UnadmittedDerivations {
     /// Every local derivation the build needs, apart from signed seeds.
     pub(crate) would_build: Vec<String>,
-    pub(crate) paths: Vec<String>,
     /// The subset rejected even when every other local derivation is
     /// trusted: the work that is itself unreviewed, not merely waiting for a
     /// rejected input.
@@ -2521,8 +2305,7 @@ pub(crate) struct UnadmittedDerivations {
 }
 
 /// Dry-run `command` in a fresh isolated store and return what `profile`
-/// does not admit. Used by the detected-commit check; build jobs use the
-/// preflight above, which runs the same classification.
+/// does not admit: the software-update check's view of a commit's local work.
 pub(crate) async fn unadmitted_local_derivations(
     config: &AppConfig,
     command: &NixBuildCommand,
@@ -2554,9 +2337,17 @@ impl DetachedDryRun {
         command: &NixBuildCommand,
         profile: &WorkstationBuildProfile,
     ) -> Result<Self> {
+        Self::run_with_limits(config, command, profile, PreflightLimits::default()).await
+    }
+
+    async fn run_with_limits(
+        config: &AppConfig,
+        command: &NixBuildCommand,
+        profile: &WorkstationBuildProfile,
+        limits: PreflightLimits,
+    ) -> Result<Self> {
         let store = IsolatedStore::create(&config.build.work_dir).await?;
         let result = async {
-            let limits = PreflightLimits::default();
             let graph = dry_run_graph_in_store(config, command, &store.root, limits).await?;
             let mut paths = graph
                 .derivations
@@ -2735,17 +2526,6 @@ async fn fetch_link_farm_builder(
     Ok(output.status.success())
 }
 
-async fn preflight_unadmitted_in_store(
-    config: &AppConfig,
-    command: &NixBuildCommand,
-    profile: &WorkstationBuildProfile,
-    store_root: &Path,
-    limits: PreflightLimits,
-) -> Result<UnadmittedDerivations> {
-    let graph = dry_run_graph_in_store(config, command, store_root, limits).await?;
-    classify_graph_in_store(&graph, &command.program, profile, store_root, limits).await
-}
-
 /// The local work a dry run lists in an isolated store, with the `nix
 /// derivation show` record of each derivation and signed seeds removed.
 #[derive(Clone, Debug, Default)]
@@ -2765,7 +2545,7 @@ async fn dry_run_graph_in_store(
     // while evaluating the installable, before it prints the derivations that
     // would be built. Disable IFD at the command-line precedence layer so an
     // unadvertised evaluator-time build cannot bypass the classifier below.
-    append_source_policy_nix_options(&mut args, false);
+    append_dry_run_nix_options(&mut args);
     args.extend([
         "build".to_string(),
         command.installable.clone(),
@@ -2909,38 +2689,6 @@ async fn dry_run_graph_in_store(
     })
 }
 
-/// Classify a dry run's local work with `profile`, in the store it ran in.
-async fn classify_graph_in_store(
-    graph: &DryRunGraph,
-    program: &str,
-    profile: &WorkstationBuildProfile,
-    store_root: &Path,
-    limits: PreflightLimits,
-) -> Result<UnadmittedDerivations> {
-    // A substituted buildEnv helper is not downloaded by --dry-run. Its bytes
-    // are still required for the independent pinned-source check below. Fetch
-    // only that exact reviewed store output, with local and remote compilation
-    // disabled and normal cache signature verification required.
-    let link_farm_builder = profile.path(TRUSTED_LINK_FARM_BUILDER.path);
-    if link_farm_builder_needed(graph, profile)
-        && !link_farm_builder_is_reviewed(profile, store_root, &link_farm_builder)
-    {
-        let fetched =
-            fetch_link_farm_builder(program, store_root, &link_farm_builder, limits).await?;
-        if !fetched || !link_farm_builder_is_reviewed(profile, store_root, &link_farm_builder) {
-            bail!("signed substitute for the pinned buildEnv helper could not be verified");
-        }
-    }
-
-    Ok(classify_graph(
-        graph,
-        profile,
-        &|path: &str, expected: &str| {
-            isolated_store_source_matches_sha256(store_root, path, expected)
-        },
-    ))
-}
-
 /// Classify a dry run's local work with `profile`; `verify_source` checks a
 /// source file's bytes against a reviewed hash.
 fn classify_graph<F>(
@@ -3021,7 +2769,6 @@ where
     }
     UnadmittedDerivations {
         would_build,
-        paths,
         rejected_on_their_own,
         derivations,
         changed_builder_files,
@@ -3126,23 +2873,6 @@ where
     trusted_local
 }
 
-fn isolated_store_source_matches_sha256(root: &Path, logical_path: &str, expected: &str) -> bool {
-    let Ok(relative) = Path::new(logical_path).strip_prefix("/nix/store") else {
-        return false;
-    };
-    if relative
-        .components()
-        .any(|component| !matches!(component, std::path::Component::Normal(_)))
-    {
-        return false;
-    }
-    let physical = root.join("nix/store").join(relative);
-    fs::read(physical).ok().is_some_and(|bytes| {
-        let digest = Sha256::digest(bytes);
-        hex::encode(digest) == expected
-    })
-}
-
 /// Find a derivation entry in `nix derivation show` JSON. Older nix keys the
 /// top-level object by full store path; nix 2.30+ nests entries under
 /// `derivations` keyed by drv basename.
@@ -3238,18 +2968,6 @@ fn link_farm_builder_needed(graph: &DryRunGraph, profile: &WorkstationBuildProfi
                 input.drv_path == builder_drv && input.output == TRUSTED_LINK_FARM_BUILDER.output
             })
         })
-}
-
-/// The fetched buildEnv helper has the pin's bytes or a counterpart's (in
-/// any role; each link farm using it is then checked in its own role).
-fn link_farm_builder_is_reviewed(
-    profile: &WorkstationBuildProfile,
-    store_root: &Path,
-    path: &str,
-) -> bool {
-    std::iter::once(TRUSTED_LINK_FARM_BUILDER_SHA256)
-        .chain(profile.any_builder_file_counterparts(TRUSTED_LINK_FARM_BUILDER_SHA256))
-        .any(|expected| isolated_store_source_matches_sha256(store_root, path, expected))
 }
 
 /// A reviewed builder file: the pin's bytes, or at a detected commit the
@@ -6248,12 +5966,12 @@ fn success_result_metadata(
     metadata
 }
 
-fn software_inventory_eval_args(installable: &str, allow_source_builds: bool) -> Vec<String> {
+fn software_inventory_eval_args(installable: &str) -> Vec<String> {
     let mut args = Vec::new();
     // Inventory is metadata, but `nix eval` can still realize an
     // import-from-derivation before returning that metadata. Keep it inside
-    // the same command-line policy boundary as preflight and the real build.
-    append_source_policy_nix_options(&mut args, allow_source_builds);
+    // the same isolation boundary as the real build.
+    append_build_isolation_nix_options(&mut args);
     args.extend([
         "eval".to_string(),
         "--raw".to_string(),
@@ -6321,10 +6039,7 @@ async fn evaluate_software_inventory_pinned(
             spec.system, package_ref
         );
         let mut command = crate::nix_command::tokio_command(&config.build.nix_binary);
-        command.args(software_inventory_eval_args(
-            &installable,
-            spec.allow_source_builds,
-        ));
+        command.args(software_inventory_eval_args(&installable));
         let output = run_bounded_command(
             command,
             limits.probe_timeout.min(remaining),
@@ -6405,7 +6120,7 @@ fn nix_build_command_with_nixpkgs_nar_hash(
     let out_link = job_dir.join("result");
     let installable = format!("{}#{}", target.flake, target.attr);
     let mut args = vec!["build".to_string()];
-    append_source_policy_nix_options(&mut args, spec.allow_source_builds);
+    append_build_isolation_nix_options(&mut args);
     args.extend([
         installable.clone(),
         "--cores".to_string(),
@@ -6573,7 +6288,7 @@ fn blueprint_nix_build_command_with_nixpkgs_nar_hash(
     let out_link = job_dir.join("result");
     let installable = format!("{}#{}", input_dir.display(), target.attr);
     let mut args = vec!["build".to_string()];
-    append_source_policy_nix_options(&mut args, spec.allow_source_builds);
+    append_build_isolation_nix_options(&mut args);
     args.extend([
         installable.clone(),
         "--cores".to_string(),
@@ -7964,20 +7679,7 @@ esac
             })
     }
 
-    fn authenticated_substitutes_are_preferred(args: &[String]) -> bool {
-        ["always-allow-substitutes", "require-sigs"]
-            .iter()
-            .all(|option| {
-                args.windows(3).any(|window| {
-                    window[0] == "--option" && window[1] == *option && window[2] == "true"
-                })
-            })
-    }
-
-    fn software_inventory_test_spec(
-        allow_source_builds: bool,
-        software_package_refs: Vec<String>,
-    ) -> ValidatedBuildSpec {
+    fn software_inventory_test_spec(software_package_refs: Vec<String>) -> ValidatedBuildSpec {
         ValidatedBuildSpec {
             artifact_type: "nixos_closure".to_string(),
             target: "blueprint".to_string(),
@@ -7991,33 +7693,23 @@ esac
             source_lock_sha256: Some("d".repeat(64)),
             software_package_refs,
             build_input: None,
-            allow_source_builds,
             closure_source: None,
         }
     }
 
     #[test]
-    fn software_inventory_eval_inherits_the_build_source_policy() {
+    fn software_inventory_eval_keeps_the_build_isolation() {
         let installable =
             "github:NixOS/nixpkgs/reviewed#legacyPackages.x86_64-linux.firefox.version";
-        let source_disabled = software_inventory_eval_args(installable, false);
-        assert!(import_from_derivation_is_disabled(&source_disabled));
-        assert!(flake_config_is_rejected(&source_disabled));
-        assert!(build_sandbox_is_required(&source_disabled));
-        assert_eq!(
-            source_disabled.last().map(String::as_str),
-            Some(installable)
-        );
-
-        let source_enabled = software_inventory_eval_args(installable, true);
-        assert!(!import_from_derivation_is_disabled(&source_enabled));
-        assert!(flake_config_is_rejected(&source_enabled));
-        assert!(build_sandbox_is_required(&source_enabled));
+        let args = software_inventory_eval_args(installable);
+        assert!(flake_config_is_rejected(&args));
+        assert!(build_sandbox_is_required(&args));
+        assert_eq!(args.last().map(String::as_str), Some(installable));
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn software_inventory_uses_bounded_source_disabled_eval() {
+    async fn software_inventory_uses_bounded_isolated_eval() {
         use std::os::unix::fs::PermissionsExt;
 
         let root = std::env::temp_dir().join(format!(
@@ -8035,10 +7727,6 @@ case " $* " in
   *" --option accept-flake-config false "*) ;;
   *) exit 91 ;;
 esac
-case " $* " in
-  *" --option allow-import-from-derivation false "*) ;;
-  *) exit 92 ;;
-esac
 printf '123.4\n'
 "#,
         )
@@ -8046,7 +7734,7 @@ printf '123.4\n'
         std::fs::set_permissions(&fake_nix, std::fs::Permissions::from_mode(0o700)).unwrap();
         let mut config = AppConfig::default();
         config.build.nix_binary = fake_nix.display().to_string();
-        let spec = software_inventory_test_spec(false, vec!["firefox".to_string()]);
+        let spec = software_inventory_test_spec(vec!["firefox".to_string()]);
 
         let inventory = evaluate_software_inventory_with_limits(
             &config,
@@ -8106,7 +7794,7 @@ sleep 5
         std::fs::set_permissions(&fake_nix, std::fs::Permissions::from_mode(0o700)).unwrap();
         let mut config = AppConfig::default();
         config.build.nix_binary = fake_nix.display().to_string();
-        let spec = software_inventory_test_spec(false, vec!["firefox".to_string()]);
+        let spec = software_inventory_test_spec(vec!["firefox".to_string()]);
         let started = Instant::now();
 
         let inventory = evaluate_software_inventory_with_limits(
@@ -8371,9 +8059,6 @@ sleep 5
             parsed.build_input.unwrap().blueprint_name.as_deref(),
             Some("Legacy Workstation")
         );
-        // Specs from older Tiaris versions omit allow_source_builds entirely;
-        // enforcement must default on.
-        assert!(!parsed.allow_source_builds);
         assert!(build_target_names_compatible(
             "desktop_experience",
             "blueprint"
@@ -8392,7 +8077,7 @@ sleep 5
             flake: "/srv/tiaris-nest/build-inputs/tiaris".to_string(),
             attr: "packages.x86_64-linux.desktop-experience".to_string(),
         };
-        let mut spec = ValidatedBuildSpec {
+        let spec = ValidatedBuildSpec {
             artifact_type: "nixos_closure".to_string(),
             target: "blueprint".to_string(),
             system: "x86_64-linux".to_string(),
@@ -8405,7 +8090,6 @@ sleep 5
             source_lock_sha256: None,
             software_package_refs: Vec::new(),
             build_input: None,
-            allow_source_builds: false,
             closure_source: None,
         };
 
@@ -8421,16 +8105,9 @@ sleep 5
         );
         assert!(command.args.contains(&"--out-link".to_string()));
         assert!(command.args.windows(2).any(|args| args == ["--cores", "4"]));
-        assert!(import_from_derivation_is_disabled(&command.args));
+        assert!(!import_from_derivation_is_disabled(&command.args));
         assert!(flake_config_is_rejected(&command.args));
         assert!(build_sandbox_is_required(&command.args));
-        assert!(authenticated_substitutes_are_preferred(&command.args));
-
-        spec.allow_source_builds = true;
-        let source_enabled = nix_build_command(&config, &target, &spec, 43).unwrap();
-        assert!(!import_from_derivation_is_disabled(&source_enabled.args));
-        assert!(flake_config_is_rejected(&source_enabled.args));
-        assert!(build_sandbox_is_required(&source_enabled.args));
     }
 
     #[test]
@@ -8469,7 +8146,6 @@ sleep 5
                 installer_target: None,
                 wallpaper_asset: None,
             }),
-            allow_source_builds: false,
             closure_source: None,
         };
         assert!(build_target(&config, &spec).is_ok());
@@ -11549,19 +11225,19 @@ fi
 
     #[cfg(unix)]
     #[tokio::test]
-    #[ignore = "requires Nix, network access, and TIARIS_SOURCE_POLICY_INSTALLABLE"]
-    async fn source_policy_qualifies_cache_only_installable() {
-        let installable = std::env::var("TIARIS_SOURCE_POLICY_INSTALLABLE")
+    #[ignore = "requires Nix, network access, and TIARIS_DRY_RUN_INSTALLABLE"]
+    async fn isolated_dry_run_leaves_nothing_unadmitted() {
+        let installable = std::env::var("TIARIS_DRY_RUN_INSTALLABLE")
             .expect("set an exact pinned qualification installable");
         let root = std::env::temp_dir().join(format!(
-            "tiaris-source-policy-qualification-{}",
+            "tiaris-dry-run-qualification-{}",
             std::process::id()
         ));
         std::fs::create_dir(&root).unwrap();
         let mut config = AppConfig::default();
         config.build.work_dir = root.clone();
         config.update.trusted_public_key =
-            std::env::var("TIARIS_SOURCE_POLICY_RELEASE_KEY").unwrap_or_default();
+            std::env::var("TIARIS_DRY_RUN_RELEASE_KEY").unwrap_or_default();
         let command = NixBuildCommand {
             program: "nix".into(),
             args: Vec::new(),
@@ -11569,7 +11245,7 @@ fi
             out_link: root.join("unused-result"),
             installable,
         };
-        let result = preflight_source_build_check(&config, &command).await;
+        let result = unadmitted_names(&config, &command, PreflightLimits::default()).await;
         std::fs::remove_dir_all(root).unwrap();
         assert_eq!(result.unwrap(), Vec::<String>::new());
     }
@@ -11608,7 +11284,7 @@ esac
             out_link: root.join("result"),
             installable: ".#test".into(),
         };
-        let error = preflight_source_build_check(&config, &command)
+        let error = unadmitted_names(&config, &command, PreflightLimits::default())
             .await
             .unwrap_err();
         assert!(
@@ -11662,7 +11338,7 @@ esac
             out_link: root.join("result"),
             installable: ".#test".into(),
         };
-        let _ = preflight_source_build_check(&config, &command).await;
+        let _ = unadmitted_names(&config, &command, PreflightLimits::default()).await;
         let invocations = std::fs::read_to_string(&log).unwrap();
         let isolated = invocations
             .lines()
@@ -11745,7 +11421,7 @@ esac
             installable: ".#test".to_string(),
         };
 
-        let offenders = preflight_source_build_check(&config, &command)
+        let offenders = unadmitted_names(&config, &command, PreflightLimits::default())
             .await
             .unwrap();
 
@@ -11835,7 +11511,7 @@ esac
             out_link: root.join("result"),
             installable: format!("path:{}#default", flake_dir.display()),
         };
-        let error = preflight_source_build_check(&config, &command)
+        let error = unadmitted_names(&config, &command, PreflightLimits::default())
             .await
             .unwrap_err();
         let error = format!("{error:#}");
@@ -11850,6 +11526,26 @@ esac
         );
         assert_no_source_policy_store_left(&config);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The display names a dry run leaves unadmitted under the built-in
+    /// profile, as the software-update check sees them.
+    async fn unadmitted_names(
+        config: &AppConfig,
+        command: &NixBuildCommand,
+        limits: PreflightLimits,
+    ) -> Result<Vec<String>> {
+        let profile = WorkstationBuildProfile::builtin();
+        DetachedDryRun::run_with_limits(config, command, profile, limits)
+            .await?
+            .classify(profile)
+            .map(|unadmitted| {
+                unadmitted
+                    .rejected_on_their_own
+                    .iter()
+                    .map(|path| crate::nix_log::derivation_display_name(path))
+                    .collect()
+            })
     }
 
     #[cfg(unix)]
@@ -11911,10 +11607,9 @@ esac
             &overflow_root,
             "#!/bin/sh\nset -eu\nwhile :; do printf 'xxxxxxxxxxxxxxxx' >&2; done\n",
         );
-        let error =
-            preflight_source_build_check_with_limits(&config, &command, tiny_preflight_limits())
-                .await
-                .unwrap_err();
+        let error = unadmitted_names(&config, &command, tiny_preflight_limits())
+            .await
+            .unwrap_err();
         let error = format!("{error:#}");
         assert!(error.contains("exceeded"), "unexpected error: {error}");
         assert_no_source_policy_store_left(&config);
@@ -11926,10 +11621,9 @@ esac
         ));
         let (config, command) =
             source_policy_test_command(&timeout_root, "#!/bin/sh\nset -eu\nwhile :; do :; done\n");
-        let error =
-            preflight_source_build_check_with_limits(&config, &command, tiny_preflight_limits())
-                .await
-                .unwrap_err();
+        let error = unadmitted_names(&config, &command, tiny_preflight_limits())
+            .await
+            .unwrap_err();
         let error = format!("{error:#}");
         assert!(error.contains("timed out"), "unexpected error: {error}");
         assert_no_source_policy_store_left(&config);
@@ -11951,7 +11645,7 @@ esac
         let (config, command) = source_policy_test_command(&root, &script);
         let mut limits = tiny_preflight_limits();
         limits.dry_run_timeout = Duration::from_millis(500);
-        let error = preflight_source_build_check_with_limits(&config, &command, limits)
+        let error = unadmitted_names(&config, &command, limits)
             .await
             .unwrap_err();
         assert!(format!("{error:#}").contains("timed out"));
@@ -11999,7 +11693,7 @@ esac
         );
         let mut limits = tiny_preflight_limits();
         limits.dry_run_stderr_max_bytes = 1024;
-        let error = preflight_source_build_check_with_limits(&config, &command, limits)
+        let error = unadmitted_names(&config, &command, limits)
             .await
             .unwrap_err();
         assert!(format!("{error:#}").contains("exceeded"));
@@ -12043,16 +11737,10 @@ esac
                 .kind,
             "nix_daemon_unavailable"
         );
-        let blocked_log = "these 2 derivations will be built:\n  /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-firefox-140.0.drv\n  /nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-vlc-3.0.21.drv\nerror: unable to start any build; either increase '--max-jobs' or enable remote builds";
-        let failure::NixBuildFailure { kind, message, .. } =
-            failure::classify_nix_build_failure(blocked_log, false);
-        assert_eq!(kind, "source_build_blocked");
-        assert!(message.contains("firefox-140.0"));
-        assert!(message.contains("Allow building from source"));
     }
 
     #[test]
-    fn would_build_extraction_and_blocked_message() {
+    fn would_build_extraction_is_strict() {
         let dry_run = "evaluating\nthis derivation will be built:\n  /nix/store/cccccccccccccccccccccccccccccccc-pkg-1.0.drv\nthese 3 paths will be fetched (12 MiB download):\n  /nix/store/x\n";
         assert_eq!(
             extract_would_build_derivations(dry_run, 10).paths,
@@ -12083,16 +11771,6 @@ esac
                 "accepted incomplete dry-run output: {malformed}"
             );
         }
-
-        let names: Vec<String> = (0..7).map(|index| format!("pkg-{index}")).collect();
-        let message = source_build_blocked_message(&names);
-        assert!(message.starts_with("Blocked: 7 derivation(s)"));
-        assert!(message.contains("pkg-4"));
-        assert!(!message.contains("pkg-5"));
-        assert!(message.contains("(+2 more)"));
-        let generic_message = source_build_blocked_message(&[]);
-        assert!(generic_message.contains("requires compiling derivations from source"));
-        assert!(generic_message.contains("organization Software delivery policy"));
     }
 
     #[test]
@@ -12113,7 +11791,7 @@ esac
             flake: "/srv/tiaris-nest/build-inputs/tiaris".to_string(),
             attr: "packages.x86_64-linux.desktop-experience".to_string(),
         };
-        let mut spec = ValidatedBuildSpec {
+        let spec = ValidatedBuildSpec {
             artifact_type: "nixos_closure".to_string(),
             target: "blueprint".to_string(),
             system: "x86_64-linux".to_string(),
@@ -12145,7 +11823,6 @@ esac
             installer_target: None,
             wallpaper_asset: None,
             }),
-            allow_source_builds: false,
             closure_source: None,
         };
 
@@ -12159,7 +11836,7 @@ esac
                 .iter()
                 .any(|arg| arg.ends_with("#packages.x86_64-linux.desktop-experience"))
         );
-        assert!(import_from_derivation_is_disabled(&command.args));
+        assert!(!import_from_derivation_is_disabled(&command.args));
         assert!(flake_config_is_rejected(&command.args));
         assert!(build_sandbox_is_required(&command.args));
         assert!(root.join("work/job-42-input/flake.nix").is_file());
@@ -12211,12 +11888,6 @@ esac
             "c".repeat(40)
         )));
         assert!(!flake.contains("/srv/tiaris-nest/build-inputs/tiaris"));
-
-        spec.allow_source_builds = true;
-        let source_enabled = nix_build_command(&config, &target, &spec, 43).unwrap();
-        assert!(!import_from_derivation_is_disabled(&source_enabled.args));
-        assert!(flake_config_is_rejected(&source_enabled.args));
-        assert!(build_sandbox_is_required(&source_enabled.args));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -12286,7 +11957,6 @@ esac
             source_lock_sha256: Some("6".repeat(64)),
             software_package_refs: Vec::new(),
             build_input: None,
-            allow_source_builds: false,
             closure_source: None,
         };
         let build_input = ValidatedBlueprintBuildInput {
@@ -12381,7 +12051,6 @@ esac
                 installer_target: None,
                 wallpaper_asset: None,
             }),
-            allow_source_builds: false,
             closure_source: None,
         };
 
@@ -12826,7 +12495,7 @@ esac
         let (detected, _) = shifted_detected_profile(BTreeSet::from([agent.to_string()]));
         let compile = |path: &str| {
             json!({
-                "name": derivation_display_name(path),
+                "name": crate::nix_log::derivation_display_name(path),
                 "builder": "/nix/store/cccccccccccccccccccccccccccccccc-bash-5.3p9/bin/bash",
                 "env": {"buildPhase": "cargo build --release"},
                 "inputSrcs": [],
@@ -13005,7 +12674,6 @@ esac
                 installer_target: None,
                 wallpaper_asset: None,
             }),
-            allow_source_builds: false,
             closure_source: None,
         }
     }
@@ -13072,13 +12740,6 @@ esac
     {
         let would_build = derivations.keys().cloned().collect::<Vec<_>>();
         let set = would_build.iter().cloned().collect::<HashSet<_>>();
-        let trusted = classify_trusted_local_derivations_for_profile(
-            profile,
-            &would_build,
-            derivations,
-            verify_source,
-            &set,
-        );
         let rejected_on_their_own = would_build
             .iter()
             .filter(|path| {
@@ -13094,11 +12755,6 @@ esac
             .cloned()
             .collect();
         UnadmittedDerivations {
-            paths: would_build
-                .iter()
-                .filter(|path| !trusted.contains(*path))
-                .cloned()
-                .collect(),
             would_build,
             rejected_on_their_own,
             derivations: derivations.clone(),
@@ -13626,23 +13282,10 @@ esac
     }
 
     #[test]
-    fn the_preflight_profile_follows_the_admitted_commit_only() {
+    fn a_job_is_admitted_at_the_pin_or_a_ready_commit_only() {
         let pin = "74cc63f702f7d60a557e152a57b40fb1fd0f72ac";
         let detected_commit = "6f06d204d8f2d8761d9da78778745974a3216381";
-        let (detected, _) = shifted_detected_profile(BTreeSet::new());
-        assert!(
-            WorkstationBuildProfile::for_build(Some(pin), Some(&detected))
-                .is_some_and(WorkstationBuildProfile::is_builtin)
-        );
-        assert!(std::ptr::eq(
-            WorkstationBuildProfile::for_build(Some(detected_commit), Some(&detected)).unwrap(),
-            &detected
-        ));
-        // Neither the pin nor the ready commit: no profile, no fallback.
         let other = "1111111111111111111111111111111111111111";
-        assert!(WorkstationBuildProfile::for_build(Some(other), Some(&detected)).is_none());
-        assert!(WorkstationBuildProfile::for_build(Some(detected_commit), None).is_none());
-        assert!(WorkstationBuildProfile::for_build(None, Some(&detected)).is_none());
 
         let mut config = AppConfig::default();
         config.build.targets = vec![BuildTargetConfig {
@@ -13679,17 +13322,13 @@ esac
             plain.nixpkgs_commit = Some(claimed.to_string());
             assert!(admit_build_target(&config, &plain, Some(detected_commit)).is_err());
         }
-        // A target flake that is not a pinned nixpkgs gives no commit, and so
-        // no source-free profile.
+        // A target flake that is not a pinned nixpkgs gives no commit.
         config.build.targets[0].target = "custom".to_string();
         config.build.targets[0].flake = "path:/srv/custom".to_string();
         plain.target = "custom".to_string();
         plain.nixpkgs_commit = None;
         let admitted = admit_build_target(&config, &plain, None).unwrap();
         assert_eq!(admitted.nixpkgs_commit, None);
-        assert!(
-            WorkstationBuildProfile::for_build(admitted.nixpkgs_commit.as_deref(), None).is_none()
-        );
     }
 
     #[test]
@@ -13915,14 +13554,14 @@ esac
             &target,
             Some(commit),
             Some(nar_hash),
-            Some("source_build_blocked"),
+            Some("package_build_failed"),
         );
         assert_eq!(detected["nixpkgs_revision"], commit);
         assert_eq!(
             detected["nixpkgs_flake"],
             nixpkgs_flake_ref(commit, Some(nar_hash)).unwrap()
         );
-        assert_eq!(detected["error_kind"], "source_build_blocked");
+        assert_eq!(detected["error_kind"], "package_build_failed");
         let pin = admitted_result_metadata(
             &config,
             &job,

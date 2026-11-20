@@ -1,7 +1,7 @@
-"""Real Nix regression for signed appliance seeds in an isolated preflight.
+"""Real Nix regression for signed appliance seeds in an isolated dry run.
 
 Only runs in the disposable CI guest: its daemon owns the temporary build and
-the test key never leaves TemporaryDirectory. No source policy is relaxed.
+the test key never leaves TemporaryDirectory.
 """
 import json
 import os
@@ -24,7 +24,7 @@ class SignedSeedCacheTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_only_signed_daemon_outputs_satisfy_isolated_preflight(self):
+    def test_only_signed_daemon_outputs_satisfy_an_isolated_dry_run(self):
         pin = json.loads(self.run_command(
             'nix-instantiate', '--eval', '--strict', '--json', 'release/nixpkgs.nix'))
         with tempfile.TemporaryDirectory(prefix='signed-seed-contract-') as temporary:
@@ -37,7 +37,7 @@ class SignedSeedCacheTests(unittest.TestCase):
                 nixpkgs = builtins.fetchTarball %s;
                 pkgs = import nixpkgs { system = "x86_64-linux"; };
               in { packages.x86_64-linux.seed =
-                pkgs.runCommand "source-policy-seed-%s" { }
+                pkgs.runCommand "dry-run-seed-%s" { }
                   "printf '%%s' '%s' > $out"; };
             }''' % ('{ url = %s; sha256 = %s; }' %
                      (json.dumps(pin['url']), json.dumps(pin['sha256'])), nonce, nonce))
@@ -54,19 +54,19 @@ class SignedSeedCacheTests(unittest.TestCase):
                 'key', 'convert-secret-to-public'], input=secret, text=True,
                 capture_output=True, check=True, timeout=30).stdout.strip()
 
-            def preflight():
+            def dry_run():
                 return subprocess.run(['cargo', 'test', '--locked',
-                    'source_policy_qualifies_cache_only_installable', '--', '--ignored', '--nocapture'],
-                    env={**os.environ, 'TIARIS_SOURCE_POLICY_INSTALLABLE': installable,
-                         'TIARIS_SOURCE_POLICY_RELEASE_KEY': public.split(':', 1)[1]},
+                    'isolated_dry_run_leaves_nothing_unadmitted', '--', '--ignored', '--nocapture'],
+                    env={**os.environ, 'TIARIS_DRY_RUN_INSTALLABLE': installable,
+                         'TIARIS_DRY_RUN_RELEASE_KEY': public.split(':', 1)[1]},
                     text=True, capture_output=True, timeout=600)
 
             # A daemon build is marked ultimate locally, but that must not
             # grant an unsigned path trust in the isolated verification store.
-            unsigned = preflight()
+            unsigned = dry_run()
             self.assertNotEqual(unsigned.returncode, 0, unsigned.stdout + unsigned.stderr)
-            self.assertIn(f'source-policy-seed-{nonce}', unsigned.stdout + unsigned.stderr)
+            self.assertIn(f'dry-run-seed-{nonce}', unsigned.stdout + unsigned.stderr)
             self.run_command('sudo', '-n', 'nix', '--extra-experimental-features',
                 'nix-command', 'store', 'sign', '--key-file', str(key), seed)
-            signed = preflight()
+            signed = dry_run()
             self.assertEqual(signed.returncode, 0, signed.stdout + signed.stderr)

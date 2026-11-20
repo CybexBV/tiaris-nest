@@ -19,7 +19,6 @@ class DeliveryTests(unittest.TestCase):
         self.created = []
         self.old_runtime = True
         self.blocked = False
-        self.policy_allowed = False
         self.cached = True
         self.manifest = {'workstation_netboot': {'runtime_version': '1.0.108', 'sha256': 'a' * 64,
                                                'manage_source_revision': 'b' * 40}}
@@ -34,16 +33,6 @@ class DeliveryTests(unittest.TestCase):
         self.t += seconds
 
     def api(self, path, body=None):
-        if path == '/v1/nest/delivery-policy':
-            # Current Manage: local builds and the stored preparation mode stay
-            # permissive; only Nest-only delivery makes it source-free.
-            return {'mode': 'connected' if self.policy_allowed else 'nest_only',
-                    'effective_mode': 'connected' if self.policy_allowed else 'nest_only',
-                    'allow_nest_source_builds': True, 'allow_local_builds': True,
-                    'source_builds_allowed': self.policy_allowed,
-                    'preparation_mode': 'approved',
-                    'effective_preparation_mode': 'approved' if self.policy_allowed else 'cached_only',
-                    'emergency_override_mode': None}
         if path.endswith('/workstation-netboot'):
             runtime = copy.deepcopy(self.manifest['workstation_netboot'])
             runtime['bundle_sha256'] = runtime.pop('sha256')
@@ -55,7 +44,7 @@ class DeliveryTests(unittest.TestCase):
                 self.assertGreaterEqual(self.t, 5, 'current inputs were sent to the signed predecessor')
                 job = {'id': str(uuid.uuid4()), 'build_spec': copy.deepcopy(body),
                        'status': 'failed' if self.blocked else 'succeeded',
-                       'cache_metadata': {'error_kind': 'source_build_blocked'} if self.blocked else {}}
+                       'cache_metadata': {'error_kind': 'package_build_failed'} if self.blocked else {}}
                 self.created.append(job)
                 return job
             return {'jobs': copy.deepcopy(self.created)}
@@ -76,12 +65,9 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(set(result['job_ids']), {row['id'] for row in self.created})
         delivery.validate(self.manifest, 'dev_' + '1' * 32, result)
 
-    def test_source_build_block_and_relaxed_policy_fail_without_evidence(self):
+    def test_a_failed_build_fails_without_evidence(self):
         self.blocked = True
-        with self.assertRaisesRegex(ValueError, 'source-free'):
-            self.qualify()
-        self.policy_allowed = True
-        with self.assertRaisesRegex(ValueError, 'policy'):
+        with self.assertRaisesRegex(ValueError, 'failed'):
             self.qualify()
 
     def test_missing_replica_never_passes(self):

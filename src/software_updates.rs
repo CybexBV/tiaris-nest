@@ -8,7 +8,7 @@
 //! 1. The commit must be on the channel's branch of NixOS/nixpkgs after the
 //!    release pin (GitHub compare). `nix flake metadata` records its
 //!    `lastModified` and `narHash`; every later fetch is pinned to it.
-//! 2. The commit identities of the source-build preflight are evaluated from
+//! 2. The commit identities of the local-work classifier are evaluated from
 //!    the same nixpkgs attributes as the built-in profile
 //!    (`software_updates/identities.nix`), together with the hashes of the
 //!    reviewed builder files.
@@ -24,8 +24,7 @@
 //!    reference must keep at this commit what the pin admits.
 //!
 //! The result is a detected commit, `ready` or `blocked` with a reason.
-//! Ready commits are admitted by `build_target`, selected by
-//! `spec.nixpkgs_commit` in the preflight and reported to Manage.
+//! Ready commits are admitted by `build_target` and reported to Manage.
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
@@ -255,8 +254,8 @@ pub(crate) async fn apply_managed(
 
 /// One detected commit, one record each (`detected/<commit>.json`).
 /// `profile` and `tiaris_derivations` are set only for ready commits; they
-/// are the derived build profile the preflight selects by
-/// `spec.nixpkgs_commit`, and are validated again whenever they are used.
+/// are the derived build profile of that commit, and are validated again
+/// whenever they are used.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct DetectedRow {
@@ -415,12 +414,11 @@ pub(crate) async fn report(db: &SqlitePool, data_dir: &Path) -> Result<Vec<Detec
         .collect())
 }
 
-/// A ready detected commit: the jobs it admits build with its derived
-/// profile and with nixpkgs pinned to its recorded `narHash`.
+/// A ready detected commit: the jobs it admits build with nixpkgs pinned to
+/// its recorded `narHash`.
 pub(crate) struct ReadyCommit {
     pub(crate) commit: String,
     pub(crate) nar_hash: String,
-    pub(crate) profile: WorkstationBuildProfile,
 }
 
 /// The recorded `narHash` of a commit that is ready for this Nest build.
@@ -505,17 +503,12 @@ fn ready_commit_from_row(row: DetectedRow) -> Result<ReadyCommit> {
     let last_modified = parse_timestamp(Some(&row.last_modified))
         .ok_or_else(|| anyhow!("detected commit lastModified is invalid"))?
         .timestamp();
-    let profile = WorkstationBuildProfile::derived(
-        &row.commit_rev,
-        last_modified,
-        &stored.identities,
-        tiaris,
-    )?
-    .with_reviewed_content(&stored.reviewed)?;
+    // A record whose profile no longer derives is not ready.
+    WorkstationBuildProfile::derived(&row.commit_rev, last_modified, &stored.identities, tiaris)?
+        .with_reviewed_content(&stored.reviewed)?;
     Ok(ReadyCommit {
         commit: row.commit_rev,
         nar_hash: row.nar_hash,
-        profile,
     })
 }
 

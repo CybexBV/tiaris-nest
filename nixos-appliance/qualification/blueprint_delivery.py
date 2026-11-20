@@ -29,25 +29,6 @@ def read_catalog(api):
     return CATALOG['catalog'](rows, configs)
 
 
-def source_free(policy):
-    """Manage's one delivery switch: Nest-only delivery is the source-free policy.
-
-    Since Manage made every other delivery value fixed (local builds are always
-    stored as on), Nest-only delivery is what turns source builds off
-    (`effective_preparation_mode` `cached_only`) and leaves computers no local
-    build or public-cache fallback.
-    """
-    return (policy.get('effective_mode') == 'nest_only'
-            and policy.get('source_builds_allowed') is False
-            and policy.get('effective_preparation_mode') == 'cached_only'
-            and policy.get('emergency_override_mode') is None)
-
-
-def source_free_policy(api):
-    if not source_free(api('/v1/nest/delivery-policy')):
-        raise ValueError('Upgraded Blueprint qualification requires the source-disabled policy')
-
-
 def exact_runtime(status, manifest):
     expected = manifest['workstation_netboot']
     return (status.get('operational') is True and status.get('converged') is True
@@ -86,12 +67,10 @@ def qualify(api, device, manifest, catalog, *, clock=time.monotonic, sleep=time.
     deadline = clock() + timeout
     prefix = '/v1/nest/nodes/' + device
     admitted = {}
-    source_free_policy(api)
     while clock() < deadline:
         if not exact_runtime(api(prefix + '/workstation-netboot'), manifest):
             sleep(5)
             continue
-        source_free_policy(api)
         for blueprint in catalog['blueprints']:
             revision = blueprint['current_revision_id']
             if revision not in admitted:
@@ -110,7 +89,6 @@ def qualify(api, device, manifest, catalog, *, clock=time.monotonic, sleep=time.
                    and row.get('ready_replicas') == row['required_replicas'] for row in cached):
                 if not exact_runtime(api(prefix + '/workstation-netboot'), manifest):
                     raise ValueError('Candidate runtime changed during Blueprint qualification')
-                source_free_policy(api)
                 receipt = {'schema': 'tiaris.nest.upgraded-blueprint-delivery.v1',
                     'nest_device_id': device, 'qualified_blueprints': catalog,
                     'job_ids': list(admitted.values()), 'source_builds_allowed': False,
