@@ -383,6 +383,14 @@ fn ready_outcome() -> DetectedOutcome {
     DetectedOutcome::ready("6.18.59".to_string())
 }
 
+fn blocked_outcome() -> DetectedOutcome {
+    DetectedOutcome::blocked(
+        "6.18.60".to_string(),
+        REASON_SOURCE_BUILD_REQUIRED,
+        vec!["libreoffice-26.2.1.2".to_string()],
+    )
+}
+
 #[tokio::test]
 async fn ready_commits_are_admitted_reported_and_kept_while_used() {
     let stores = stores("ready").await;
@@ -415,11 +423,7 @@ async fn ready_commits_are_admitted_reported_and_kept_while_used() {
         blocked,
         DEFAULT_CHANNEL,
         &metadata(1_793_400_000),
-        &DetectedOutcome::blocked(
-            "6.18.60".to_string(),
-            REASON_SOURCE_BUILD_REQUIRED,
-            vec!["libreoffice-26.2.1.2".to_string()],
-        ),
+        &blocked_outcome(),
     )
     .await
     .unwrap();
@@ -494,8 +498,7 @@ async fn ready_commits_are_admitted_reported_and_kept_while_used() {
     );
 
     // A record an older Nest wrote: its build profile is ignored, and a
-    // verdict of the strict "Nest only" check is not used, so the commit is
-    // evaluated again.
+    // verdict of the strict "Nest only" check is not used.
     tamper(data, COMMIT, |record| {
         record["profile"] = json!("{}");
         record["tiaris_derivations"] = json!("[]");
@@ -798,10 +801,9 @@ fn provenance_needs_the_branch_to_contain_the_commit_after_the_pin() {
 }
 
 #[test]
-fn failed_commits_are_evaluated_again_at_most_daily_and_after_an_update() {
+fn failed_checks_are_tried_again_at_most_daily() {
     let now = Utc.with_ymd_and_hms(2026, 10, 31, 12, 0, 0).unwrap();
-    let build = "0.2.49 release=0.2.49 source=a tiaris=b";
-    let row = |reason: Option<&str>, hours_ago: i64, derived_by: &str| DetectedRow {
+    let row = |reason: Option<&str>, hours_ago: i64| DetectedRow {
         commit_rev: COMMIT.to_string(),
         channel: DEFAULT_CHANNEL.to_string(),
         last_modified: "2026-10-29T17:25:25Z".to_string(),
@@ -811,53 +813,68 @@ fn failed_commits_are_evaluated_again_at_most_daily_and_after_an_update() {
         reason: reason.map(str::to_string),
         reason_details: "[]".to_string(),
         detected_at: (now - chrono::Duration::hours(hours_ago)).to_rfc3339(),
-        derived_by: derived_by.to_string(),
+        derived_by: String::new(),
     };
-    assert!(needs_evaluation_by(None, now, build));
+    assert!(needs_evaluation(None, now));
     for reason in [
         REASON_EVALUATION_FAILED,
         REASON_PROVENANCE_UNVERIFIED,
         REASON_INSUFFICIENT_DISK,
     ] {
-        assert!(!needs_evaluation_by(
-            Some(&row(Some(reason), 1, build)),
-            now,
-            build
-        ));
-        assert!(!needs_evaluation_by(
-            Some(&row(Some(reason), 23, build)),
-            now,
-            build
-        ));
-        assert!(needs_evaluation_by(
-            Some(&row(Some(reason), 24, build)),
-            now,
-            build
-        ));
+        assert!(!needs_evaluation(Some(&row(Some(reason), 23)), now));
+        assert!(needs_evaluation(Some(&row(Some(reason), 24)), now));
     }
-    let reason = REASON_SOURCE_BUILD_REQUIRED;
-    assert!(!needs_evaluation_by(
-        Some(&row(Some(reason), 48, build)),
-        now,
-        build
+    // A commit that needs a new compile is not asked again, and a ready
+    // commit stays ready.
+    assert!(!needs_evaluation(
+        Some(&row(Some(REASON_SOURCE_BUILD_REQUIRED), 48)),
+        now
     ));
-    // A Nest update (another build or shipped Tiaris source) may be what
-    // the commit waited for.
-    assert!(needs_evaluation_by(
-        Some(&row(
-            Some(reason),
-            1,
-            "0.2.48 release=0.2.48 source=a tiaris=c"
-        )),
-        now,
-        build
-    ));
-    // A ready commit stays ready.
-    assert!(!needs_evaluation_by(
-        Some(&row(None, 48, "other")),
-        now,
-        build
-    ));
+    assert!(!needs_evaluation(Some(&row(None, 48)), now));
+}
+
+#[tokio::test]
+async fn startup_forgets_what_another_nest_build_held_back() {
+    let stores = stores("other-build").await;
+    let (pool, data) = (&stores.pool, stores.data.as_path());
+    let [ready, strict, compile, own] = ["1", "2", "3", "4"].map(|digit| digit.repeat(40));
+    for (commit, outcome) in [
+        (&ready, ready_outcome()),
+        (&strict, blocked_outcome()),
+        (&compile, blocked_outcome()),
+        (&own, blocked_outcome()),
+    ] {
+        store_detected(
+            pool,
+            data,
+            commit,
+            DEFAULT_CHANNEL,
+            &metadata(1_793_294_725),
+            &outcome,
+        )
+        .await
+        .unwrap();
+    }
+    // Records of the Nest release before this one: a ready commit, a verdict
+    // of the removed strict check, and a verdict this build could give too.
+    for commit in [&ready, &strict, &compile] {
+        tamper(data, commit, |record| {
+            record["derived_by"] = json!("0.2.173 release=0.2.173 source=a tiaris=b");
+            if *commit == strict {
+                record["reason"] = json!("build_script_changed");
+            }
+        });
+    }
+    assert!(forget_verdicts_of_other_builds(data).await);
+    let left = detected_rows(data)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.commit_rev)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(left, BTreeSet::from([ready, own]));
+    assert!(!detected_dir(data).join(format!("{strict}.json")).exists());
+    assert!(!forget_verdicts_of_other_builds(data).await);
 }
 
 /// Provenance of a real commit through the GitHub API. Not part of CI.

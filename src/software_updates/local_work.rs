@@ -55,8 +55,8 @@ impl LocalWork {
     }
 
     /// The derivations that may be a compile, as `(role, name)` in dry-run
-    /// order: not a download, and not marked by nixpkgs as cheap local work.
-    /// A derivation without a record counts.
+    /// order: not a download and not a script. A derivation without a record
+    /// counts.
     pub(crate) fn possible_compiles(&self) -> Vec<(String, String)> {
         self.would_build
             .iter()
@@ -64,7 +64,7 @@ impl LocalWork {
                 !self
                     .derivations
                     .get(*path)
-                    .is_some_and(|drv| is_download(drv) || is_marked_local(drv))
+                    .is_some_and(|drv| is_download(drv) || is_script(drv))
             })
             .map(|path| (role(path), derivation_display_name(path)))
             .collect()
@@ -105,26 +105,35 @@ fn is_download(drv: &Value) -> bool {
         })
 }
 
-/// nixpkgs sets `preferLocalBuild` on work that is cheaper to do than to
-/// download: generated configuration files, units, link farms and wrappers.
-/// Nix 2.26 keeps structured attributes in `env.__json`; newer releases in
-/// `structuredAttrs`.
-fn is_marked_local(drv: &Value) -> bool {
-    fn truthy(attributes: Option<&Value>) -> bool {
-        attributes
-            .and_then(|attributes| attributes.get("preferLocalBuild"))
-            .is_some_and(|value| {
-                value.as_bool() == Some(true) || matches!(value.as_str(), Some("1" | "true"))
-            })
-    }
+/// Work that is a script, not a compile. nixpkgs sets `preferLocalBuild` on
+/// what is cheaper to do than to download (generated configuration, units,
+/// link farms, wrappers), and everything of its `runCommand` family runs one
+/// `buildCommand` instead of the build phases of a package: the Tiaris
+/// packages' vendored crates, for example, are each unpacked by one.
+fn is_script(drv: &Value) -> bool {
+    attribute(drv, "preferLocalBuild").is_some_and(|value| {
+        value.as_bool() == Some(true) || matches!(value.as_str(), Some("1" | "true"))
+    }) || attribute(drv, "buildCommand").is_some_and(|value| {
+        value
+            .as_str()
+            .is_some_and(|command| !command.trim().is_empty())
+    })
+}
+
+/// An attribute of a derivation. Nix 2.26 keeps structured attributes in
+/// `env.__json`; newer releases in `structuredAttrs`.
+fn attribute(drv: &Value, name: &str) -> Option<Value> {
     let env = drv.get("env");
-    truthy(env)
-        || truthy(drv.get("structuredAttrs"))
-        || env
-            .and_then(|env| env.get("__json"))
-            .and_then(Value::as_str)
-            .and_then(|encoded| serde_json::from_str::<Value>(encoded).ok())
-            .is_some_and(|structured| truthy(Some(&structured)))
+    env.and_then(|env| env.get(name))
+        .or_else(|| drv.get("structuredAttrs")?.get(name))
+        .cloned()
+        .or_else(|| {
+            let encoded = env?.get("__json")?.as_str()?;
+            serde_json::from_str::<Value>(encoded)
+                .ok()?
+                .get(name)
+                .cloned()
+        })
 }
 
 /// Dry-run `installable` in a fresh private store below the build work
@@ -380,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    fn downloads_and_marked_local_work_are_never_a_compile() {
+    fn downloads_and_scripts_are_never_a_compile() {
         let fetch = json!({"outputs": {"out": {"hash": "0".repeat(64), "hashAlgo": "sha256"}}});
         let plain = json!({"outputs": {"out": {"path": "/nix/store/x"}}, "env": {}});
         let derivations = BTreeMap::from([
@@ -390,6 +399,11 @@ mod tests {
             (
                 drv("unit-new.service"),
                 json!({"env": {"preferLocalBuild": "1"}}),
+            ),
+            // A vendored crate, unpacked by `runCommand`.
+            (
+                drv("syn-2.0.118"),
+                json!({"env": {"buildCommand": "mkdir $out\ntar xf $src -C $out\n"}}),
             ),
             (
                 drv("etc"),

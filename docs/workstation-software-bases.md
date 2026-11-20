@@ -95,10 +95,12 @@ Manage offers it as a software update.
   depend on what this Nest built before. Nothing is built.
 - **Readiness.** A derivation the commit would build holds the commit back
   only when all three are true: it is not a download (a fixed-output
-  derivation), nixpkgs does not mark it as cheap local work
-  (`preferLocalBuild`: generated configuration, units, link farms,
-  wrappers), and no reference builds a derivation of the same role at the
-  pin. The role is the name up to its version, as Nix's `parseDrvName`
+  derivation); it is not a script (nixpkgs marks it `preferLocalBuild`:
+  generated configuration, units, link farms, wrappers; or it runs one
+  `buildCommand` instead of a package's build phases, like every
+  `runCommand`: the unpacking of each vendored crate of the Tiaris
+  packages, whose versions come and go in the public cache); and no
+  reference builds a derivation of the same role at the pin. The role is the name up to its version, as Nix's `parseDrvName`
   splits it (`initrd-linux-6.18.64` and `initrd-linux-6.18.40` are one
   role; every `nixos-system-…` is `nixos-system`). What the pin builds on a
   Nest (the Tiaris packages, the initrd, generated configuration) is what

@@ -16,8 +16,8 @@
 //!    (`local_work`): what would this Nest have to build that the public
 //!    NixOS cache does not have?
 //! 3. The commit is ready when it asks for no new compilation: everything
-//!    it would build is a download, cheap local work as nixpkgs marks it, or
-//!    of a kind the release pin builds as well.
+//!    it would build is a download, a script (`preferLocalBuild` or one
+//!    `buildCommand`), or of a kind the release pin builds as well.
 //!
 //! The result is a detected commit, `ready` or `blocked` with a reason:
 //! `source_build_required` (the names of what would compile),
@@ -116,8 +116,8 @@ const MAX_CHECK_STATE_BYTES: u64 = 64 * 1024;
 /// Detected commits kept: every ready one a Blueprint job uses, then the
 /// newest. The report sends at most `MAX_REPORTED_DETECTED_COMMITS`.
 const MAX_DETECTED_RECORDS: usize = 64;
-/// A record with another reason (one an older Nest wrote for the strict
-/// "Nest only" check) is not used: its commit is evaluated again.
+/// A record with another reason is not used. Those an older Nest wrote for
+/// the strict "Nest only" check are removed at startup.
 const DETECTED_REASONS: [&str; 4] = [
     REASON_SOURCE_BUILD_REQUIRED,
     REASON_EVALUATION_FAILED,
@@ -404,8 +404,8 @@ pub(crate) async fn ready_commit(data_dir: &Path, commit: &str) -> Result<Option
 }
 
 /// This Nest build: its version and the release, source and Tiaris source
-/// revisions of the installed system. A blocked commit another build
-/// evaluated is evaluated again.
+/// revisions of the installed system. What another build held back is
+/// forgotten at startup.
 fn nest_build_identity() -> String {
     #[derive(Deserialize)]
     struct Installed {
@@ -489,10 +489,10 @@ async fn run(state: AppState) {
         Ok(_) => {}
         Err(error) => warn!(error = %error, "could not read software update check state"),
     }
-    // After an update of this Nest, a commit the previous build held back is
-    // looked at again now rather than at the daily check: the update may be
-    // what it waited for.
-    if held_back_by_another_build(&state.config.paths.data_dir).await {
+    // After an update of this Nest, what the previous build held back is
+    // forgotten and the channel is looked at again now rather than at the
+    // daily check: the update may be what it waited for.
+    if forget_verdicts_of_other_builds(&state.config.paths.data_dir).await {
         if let Err(error) = check(&state).await {
             warn!(error = %error, "software update check after an update of this Nest failed");
         }
@@ -621,9 +621,8 @@ fn next_daily_check<Tz: TimeZone>(
 
 /// Read the channel and handle its newest commit. A commit already recorded
 /// is evaluated again only when its evaluation, provenance or disk check
-/// failed at least a day ago, or when another Nest build held it back; a
-/// request from Manage repeats only the channel lookup. Network failures
-/// before evaluation record nothing.
+/// failed at least a day ago; a request from Manage repeats only the channel
+/// lookup. Network failures before evaluation record nothing.
 async fn check(state: &AppState) -> Result<()> {
     let data_dir = &state.config.paths.data_dir;
     let channel = check_state(data_dir)
@@ -643,19 +642,12 @@ async fn check(state: &AppState) -> Result<()> {
     Ok(())
 }
 
+/// A commit is evaluated when it is new, and when its evaluation, provenance
+/// or disk check failed at least a day ago. Any other verdict of this Nest
+/// build stands: a ready commit stays ready, and a commit that needs a new
+/// compile is not asked again (the next channel commit is).
 fn needs_evaluation(existing: Option<&DetectedRow>, now: DateTime<Utc>) -> bool {
-    needs_evaluation_by(existing, now, &nest_build_identity())
-}
-
-/// A commit is evaluated when it is new; when its evaluation, provenance or
-/// disk check failed at least a day ago; and when it is blocked and another
-/// Nest build or shipped Tiaris source evaluated it (an update of the Nest
-/// may be what it waited for). A ready commit stays ready.
-fn needs_evaluation_by(existing: Option<&DetectedRow>, now: DateTime<Utc>, build: &str) -> bool {
     existing.is_none_or(|row| {
-        if row.state == "blocked" && row.derived_by != build {
-            return true;
-        }
         matches!(
             row.reason.as_deref(),
             Some(
@@ -666,13 +658,27 @@ fn needs_evaluation_by(existing: Option<&DetectedRow>, now: DateTime<Utc>, build
     })
 }
 
-/// Whether a commit is blocked by the verdict of another Nest build.
-async fn held_back_by_another_build(data_dir: &Path) -> bool {
+/// Remove the record of every commit another Nest build held back, whatever
+/// its reason (also reasons this build no longer has); whether one was
+/// removed. A ready commit is kept: it stays ready.
+async fn forget_verdicts_of_other_builds(data_dir: &Path) -> bool {
+    let dir = detected_dir(data_dir);
+    let _guard = crate::state_files::lock(&dir).await;
     let build = nest_build_identity();
-    detected_rows(data_dir).await.is_ok_and(|rows| {
-        rows.iter()
-            .any(|row| row.state == "blocked" && row.derived_by != build)
-    })
+    let mut forgot = false;
+    for name in crate::state_files::list(&dir, ".json", 4 * MAX_DETECTED_RECORDS) {
+        let other_build = crate::state_files::read::<DetectedRow>(
+            &dir,
+            &name,
+            DETECTED_SCHEMA,
+            MAX_DETECTED_RECORD_BYTES,
+        )
+        .is_some_and(|row| row.state == "blocked" && row.derived_by != build);
+        if other_build && crate::state_files::remove(&dir, &name).is_ok() {
+            forgot = true;
+        }
+    }
+    forgot
 }
 
 async fn evaluate_and_record(
@@ -1206,15 +1212,19 @@ async fn evaluate_commit_in(
         };
         match both.await {
             Ok((pin, new)) => {
+                let compiles = new.possible_compiles();
+                // What is neither a download nor a script, at the commit:
+                // the Tiaris packages and whatever the public cache lacks.
                 info!(
                     %commit,
                     reference,
                     local_at_pin = pin.len(),
                     local_at_commit = new.len(),
+                    compiles = ?compiles.iter().map(|(_, name)| name).collect::<Vec<_>>(),
                     "checked a reference"
                 );
                 known_roles.extend(pin.roles());
-                possible_compiles.extend(new.possible_compiles());
+                possible_compiles.extend(compiles);
             }
             Err(error) => {
                 warn!(%commit, reference, error = %format!("{error:#}"), "could not evaluate a reference");
