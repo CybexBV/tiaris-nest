@@ -311,6 +311,7 @@ async fn build_boot_script(
             },
             runtime.menu_timeout_ms,
             context,
+            runtime.menu_language,
         ))
     }
 }
@@ -616,7 +617,7 @@ async fn render_selected_profile(
 ) -> AppResult<String> {
     if profile.profile_type != BootProfileType::NestInstaller {
         let runtime = state.runtime_settings();
-        return boot_logic::render_profile_script(profile, &runtime.public_base_url);
+        return boot_logic::render_profile_script(profile, runtime.menu_language);
     }
     let mac = mac.ok_or_else(|| {
         AppError::Validation("a normalized MAC is required for Nest installer boot".to_string())
