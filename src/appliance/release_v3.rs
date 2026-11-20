@@ -57,21 +57,12 @@ pub struct NixosRelease {
 #[serde(untagged)]
 pub enum ReleaseDescriptor {
     Nixos(NixosRelease),
-    Legacy(super::SignedApplianceRelease),
 }
 
 impl ReleaseDescriptor {
     pub fn nixos(&self) -> Result<&NixosRelease> {
-        match self {
-            Self::Nixos(value) => Ok(value),
-            Self::Legacy(_) => bail!("NixOS media requires install-plan.v3 and a NixOS closure"),
-        }
-    }
-    pub fn legacy(&self) -> Result<&super::SignedApplianceRelease> {
-        match self {
-            Self::Legacy(value) => Ok(value),
-            Self::Nixos(_) => bail!("Ubuntu installation cannot consume a NixOS closure"),
-        }
+        let Self::Nixos(value) = self;
+        Ok(value)
     }
 }
 
@@ -318,11 +309,6 @@ impl<'de> Deserialize<'de> for ReleaseDescriptor {
             Some(SCHEMA) => serde_json::from_value(value)
                 .map(Self::Nixos)
                 .map_err(serde::de::Error::custom),
-            Some("tiaris.nest.appliance-release.v1" | "tiaris.nest.appliance-release.v2") => {
-                serde_json::from_value(value)
-                    .map(Self::Legacy)
-                    .map_err(serde::de::Error::custom)
-            }
             _ => Err(serde::de::Error::custom(
                 "unsupported appliance descriptor schema",
             )),

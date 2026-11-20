@@ -41,7 +41,7 @@ pub enum Command {
     Migrate,
     /// Validate a complete appliance configuration without printing it.
     ValidateApplianceConfig,
-    /// Re-verify and extract the currently staged signed Ubuntu package update.
+    /// Re-verify and extract the currently staged signed NixOS update.
     VerifyApplianceUpdate,
     /// Verify and persist an exact signed NixOS maintenance schedule.
     VerifyApplianceUpdatePolicy,
@@ -61,10 +61,6 @@ pub enum Command {
         #[arg(long)]
         output: PathBuf,
     },
-    ApplyApplianceUpdateSchedule,
-    CheckApplianceUpdateSchedule,
-    /// Re-authenticate a legacy update request from its already-booted candidate.
-    VerifyApplianceCandidateUpdate,
     /// Re-verify and materialize the currently staged signed Netplan change.
     VerifyApplianceNetworkChange,
     /// Re-derive a signed Netplan candidate for idempotent post-crash recovery.

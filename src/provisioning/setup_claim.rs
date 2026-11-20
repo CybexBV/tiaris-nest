@@ -19,7 +19,6 @@
 //! context only, never with a response body.
 use super::{
     DurableProvisioningState, PrepareOptions,
-    packages::MediaLayout,
     protocol::{self, VerifiedEnvelope},
     setup_status::{ClaimState, ClaimView, SetupStatusReporter},
     storage,
@@ -91,7 +90,6 @@ fn bytes_are_generic_slot(bytes: &[u8]) -> bool {
 pub(super) async fn prepare_generic(
     options: &PrepareOptions,
     status: &SetupStatusReporter,
-    media_layout: MediaLayout,
     trusted_keys: &[VerifyingKey],
 ) -> Result<()> {
     let store = RunStore::new(options.setup_claim_dir.clone());
@@ -133,7 +131,7 @@ pub(super) async fn prepare_generic(
             Retained::Installed(installed) => {
                 storage::release_state_probe(&options.state_mount)?;
                 info!("this server already runs a Nest; it starts unless claimed in time");
-                let start = |installed| start_installed(options, status, media_layout, installed);
+                let start = |installed| start_installed(options, status, installed);
                 match claim_installed(&mut context, installed, start).await? {
                     Some(claimed) => claimed,
                     None => return Ok(()),
@@ -148,14 +146,8 @@ pub(super) async fn prepare_generic(
                 .load_organization(claimed.verified.envelope.session_id)
                 .as_deref(),
         );
-        let result = super::prepare_verified(
-            options,
-            status,
-            media_layout,
-            claimed.verified,
-            Some(&claimed.bytes),
-        )
-        .await;
+        let result =
+            super::prepare_verified(options, status, claimed.verified, Some(&claimed.bytes)).await;
         let Err(error) = result else {
             return Ok(());
         };
@@ -470,19 +462,12 @@ where
 async fn start_installed(
     options: &PrepareOptions,
     status: &SetupStatusReporter,
-    media_layout: MediaLayout,
     installed: Installed,
 ) -> Result<()> {
     let result = match installed {
         Installed::Retained(installed) => {
-            super::prepare_verified(
-                options,
-                status,
-                media_layout,
-                installed.verified,
-                Some(&installed.bytes),
-            )
-            .await
+            super::prepare_verified(options, status, installed.verified, Some(&installed.bytes))
+                .await
         }
         Installed::BootEntry(esp) => {
             status.rebooting();

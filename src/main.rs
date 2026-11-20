@@ -37,40 +37,12 @@ async fn main() -> anyhow::Result<()> {
         );
         return Ok(());
     }
-    if matches!(
-        command,
-        Command::ApplyApplianceUpdateSchedule | Command::CheckApplianceUpdateSchedule
-    ) {
-        if !tiaris_nest::appliance::is_managed_ubuntu() {
-            anyhow::bail!("Ubuntu Nest scheduling has been retired; use the NixOS update policy");
-        }
-        if effective_uid() != 0 {
-            anyhow::bail!("appliance update policy must run as root");
-        }
-        tiaris_nest::appliance::update_schedule::apply()?;
-        if matches!(command, Command::CheckApplianceUpdateSchedule) {
-            println!(
-                "{}",
-                tiaris_nest::appliance::update_schedule::readiness(chrono::Utc::now())?
-            );
-        }
-        return Ok(());
-    }
     if matches!(command, Command::VerifyApplianceUpdate) {
         #[cfg(unix)]
         if effective_uid() != 0 {
             anyhow::bail!("appliance package verification must run as root");
         }
-        let packages = tiaris_nest::appliance::verify_and_extract_stored_update()?;
-        println!("{}", packages.display());
-        return Ok(());
-    }
-    if matches!(command, Command::VerifyApplianceCandidateUpdate) {
-        #[cfg(unix)]
-        if effective_uid() != 0 {
-            anyhow::bail!("candidate appliance verification must run as root");
-        }
-        let packages = tiaris_nest::appliance::verify_and_extract_candidate_update()?;
+        let packages = tiaris_nest::appliance::nixos::verify_update()?;
         println!("{}", packages.display());
         return Ok(());
     }
@@ -159,14 +131,8 @@ async fn main() -> anyhow::Result<()> {
         Command::VerifyApplianceUpdatePolicy => {
             unreachable!("policy verification exits before config loading")
         }
-        Command::ApplyApplianceUpdateSchedule | Command::CheckApplianceUpdateSchedule => {
-            unreachable!("root command handled before opening state")
-        }
         Command::VerifyApplianceUpdate => {
             unreachable!("appliance update verification exits before config loading")
-        }
-        Command::VerifyApplianceCandidateUpdate => {
-            unreachable!("candidate appliance verification exits before config loading")
         }
         Command::VerifyApplianceNetworkChange => {
             unreachable!("appliance network verification exits before config loading")
@@ -211,9 +177,6 @@ fn managed_command_requires_service_user(
                 | Command::VerifyApplianceUpdatePolicy
                 | Command::VerifyApplianceDatabase { .. }
                 | Command::RehearseApplianceDatabase { .. }
-                | Command::ApplyApplianceUpdateSchedule
-                | Command::CheckApplianceUpdateSchedule
-                | Command::VerifyApplianceCandidateUpdate
                 | Command::VerifyApplianceNetworkChange
                 | Command::VerifyApplianceNetworkChangeRecovery
                 | Command::VerifyApplianceNetworkAcknowledgement

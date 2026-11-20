@@ -1,4 +1,4 @@
-//! Provisioned Ubuntu appliance bootstrap.
+//! Provisioned NixOS appliance bootstrap.
 //!
 //! The live ISO uses a media-derived key only until the approved state
 //! partition contains a random device key. Every later event is signed by
@@ -133,7 +133,6 @@ fn effective_origin_for(
 pub const DEFAULT_ENVELOPE_PATH: &str = "/cdrom/TIARIS_PROVISIONING.BIN";
 pub const DEFAULT_PROVISIONING_KEYS_PATH: &str = "/cdrom/tiaris/provisioning-public-keys";
 pub const DEFAULT_RELEASE_PUBLIC_KEY_PATH: &str = packages::RELEASE_PUBLIC_KEY_PATH;
-pub const DEFAULT_AUTOINSTALL_PATH: &str = "/autoinstall.yaml";
 pub const DEFAULT_STATE_MOUNT: &str = "/run/tiaris-state";
 pub const INSTALLED_PROVISIONING_KEYS_PATH: &str =
     "/usr/share/tiaris-nest/provisioning-public-keys";
@@ -143,7 +142,6 @@ pub struct PrepareOptions {
     pub envelope_path: PathBuf,
     pub provisioning_keys_path: PathBuf,
     pub release_public_key_path: PathBuf,
-    pub autoinstall_path: PathBuf,
     pub state_mount: PathBuf,
     pub required_manage_origin: String,
     /// Public kiosk projection; `None` disables it (tests and tooling).
@@ -159,19 +157,12 @@ impl Default for PrepareOptions {
             envelope_path: PathBuf::from(DEFAULT_ENVELOPE_PATH),
             provisioning_keys_path: PathBuf::from(DEFAULT_PROVISIONING_KEYS_PATH),
             release_public_key_path: PathBuf::from(DEFAULT_RELEASE_PUBLIC_KEY_PATH),
-            autoinstall_path: PathBuf::from(DEFAULT_AUTOINSTALL_PATH),
             state_mount: PathBuf::from(DEFAULT_STATE_MOUNT),
             required_manage_origin: REQUIRED_MANAGE_ORIGIN.to_string(),
             setup_status_path: Some(PathBuf::from(SETUP_STATUS_PATH)),
             setup_claim_dir: PathBuf::from(DEFAULT_SETUP_CLAIM_DIR),
         }
     }
-}
-
-#[derive(Clone, Debug)]
-pub struct FinalizeOptions {
-    pub target: PathBuf,
-    pub state_mount: PathBuf,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -410,7 +401,7 @@ pub(crate) fn read_bounded_nofollow(path: &Path, maximum: u64, label: &str) -> R
 }
 
 /// Claim the media, wait for approval, create state first, rotate identity,
-/// then replace Subiquity's autoinstall document.
+/// then install the signed NixOS closure.
 ///
 /// Progress is projected best-effort for the tty1 setup kiosk. The projection
 /// never changes this flow: a failed status write is logged and ignored.
@@ -426,19 +417,19 @@ pub async fn prepare(options: PrepareOptions) -> Result<()> {
 }
 
 async fn prepare_with_status(options: &PrepareOptions, status: &SetupStatusReporter) -> Result<()> {
-    let media_layout = packages::inspect_media_layout()?;
+    packages::require_nixos_media()?;
     let trusted_keys = protocol::load_trusted_provisioning_keys(&options.provisioning_keys_path)?;
     // An all-zero slot is the generic ISO: it obtains the same envelope by
     // registering and being claimed, then continues below.
     if setup_claim::slot_is_generic(&options.envelope_path)? {
-        return setup_claim::prepare_generic(options, status, media_layout, &trusted_keys).await;
+        return setup_claim::prepare_generic(options, status, &trusted_keys).await;
     }
     let verified = protocol::load_and_verify_envelope(
         &options.envelope_path,
         &trusted_keys,
         &options.required_manage_origin,
     )?;
-    prepare_verified(options, status, media_layout, verified, None).await
+    prepare_verified(options, status, verified, None).await
 }
 
 /// The setup flow for one verified envelope. `retain` is the envelope's exact
@@ -447,7 +438,6 @@ async fn prepare_with_status(options: &PrepareOptions, status: &SetupStatusRepor
 async fn prepare_verified(
     options: &PrepareOptions,
     status: &SetupStatusReporter,
-    media_layout: packages::MediaLayout,
     verified: protocol::VerifiedEnvelope,
     retain: Option<&[u8]>,
 ) -> Result<()> {
@@ -461,7 +451,7 @@ async fn prepare_verified(
             protocol::require_current_envelope(&verified)?;
         }
         status.media_verified(&verified.envelope.manage_origin);
-        return resume_prepare(options, &verified, probe, media_layout, status).await;
+        return resume_prepare(options, &verified, probe, status).await;
     }
     protocol::require_current_envelope(&verified)?;
     status.media_verified(&verified.envelope.manage_origin);
@@ -506,10 +496,9 @@ async fn prepare_verified(
         status.plan_approved(&plan, &inventory);
         plan
     };
-    let (package_delivery, fresh_inventory) = loop {
+    let fresh_inventory = loop {
         match prepare_approved_plan(
             &signed_plan,
-            media_layout,
             &options.release_public_key_path,
             &verified.envelope.manage_origin,
             status,
@@ -610,16 +599,7 @@ async fn prepare_verified(
     durable.next_event_sequence = 6;
     storage::save_durable_state(&prepared.state_mount, &durable)?;
     status.step(InstallStep::InstallSystem);
-    if package_delivery == packages::PackageDelivery::SystemClosure {
-        return nixos_install::install(&prepared, &options.release_public_key_path, status).await;
-    }
-    storage::write_autoinstall(
-        &options.autoinstall_path,
-        &prepared,
-        &signed_plan,
-        package_delivery,
-    )?;
-    Ok(())
+    nixos_install::install(&prepared, &options.release_public_key_path, status).await
 }
 
 struct PreDestructiveFailure {
@@ -644,14 +624,10 @@ impl PreDestructiveFailure {
 
 async fn prepare_approved_plan(
     plan: &SignedInstallPlan,
-    media_layout: packages::MediaLayout,
     release_public_key_path: &Path,
     manage_origin: &str,
     status: &SetupStatusReporter,
-) -> std::result::Result<
-    (packages::PackageDelivery, NestProvisioningInventory),
-    PreDestructiveFailure,
-> {
+) -> std::result::Result<NestProvisioningInventory, PreDestructiveFailure> {
     status.step(InstallStep::StageRelease);
     let fresh_inventory = inventory::collect_inventory().await.map_err(|error| {
         PreDestructiveFailure::new(
@@ -667,14 +643,13 @@ async fn prepare_approved_plan(
             error,
         )
     })?;
-    let package_delivery =
-        packages::validate_plan_delivery(plan, media_layout).map_err(|error| {
-            PreDestructiveFailure::new(
-                "installation_media_validation_failed",
-                "Nest could not validate this installation media against the approved plan.",
-                error,
-            )
-        })?;
+    packages::validate_plan_delivery(plan).map_err(|error| {
+        PreDestructiveFailure::new(
+            "installation_media_validation_failed",
+            "Nest could not validate this installation media against the approved plan.",
+            error,
+        )
+    })?;
     inventory::preflight_network(plan, &fresh_inventory, manage_origin)
         .await
         .map_err(|error| {
@@ -684,29 +659,15 @@ async fn prepare_approved_plan(
                 error,
             )
         })?;
-    if package_delivery == packages::PackageDelivery::SystemClosure {
-        nixos_install::stage_closure(plan, release_public_key_path, status)
-            .await
-            .map_err(|error| {
-                PreDestructiveFailure::new(
-                    "system_closure_verification_failed",
-                    "Nest could not download and verify its approved system closure.",
-                    error,
-                )
-            })?;
-    }
-    if package_delivery == packages::PackageDelivery::NetworkSnapshot {
-        packages::stage_network_snapshot(plan, release_public_key_path)
-            .await
-            .map_err(|error| {
-                PreDestructiveFailure::new(
-                    "package_snapshot_download_failed",
-                    "Nest could not download and verify its approved installation files.",
-                    error,
-                )
-            })?;
-        status.step(InstallStep::VerifyRelease);
-    }
+    nixos_install::stage_closure(plan, release_public_key_path, status)
+        .await
+        .map_err(|error| {
+            PreDestructiveFailure::new(
+                "system_closure_verification_failed",
+                "Nest could not download and verify its approved system closure.",
+                error,
+            )
+        })?;
     status.step(InstallStep::RecheckHardware);
     let fresh_inventory = inventory::collect_inventory().await.map_err(|error| {
         PreDestructiveFailure::new(
@@ -731,7 +692,7 @@ async fn prepare_approved_plan(
                 error,
             )
         })?;
-    Ok((package_delivery, fresh_inventory))
+    Ok(fresh_inventory)
 }
 
 async fn report_failure_and_wait_for_retry(
@@ -856,7 +817,6 @@ async fn resume_prepare(
     options: &PrepareOptions,
     verified: &protocol::VerifiedEnvelope,
     probe: storage::ExistingStateProbe,
-    media_layout: packages::MediaLayout,
     status: &SetupStatusReporter,
 ) -> Result<()> {
     let mut durable = probe.state.clone();
@@ -864,25 +824,15 @@ async fn resume_prepare(
     status.inventory_collected(&inventory);
     let signed_plan = recovery::durable_plan(&durable, verified, &inventory)?;
     status.resumed(&signed_plan, &inventory);
-    let package_delivery = packages::validate_plan_delivery(&signed_plan, media_layout)?;
+    packages::validate_plan_delivery(&signed_plan)?;
     if durable.installation_complete {
         storage::validate_completed_state_probe(&options.state_mount, &probe)?;
         status.rebooting();
-        if package_delivery != packages::PackageDelivery::SystemClosure {
-            return storage::boot_installed_appliance();
-        }
         return nixos_install::boot_completed(&durable, &options.state_mount, false).await;
     }
     inventory::preflight_network(&signed_plan, &inventory, &verified.envelope.manage_origin)
         .await?;
-    if package_delivery == packages::PackageDelivery::SystemClosure {
-        nixos_install::stage_closure(&signed_plan, &options.release_public_key_path, status)
-            .await?;
-    }
-    if package_delivery == packages::PackageDelivery::NetworkSnapshot {
-        packages::stage_network_snapshot(&signed_plan, &options.release_public_key_path).await?;
-        status.step(InstallStep::VerifyRelease);
-    }
+    nixos_install::stage_closure(&signed_plan, &options.release_public_key_path, status).await?;
     status.step(InstallStep::RecheckHardware);
     let inventory = inventory::collect_inventory().await?;
     inventory::revalidate_durable_plan_hardware(&signed_plan, &inventory)?;
@@ -949,15 +899,7 @@ async fn resume_prepare(
         storage::save_durable_state(&prepared.state_mount, &durable)?;
     }
     status.step(InstallStep::InstallSystem);
-    if package_delivery == packages::PackageDelivery::SystemClosure {
-        return nixos_install::install(&prepared, &options.release_public_key_path, status).await;
-    }
-    storage::write_autoinstall(
-        &options.autoinstall_path,
-        &prepared,
-        &signed_plan,
-        package_delivery,
-    )
+    nixos_install::install(&prepared, &options.release_public_key_path, status).await
 }
 
 /// Event 3: STATE exists. Its exact bytes are replayed, unchanged, to ask
@@ -1007,18 +949,6 @@ pub async fn report_install_stage(
         .await?;
     state.next_event_sequence += 1;
     storage::save_durable_state(state_mount, &state)
-}
-
-/// Materialize plan-bound config into the newly installed target.
-pub fn finalize_target(options: FinalizeOptions) -> Result<()> {
-    let mut state = storage::load_durable_state(&options.state_mount)?;
-    if !state.identity_active {
-        bail!("cannot finalize an appliance before identity activation")
-    }
-    state.installation_complete = true;
-    storage::materialize_target(&options.target, &options.state_mount, &state)
-        .context("materialize installed Nest appliance")?;
-    storage::save_durable_state(&options.state_mount, &state)
 }
 
 #[cfg(test)]

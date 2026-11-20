@@ -6616,59 +6616,38 @@ mod tests {
 
     #[test]
     fn appliance_update_transport_override_is_optional_wire_data() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../protocol/fixtures/nest-appliance-v3.json"))
+                .unwrap();
         let update = json!({
             "attempt_id": "d4a17ec8-e854-4bc4-84c7-e490f51640c3",
             "requested_at": "2026-08-12T12:00:00Z",
-            "release": {
-                "schema": "tiaris.nest.appliance-release.v1",
-                "release_id": "0.2.1-dev.13",
-                "ubuntu_snapshot_id": "20260813T120000Z",
-                "tiaris_repository_snapshot": {
-                    "url": "https://releases.example/tiaris-nest-appliance-packages-0.2.1-dev.13-x86_64-linux.tar.zst",
-                    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                    "size_bytes": 1024
-                },
-                "required_package_versions": {},
-                "expected_kernel": "7.0.0-1",
-                "minimum_protocol": 4,
-                "minimum_state_schema": 2,
-                "rollback_compatible": true,
-                "release_notes": "https://releases.example/notes",
-                "signature": "signature"
-            }
+            "release": fixture["appliance_release"].clone(),
         });
 
-        let legacy: AgentNestConfigResponse =
+        let ordinary: AgentNestConfigResponse =
             serde_json::from_value(json!({"appliance_update": update.clone()})).unwrap();
         assert_eq!(
-            legacy
+            ordinary
                 .appliance_update
                 .unwrap()
                 .qualification_package_transport_url,
             None
         );
 
+        let transport = "http://127.0.0.1:18080/closure.tar.zst";
         let mut qualified = update;
-        qualified["qualification_package_transport_url"] = json!(
-            "http://127.0.0.1:18080/tiaris-nest-appliance-packages-0.2.1-dev.13-x86_64-linux.tar.zst"
-        );
+        qualified["qualification_package_transport_url"] = json!(transport);
         let current: AgentNestConfigResponse =
             serde_json::from_value(json!({"appliance_update": qualified})).unwrap();
         let current = current.appliance_update.unwrap();
         assert_eq!(
             current.qualification_package_transport_url.as_deref(),
-            Some(
-                "http://127.0.0.1:18080/tiaris-nest-appliance-packages-0.2.1-dev.13-x86_64-linux.tar.zst"
-            )
+            Some(transport)
         );
         assert_eq!(
-            current
-                .release
-                .legacy()
-                .unwrap()
-                .tiaris_repository_snapshot
-                .url,
-            "https://releases.example/tiaris-nest-appliance-packages-0.2.1-dev.13-x86_64-linux.tar.zst"
+            current.release.nixos().unwrap().release_id,
+            fixture["appliance_release"]["release_id"].as_str().unwrap()
         );
     }
 

@@ -2,10 +2,9 @@ use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tiaris_nest::provisioning::{
-    FinalizeOptions, LEGACY_MANAGE_ORIGIN, MAX_ENVELOPE_VALIDITY_HOURS, NetworkRuntimeOptions,
-    PrepareOptions, REQUIRED_MANAGE_ORIGIN, SETUP_CLAIM_PROTOCOL, SETUP_STATUS_PATH,
-    commit_network_change, effective_manage_origin, finalize_target, prepare,
-    reconcile_network_runtime, report_install_stage, validate_installed_state,
+    LEGACY_MANAGE_ORIGIN, MAX_ENVELOPE_VALIDITY_HOURS, NetworkRuntimeOptions, PrepareOptions,
+    REQUIRED_MANAGE_ORIGIN, SETUP_CLAIM_PROTOCOL, SETUP_STATUS_PATH, commit_network_change,
+    effective_manage_origin, prepare, reconcile_network_runtime, validate_installed_state,
     validate_legacy_state_promotion, verify_committed_network_change,
 };
 
@@ -43,33 +42,11 @@ enum Command {
         provisioning_keys: PathBuf,
         #[arg(long, default_value = "/cdrom/tiaris/release-public-key")]
         release_public_key: PathBuf,
-        #[arg(long, default_value = "/autoinstall.yaml")]
-        autoinstall: PathBuf,
         #[arg(long, default_value = "/run/tiaris-state")]
         state_mount: PathBuf,
         /// Public progress projection read by the tty1 setup kiosk.
         #[arg(long, default_value = SETUP_STATUS_PATH)]
         setup_status: PathBuf,
-    },
-    /// Report a late Subiquity stage using the installed device identity.
-    Event {
-        #[arg(long, default_value = "/run/tiaris-state")]
-        state_mount: PathBuf,
-        #[arg(long)]
-        stage: String,
-        #[arg(long)]
-        status: String,
-        #[arg(long)]
-        progress_percent: Option<i32>,
-        #[arg(long, default_value = "")]
-        message: String,
-    },
-    /// Write plan-bound identity, networking, and SSH trust into /target.
-    FinalizeTarget {
-        #[arg(long, default_value = "/target")]
-        target: PathBuf,
-        #[arg(long, default_value = "/run/tiaris-state")]
-        state_mount: PathBuf,
     },
     /// Reconcile the appliance's advertised boot URL with its active wired IPv4 address.
     ReconcileNetworkRuntime {
@@ -151,7 +128,6 @@ async fn main() -> Result<()> {
             envelope,
             provisioning_keys,
             release_public_key,
-            autoinstall,
             state_mount,
             setup_status,
         } => {
@@ -160,29 +136,11 @@ async fn main() -> Result<()> {
                 envelope_path: envelope,
                 provisioning_keys_path: provisioning_keys,
                 release_public_key_path: release_public_key,
-                autoinstall_path: autoinstall,
                 state_mount,
                 setup_status_path: Some(setup_status),
                 ..PrepareOptions::default()
             };
             prepare(options).await
-        }
-        Command::Event {
-            state_mount,
-            stage,
-            status,
-            progress_percent,
-            message,
-        } => report_install_stage(&state_mount, &stage, &status, progress_percent, &message).await,
-        Command::FinalizeTarget {
-            target,
-            state_mount,
-        } => {
-            require_root()?;
-            finalize_target(FinalizeOptions {
-                target,
-                state_mount,
-            })
         }
         Command::ReconcileNetworkRuntime {
             config,
