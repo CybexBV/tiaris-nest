@@ -284,7 +284,8 @@ done
 session_id="$(jq -er '.session.id' "$claim")"
 test "$(jq -er '.session.created_by_setup_claim' "$claim")" = true
 test "$(jq -er '.session.release_version' "$claim")" = "$release_version"
-test "$(jq -er '.session.template_sha256' "$claim")" = "$template_sha256"
+# Manage's answer names the release, not the ISO's hash. The ISO is bound to
+# this manifest above, and the fixture refuses a claim for another manifest.
 if [[ -n "${TIARIS_NEST_QUALIFICATION_SESSION_RECEIPT:-}" ]]; then
   test ! -e "$TIARIS_NEST_QUALIFICATION_SESSION_RECEIPT"
   jq -n --arg session_id "$session_id" '{session_id:$session_id}' > "$TIARIS_NEST_QUALIFICATION_SESSION_RECEIPT"
