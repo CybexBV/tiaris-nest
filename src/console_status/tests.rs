@@ -158,12 +158,28 @@ fn first_boot_and_enrollment_are_starting_stages() {
     // Without a Tiaris report this boot, health waiting is enrollment and
     // never escalates to not_ready: the unreachable rule bounds it instead.
     current.health_ready = false;
-    for second in (10..500).step_by(15) {
+    for second in (10..120).step_by(15) {
         current.now = at(second);
         let status = tracker.evaluate(&current);
         assert_eq!(status.stage, Some(Stage::Enrolling));
         assert_eq!(status.state, ConsoleState::Starting);
     }
+}
+
+#[test]
+fn a_nest_that_started_without_tiaris_says_so_after_two_minutes() {
+    // A restart during an internet fault: the services run, so the screen
+    // names what it waits for instead of showing "Starting" for ten minutes.
+    let mut tracker = ReadinessTracker::default();
+    let mut current = observation(121);
+    current.contacted_this_boot = false;
+    current.health_ready = false;
+    let status = tracker.evaluate(&current);
+    assert_eq!(status.state, ConsoleState::Attention);
+    assert_eq!(
+        status.attention.unwrap().code,
+        AttentionCode::TiarisUnreachable
+    );
 }
 
 #[test]
@@ -242,7 +258,7 @@ fn a_long_power_off_is_not_unreachable_at_boot() {
     let status = tracker.evaluate(&current);
     assert_eq!(status.state, ConsoleState::Starting);
     assert_eq!(status.stage, Some(Stage::Enrolling));
-    current.now = at(11 * 60);
+    current.now = at(3 * 60);
     let status = tracker.evaluate(&current);
     assert_eq!(status.state, ConsoleState::Attention);
     let attention = status.attention.unwrap();

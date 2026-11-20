@@ -101,16 +101,17 @@ shutil.copyfile(*paths)
                           'provisioning-state.json'])
         self.assertEqual(json.loads((result.netplan / '90-tiaris-nest.yaml').read_text()), fixture_plan(True))
 
-    def test_dhcp_failure_remains_bounded_and_fails_closed(self):
+    def test_dhcp_without_tiaris_keeps_the_approved_profile_and_lets_the_nest_start(self):
+        # A restart during an internet fault: the wait is bounded and the unit
+        # succeeds, so the Nest service starts and reports the silence itself.
         result = self.guard(dhcp4=True, approved_failures=-1,
                             replacements={'management_reachable 30': 'management_reachable 3'})
-        self.assertEqual(result.process.returncode, 1, result.process.stderr)
-        self.assertIn('DHCP could not reach Tiarisment', result.process.stderr)
+        self.assertEqual(result.process.returncode, 0, result.process.stderr)
         self.assertGreaterEqual(result.log.count('curl 1'), 2)
-        self.assertNotIn('curl 2', result.log)
+        self.assertEqual(result.log.count('activated'), 1)
         self.assertLess(result.elapsed, 10)
-        self.assertTrue((result.control / 'network-fallback-active').exists())
-        self.assertFalse(any(p.name.startswith('.network-fallback-active.') for p in result.control.iterdir()))
+        self.assertEqual(json.loads((result.netplan / '90-tiaris-nest.yaml').read_text()), fixture_plan(True))
+        self.assertFalse((result.control / 'network-fallback-active').exists())
 
     def test_static_fallback_also_retries_after_its_link_reset(self):
         result = self.guard(dhcp4=False, approved_failures=-1, fallback_failures=1,
@@ -124,18 +125,19 @@ shutil.copyfile(*paths)
         self.assertFalse((result.control / 'netplan-pending.sha256').exists())
         self.assertFalse((result.control / 'netplan-before-change.yaml').exists())
 
-    def test_failed_static_and_dhcp_profiles_preserve_recovery_evidence(self):
+    def test_a_fixed_address_without_tiaris_on_either_profile_goes_back_to_the_approved_profile(self):
+        # The internet is down, not the address: no DHCP fallback is left
+        # behind, and the Nest starts on the address its computers know.
         result = self.guard(dhcp4=False, approved_failures=-1, fallback_failures=-1,
                             replacements={'management_reachable 30': 'management_reachable 2',
                                           'management_reachable 60': 'management_reachable 2'})
-        self.assertNotEqual(result.process.returncode, 0)
-        self.assertEqual(result.log.count('activated'), 2)
+        self.assertEqual(result.process.returncode, 0, result.process.stderr)
+        self.assertEqual(result.log.count('activated'), 3)
         self.assertIn('curl 1', result.log)
         self.assertIn('curl 2', result.log)
         self.assertLess(result.elapsed, 10)
-        self.assertEqual(json.loads((result.netplan / '90-tiaris-nest.yaml').read_text()), fixture_plan(True))
-        marker = json.loads((result.control / 'network-fallback-active').read_text())
-        self.assertEqual(marker['schema'], 'tiaris.nest.network-fallback.v1')
+        self.assertEqual(json.loads((result.netplan / '90-tiaris-nest.yaml').read_text()), fixture_plan(False))
+        self.assertFalse((result.control / 'network-fallback-active').exists())
         for name in ('netplan-pending.sha256', 'netplan-before-change.yaml'):
             self.assertEqual((result.control / name).read_text(), 'stale recovery evidence')
 
@@ -198,7 +200,8 @@ class RecoverySshUnitGraph(unittest.TestCase):
         self.assertEqual(set(checks), {
             'retryStartsRecoverySsh', 'sshFailureDoesNotFailFirstBoot', 'firstBootDoesNotWaitForSsh',
             'sshRequiresMaterializedTrust', 'sshRequiresFirewall', 'firewallFollowsFirstBoot',
-            'nestRetriesFirstBoot', 'networkRuntimeCanRetryWithoutNest', 'networkRetryTimerRemainsEnabled'})
+            'nestRetriesFirstBoot', 'networkRuntimeCanRetryWithoutNest', 'networkRetryTimerRemainsEnabled',
+            'startUpChecksDoNotWaitForTheNetwork', 'nothingRequiresTheNetworkGuard'})
         self.assertTrue(all(value is True for value in checks.values()), checks)
 
     def test_sshd_keeps_requiring_materialized_trust_and_firewall(self):
@@ -216,6 +219,18 @@ class RecoverySshUnitGraph(unittest.TestCase):
         self.assertIn('sshd.service', unit_list(first_boot, 'wants'))
         self.assertNotIn('sshd.service', unit_list(first_boot, 'requires'))
         self.assertNotIn('sshd.service', unit_list(first_boot, 'after'))
+
+    def test_services_start_without_tiaris(self):
+        # B25: nginx, the boot file server, SSH and the Nest service require
+        # the start-up checks, which therefore never wait for the network; the
+        # one unit that asks Tiaris is required by nothing.
+        first_boot = unit_block(self.module, 'tiaris-nest-first-boot')
+        self.assertNotIn('network-online.target', unit_list(first_boot, 'after') + unit_list(first_boot, 'wants'))
+        script = (ROOT / 'runtime/tiaris-nest-first-boot').read_text()
+        self.assertNotRegex(script, r'run\([^)]*(network-guard|reconcile-network-runtime)')
+        self.assertNotRegex(self.module, r'requires = \[[^\]]*tiaris-nest-network-guard')
+        guard = unit_block(self.module, 'tiaris-nest-network-guard')
+        self.assertIn('tiaris-nest.service', unit_list(guard, 'before'))
 
 
 if __name__ == '__main__':
