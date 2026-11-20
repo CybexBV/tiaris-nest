@@ -7,6 +7,11 @@ the Nest already holds from its own disk instead of the internet. Only this
 root unit writes the nix.conf include, and only one validated
 `extra-trusted-public-keys` line: the service user can change which key is
 trusted, never any other Nix option.
+
+The same include names the Tiaris software cache as a substituter, and only
+while Manage sends this Nest access to it (the daemon then keeps
+software-cache.netrc). Where the cache is off, Nix never asks that host. The
+line is fixed: the service user decides whether it is there, not what it says.
 """
 import base64
 import os
@@ -26,6 +31,10 @@ PUBLIC_KEYS = (
 )
 INCLUDE = Path('/etc/tiaris-nest/nix-self-cache.conf')
 KEY = re.compile(r'tiaris-nest-cache:[A-Za-z0-9+/]{43}=')
+# What src/software_cache.rs writes for the one cache whose key module.nix trusts.
+SOFTWARE_CACHE_NETRC = Path('/var/lib/tiaris-nest/state/agent/software-cache.netrc')
+SOFTWARE_CACHE_ACCESS = re.compile(r'machine cache\.tiaris\.com login nest password [A-Za-z0-9._-]{1,512}\n')
+SOFTWARE_CACHE_LINE = 'extra-substituters = https://cache.tiaris.com\n'
 
 
 def public_key(paths=PUBLIC_KEYS, owner=UID):
@@ -42,18 +51,27 @@ def public_key(paths=PUBLIC_KEYS, owner=UID):
     return None
 
 
-def render(key):
-    return '' if key is None else 'extra-trusted-public-keys = ' + key + '\n'
+def software_cache_on(netrc=SOFTWARE_CACHE_NETRC, owner=UID):
+    """Whether Manage gave this Nest access to the Tiaris software cache."""
+    try:
+        return SOFTWARE_CACHE_ACCESS.fullmatch(read(netrc, maximum=1024, owner=owner).decode('ascii')) is not None
+    except (OSError, ValueError, UnicodeDecodeError):
+        return False
 
 
-def apply(include=INCLUDE, paths=PUBLIC_KEYS, owner=UID, restart=None):
+def render(key, software_cache=False):
+    return ('' if key is None else 'extra-trusted-public-keys = ' + key + '\n') + (SOFTWARE_CACHE_LINE if software_cache else '')
+
+
+def apply(include=INCLUDE, paths=PUBLIC_KEYS, owner=UID, restart=None, netrc=SOFTWARE_CACHE_NETRC):
     """Write the include; restart the Nix daemon when it changed. Any invalid
     key leaves no trust at all: the self-substituter is then simply unused."""
+    software_cache = software_cache_on(netrc, owner)
     try:
-        content = render(public_key(paths, owner))
+        content = render(public_key(paths, owner), software_cache)
         valid = True
     except (OSError, ValueError, UnicodeDecodeError):
-        content, valid = '', False
+        content, valid = render(None, software_cache), False
     try:
         info = os.lstat(include)
         current = include.read_text() if stat.S_ISREG(info.st_mode) else None

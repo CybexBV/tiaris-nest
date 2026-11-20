@@ -244,9 +244,10 @@ def run(api, state, nest, manifest, catalog, output):
     blueprints = {v['slug']: v for v in catalog['blueprints']}
     first = blueprints['standard_workstation']
     boot_base = f'/v1/boot/servers/{nest.device}'
-    profiles = api(boot_base + '/profiles?limit=100&offset=0')
-    enabled = [v for v in profiles['profiles'] if v['enabled'] and v['profile_type'] == 'nest_installer']
-    if profiles['total'] > 100 or len(enabled) != 1:
+    # The Nest's own page lists its boot profiles; no route of their own is needed.
+    profiles = api(f'/v1/nest/nodes/{nest.device}')['profiles']
+    enabled = [v for v in profiles if v['enabled'] and v['profile_type'] == 'nest_installer']
+    if len(enabled) != 1:
         raise ValueError('New private Nest must have exactly one enabled installer profile')
     started = now()
     checks = []

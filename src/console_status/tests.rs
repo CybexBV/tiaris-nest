@@ -167,6 +167,42 @@ fn first_boot_and_enrollment_are_starting_stages() {
 }
 
 #[test]
+fn only_the_start_that_finishes_setup_is_a_first_setup() {
+    // First setup: no report to Tiaris exists yet, then this start's own.
+    let mut tracker = ReadinessTracker::default();
+    let mut current = observation(10);
+    current.last_contact = None;
+    current.contacted_this_boot = false;
+    assert!(tracker.evaluate(&current).first_setup);
+    let mut current = observation(30);
+    current.health_ready = false;
+    let status = tracker.evaluate(&current);
+    assert_eq!(status.stage, Some(Stage::Services));
+    assert!(status.first_setup);
+
+    // A restart: the receipt of an earlier start is there, and the restart
+    // stays one after this start's own report replaced that receipt.
+    let mut tracker = ReadinessTracker::default();
+    let mut current = observation(10);
+    current.last_contact = Some(at(-600));
+    current.contacted_this_boot = false;
+    let status = tracker.evaluate(&current);
+    assert_eq!(status.state, ConsoleState::Starting);
+    assert!(!status.first_setup);
+    let mut current = observation(30);
+    current.health_ready = false;
+    let status = tracker.evaluate(&current);
+    assert_eq!(status.stage, Some(Stage::Services));
+    assert!(!status.first_setup);
+    assert!(
+        serde_json::to_value(&status)
+            .unwrap()
+            .get("first_setup")
+            .is_none()
+    );
+}
+
+#[test]
 fn a_nest_that_started_without_tiaris_says_so_after_two_minutes() {
     // A restart during an internet fault: the services run, so the screen
     // names what it waits for instead of showing "Starting" for ten minutes.

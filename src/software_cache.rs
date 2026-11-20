@@ -1,11 +1,12 @@
 //! Access to the Tiaris software cache (`https://cache.tiaris.com`).
 //!
-//! The NixOS appliance lists the cache as a substituter after cache.nixos.org,
-//! trusts its signing key and points Nix's `netrc-file` at
-//! `<data_dir>/software-cache.netrc`. Manage sends each Nest a short-lived
-//! token in its configuration; this module keeps the netrc file in step. Without
-//! a token Nix gets 401 from the cache, treats every path as absent there and
-//! the Nest prepares the software itself, as before.
+//! The NixOS appliance trusts the cache's signing key and points Nix's
+//! `netrc-file` at `<data_dir>/software-cache.netrc`. Manage sends each Nest a
+//! short-lived token in its configuration; this module keeps the netrc file in
+//! step. While that file holds access, the root unit
+//! `tiaris-nest-self-cache-trust` lists the cache as a substituter after
+//! cache.nixos.org (`nixos-appliance/runtime/self_cache_trust.py`). Without
+//! access Nix never asks the cache and the Nest prepares the software itself.
 
 use std::fs;
 use std::io::Write;
