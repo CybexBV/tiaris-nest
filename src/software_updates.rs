@@ -80,6 +80,10 @@ const MAX_SYSTEM_IDENTITY_BYTES: u64 = 64 * 1024;
 const DAILY_WINDOW_START_MINUTE: u32 = 60;
 const DAILY_WINDOW_MINUTES: u32 = 240;
 const ON_DEMAND_MIN_INTERVAL: chrono::Duration = chrono::Duration::minutes(10);
+/// The check right after an update of this Nest is tried this often, this
+/// far apart, before it is left to the daily check.
+const STARTUP_CHECK_ATTEMPTS: u32 = 5;
+const STARTUP_CHECK_RETRY: Duration = Duration::from_secs(120);
 const CHANNEL_TIMEOUT: Duration = Duration::from_secs(30);
 const EVALUATION_TIMEOUT: Duration = Duration::from_secs(900);
 const EVALUATION_STDOUT_MAX_BYTES: usize = 1024 * 1024;
@@ -493,8 +497,15 @@ async fn run(state: AppState) {
     // forgotten and the channel is looked at again now rather than at the
     // daily check: the update may be what it waited for.
     if forget_verdicts_of_other_builds(&state.config.paths.data_dir).await {
-        if let Err(error) = check(&state).await {
-            warn!(error = %error, "software update check after an update of this Nest failed");
+        // The network may come up after the Nest: try for some minutes.
+        for attempt in 1..=STARTUP_CHECK_ATTEMPTS {
+            match check(&state).await {
+                Ok(()) => break,
+                Err(error) => {
+                    warn!(attempt, error = %error, "software update check after an update of this Nest failed");
+                    sleep(STARTUP_CHECK_RETRY).await;
+                }
+            }
         }
     }
     loop {
