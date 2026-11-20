@@ -2,20 +2,21 @@ use std::os::unix::fs::PermissionsExt;
 
 use chrono::Timelike;
 use serde_json::json;
-use sha2::{Digest, Sha256};
 
 use super::*;
-use crate::build::{COMMIT_IDENTITIES, REVIEWED_BUILDER_FILES, store_path_item};
 
 const COMMIT: &str = "6f06d204d8f2d8761d9da78778745974a3216381";
 const NAR_HASH: &str = "sha256-loLMnbbS4KhmG2ln9EY6f0YMNCA273Yx02oWYQ9IMeE=";
-const AGENT_DRV: &str = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-tiaris-agent-0.1.0.drv";
-const WRAPPER_DRV: &str = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-tiaris-packages.drv";
-const FIREFOX_DRV: &str = "/nix/store/cccccccccccccccccccccccccccccccc-firefox-unwrapped-145.0.drv";
-const UNITS_DRV: &str = "/nix/store/dddddddddddddddddddddddddddddddd-system-units.drv";
-const VENDOR_DRV: &str = "/nix/store/ffffffffffffffffffffffffffffffff-cargo-vendor-dir.drv";
-const STAGING_DRV: &str =
-    "/nix/store/gggggggggggggggggggggggggggggggg-tiaris-agent-vendor-staging.drv";
+// What the release pin builds on a Nest, and the same at the commit.
+const PIN_AGENT_DRV: &str = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-tiaris-agent-0.1.0.drv";
+const PIN_INITRD_DRV: &str = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-initrd-linux-6.18.40.drv";
+const AGENT_DRV: &str = "/nix/store/cccccccccccccccccccccccccccccccc-tiaris-agent-0.1.0.drv";
+const INITRD_DRV: &str = "/nix/store/dddddddddddddddddddddddddddddddd-initrd-linux-6.18.59.drv";
+// New at the commit: a generated unit, a download and a real compile.
+const UNITS_DRV: &str = "/nix/store/ffffffffffffffffffffffffffffffff-unit-new.service.drv";
+const FETCH_DRV: &str =
+    "/nix/store/gggggggggggggggggggggggggggggggg-firefox-145.0.source.tar.xz.drv";
+const FIREFOX_DRV: &str = "/nix/store/hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh-firefox-unwrapped-145.0.drv";
 
 async fn pool() -> SqlitePool {
     let pool = crate::db::connect_with_url("sqlite::memory:")
@@ -66,70 +67,8 @@ fn tamper(data: &Path, commit: &str, change: impl FnOnce(&mut Value)) {
     .unwrap();
 }
 
-/// Identities of a commit at which every reviewed provider has a new hash.
-fn shifted_identities() -> BTreeMap<String, DerivedIdentity> {
-    const NIX_BASE32: &[u8] = b"0123456789abcdfghijklmnpqrsvwxyz";
-    let shift = |path: &str| {
-        let item = store_path_item(path).unwrap();
-        let hash = Sha256::digest(item.as_bytes())
-            .iter()
-            .take(32)
-            .map(|byte| NIX_BASE32[usize::from(*byte) % 32] as char)
-            .collect::<String>();
-        path.replacen(&item[..32], &hash, 1)
-    };
-    COMMIT_IDENTITIES
-        .iter()
-        .map(|identity| {
-            (
-                identity.role.to_string(),
-                DerivedIdentity {
-                    path: shift(identity.path),
-                    drv: identity.drv_path.map(shift),
-                },
-            )
-        })
-        .collect()
-}
-
-fn evaluated_identities(release: &str, files: &[(&str, &str)]) -> Value {
-    let mut reviewed = REVIEWED_BUILDER_FILES
-        .iter()
-        .map(|(name, sha256)| (name.to_string(), sha256.to_string()))
-        .collect::<BTreeMap<_, _>>();
-    for (name, sha256) in files {
-        reviewed.insert(name.to_string(), sha256.to_string());
-    }
-    json!({
-        "release": release,
-        "kernel_version": "6.18.59",
-        "files": reviewed,
-        "identities": shifted_identities(),
-    })
-}
-
-fn compile(path: &str) -> Value {
-    json!({
-        "name": derivation_display_name(path),
-        "builder": "/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p9/bin/bash",
-        "env": {"buildPhase": "make"},
-        "inputSrcs": [],
-        "inputDrvs": {},
-    })
-}
-
-/// A NixOS generator script run by the commit's own stdenv shell whose
-/// content no reviewed fingerprint matches.
-fn changed_script() -> Value {
-    let identities = shifted_identities();
-    let bash = &identities["stdenv.shell"];
-    json!({
-        "name": "system-units",
-        "builder": bash.path,
-        "env": {"preferLocalBuild": "1", "buildCommand": "mkdir -p $out\necho changed\n"},
-        "inputSrcs": [],
-        "inputDrvs": {bash.drv.clone().unwrap(): ["out"]},
-    })
+fn evaluated_release(release: &str) -> Value {
+    json!({ "release": release, "kernel_version": "6.18.59" })
 }
 
 struct FakeNix {
@@ -138,95 +77,50 @@ struct FakeNix {
 }
 
 /// A `nix` that answers the check's evaluation, dry runs and derivation
-/// queries from files, so every outcome is reached without real Nix.
-fn fake_nix(name: &str, identities: Option<Value>, blueprint_listing: &[&str]) -> FakeNix {
-    fake_nix_with(
-        name,
-        identities,
-        blueprint_listing,
-        &[AGENT_DRV, WRAPPER_DRV],
-        &[],
-    )
-}
-
-/// `tiaris_listing` is what the Tiaris packages' dry run lists and
-/// `agent_inputs` the agent's local inputs. Pin runs list nothing: the
-/// reference jobs were fully admitted there.
-fn fake_nix_with(
-    name: &str,
-    identities: Option<Value>,
-    blueprint_listing: &[&str],
-    tiaris_listing: &[&str],
-    agent_inputs: &[&str],
-) -> FakeNix {
-    fake_nix_full(
-        name,
-        identities,
-        blueprint_listing,
-        tiaris_listing,
-        agent_inputs,
-        json!({}),
-    )
-}
-
-fn fake_nix_full(
-    name: &str,
-    identities: Option<Value>,
-    blueprint_listing: &[&str],
-    tiaris_listing: &[&str],
-    agent_inputs: &[&str],
-    extra_derivations: Value,
-) -> FakeNix {
+/// queries from files, so every outcome is reached without real Nix. Every
+/// reference lists `PIN_AGENT_DRV` and `PIN_INITRD_DRV` at the release pin
+/// and `commit_listing` at the commit.
+fn fake_nix(name: &str, release: Option<Value>, commit_listing: &[&str]) -> FakeNix {
     let root = std::env::temp_dir().join(format!(
         "tiaris-nest-software-updates-{name}-{}",
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
-    if let Some(identities) = identities {
-        std::fs::write(root.join("identities.json"), identities.to_string()).unwrap();
+    if let Some(release) = release {
+        std::fs::write(root.join("release.json"), release.to_string()).unwrap();
     }
     let listing = |paths: &[&str]| {
-        if paths.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "these {} derivations will be built:\n{}\n",
-                paths.len(),
-                paths
-                    .iter()
-                    .map(|path| format!("  {path}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            )
-        }
+        format!(
+            "these {} derivations will be built:\n{}\n",
+            paths.len(),
+            paths
+                .iter()
+                .map(|path| format!("  {path}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
     };
-    std::fs::write(root.join("tiaris-listing"), listing(tiaris_listing)).unwrap();
+    std::fs::write(
+        root.join("pin-listing"),
+        listing(&[PIN_AGENT_DRV, PIN_INITRD_DRV]),
+    )
+    .unwrap();
+    std::fs::write(root.join("commit-listing"), listing(commit_listing)).unwrap();
     std::fs::write(root.join("references.json"), r#"["standard"]"#).unwrap();
-    std::fs::write(root.join("blueprint-listing"), listing(blueprint_listing)).unwrap();
-    let mut agent = compile(AGENT_DRV);
-    agent["inputDrvs"] = agent_inputs
-        .iter()
-        .map(|path| (path.to_string(), json!(["out"])))
-        .collect::<serde_json::Map<_, _>>()
-        .into();
-    let mut list = compile(WRAPPER_DRV);
-    list["inputDrvs"] = json!({ AGENT_DRV: ["out"] });
-    // A fixed-output fetch whose builder is not `builtin:fetchurl`.
-    let mut staging = compile(STAGING_DRV);
-    staging["outputs"] = json!({"out": {"path": "/nix/store/hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh-staging",
-        "method": "nar", "hashAlgo": "sha256", "hash": "0".repeat(64)}});
-    let mut derivations = json!({
-        AGENT_DRV: agent,
-        WRAPPER_DRV: list,
-        STAGING_DRV: staging,
-        VENDOR_DRV: compile(VENDOR_DRV),
-        FIREFOX_DRV: compile(FIREFOX_DRV),
-        UNITS_DRV: changed_script(),
+    let compile = json!({"outputs": {"out": {"path": "out"}}, "env": {"buildPhase": "make"}});
+    let derivations = json!({
+        PIN_AGENT_DRV: compile.clone(),
+        PIN_INITRD_DRV: compile.clone(),
+        AGENT_DRV: compile.clone(),
+        INITRD_DRV: compile.clone(),
+        FIREFOX_DRV: compile,
+        // A generated unit whose script the release pin never saw.
+        UNITS_DRV: {"outputs": {"out": {"path": "out"}},
+            "env": {"preferLocalBuild": "1", "buildCommand": "mkdir -p $out\necho changed\n"}},
+        FETCH_DRV: {"outputs": {"out": {"path": "out", "method": "flat",
+            "hashAlgo": "sha256", "hash": "0".repeat(64)}}, "env": {}},
     });
-    for (path, drv) in extra_derivations.as_object().unwrap() {
-        derivations[path] = drv.clone();
-    }
     std::fs::write(root.join("derivations.json"), derivations.to_string()).unwrap();
     let script = format!(
         r#"#!/bin/sh
@@ -237,7 +131,7 @@ for argument in "$@"; do
   case "$argument" in
     local\?root=*)
       store="${{argument#local?root=}}"
-      ls -d "$(dirname "$store")"/source-policy-store-* | wc -l >> "$root/stores"
+      ls -d "$(dirname "$store")"/dry-run-store-* | wc -l >> "$root/stores"
       ;;
   esac
 done
@@ -246,22 +140,19 @@ case " $* " in
     cat "$root/references.json"
     ;;
   *" eval "*)
-    [ -f "$root/identities.json" ] || exit 3
-    cat "$root/identities.json"
+    [ -f "$root/release.json" ] || exit 3
+    cat "$root/release.json"
     ;;
   *" derivation show "*)
     cat "$root/derivations.json"
     ;;
-  *" build "*"tiaris-packages"*)
-    cat "$root/tiaris-listing" >&2
-    ;;
-  *" build "*pin-*)
+  *" build "*/pin-flake#*)
     [ -f "$root/fail-dry-run" ] && exit 4
-    :
+    cat "$root/pin-listing" >&2
     ;;
   *" build "*)
     [ -f "$root/fail-dry-run" ] && exit 4
-    cat "$root/blueprint-listing" >&2
+    cat "$root/commit-listing" >&2
     ;;
   *) exit 5 ;;
 esac
@@ -306,12 +197,12 @@ async fn evaluate_with(fake: &FakeNix, keep_root: bool) -> Result<DetectedOutcom
                     entry
                         .file_name()
                         .to_string_lossy()
-                        .starts_with("source-policy-store-")
+                        .starts_with("dry-run-store-")
                 })
                 .count()
         })
         .unwrap_or(0);
-    assert_eq!(leftovers, 0, "isolated stores must be removed");
+    assert_eq!(leftovers, 0, "private stores must be removed");
     if !keep_root {
         let _ = std::fs::remove_dir_all(&fake.root);
     }
@@ -319,144 +210,30 @@ async fn evaluate_with(fake: &FakeNix, keep_root: bool) -> Result<DetectedOutcom
 }
 
 #[tokio::test]
-async fn a_commit_whose_builtin_blueprints_need_only_tiaris_packages_is_ready() {
+async fn a_commit_that_builds_only_what_the_release_pin_builds_is_ready() {
+    // The Tiaris packages and the initrd are built on a Nest at the release
+    // pin too. A new generated unit (a build script the pin never saw) and a
+    // download are not a compile: they do not hold the commit back.
     let fake = fake_nix(
         "ready",
-        Some(evaluated_identities("26.05", &[])),
-        &[AGENT_DRV],
+        Some(evaluated_release("26.05")),
+        &[AGENT_DRV, INITRD_DRV, UNITS_DRV, FETCH_DRV],
     );
     let outcome = evaluate(&fake).await.unwrap();
-    assert_eq!(outcome.state(), "ready");
-    assert_eq!(outcome.kernel_version, "6.18.59");
-    assert_eq!(
-        outcome.tiaris_derivations,
-        BTreeSet::from([AGENT_DRV.to_string()])
-    );
-    assert_eq!(outcome.identities, Some(shifted_identities()));
+    assert_eq!(outcome, DetectedOutcome::ready("6.18.59".to_string()));
 }
 
 #[tokio::test]
-async fn a_compile_beyond_the_tiaris_packages_blocks_with_source_build_required() {
+async fn a_compile_the_release_pin_does_not_do_blocks_with_its_name() {
     let fake = fake_nix(
         "source",
-        Some(evaluated_identities("26.05", &[])),
-        &[AGENT_DRV, FIREFOX_DRV],
-    );
-    let outcome = evaluate(&fake).await.unwrap();
-    assert_eq!(outcome.reason, Some(REASON_SOURCE_BUILD_REQUIRED));
-    assert_eq!(outcome.details, vec!["firefox-unwrapped-145.0"]);
-    assert_eq!(outcome.identities, None);
-}
-
-#[tokio::test]
-async fn a_changed_generator_script_blocks_with_its_name() {
-    let fake = fake_nix(
-        "script",
-        Some(evaluated_identities("26.05", &[])),
+        Some(evaluated_release("26.05")),
         &[AGENT_DRV, UNITS_DRV, FIREFOX_DRV],
     );
     let outcome = evaluate(&fake).await.unwrap();
-    // A changed reviewed script outranks a compile: a Tiaris release must
-    // review it before anything else matters.
-    assert_eq!(outcome.reason, Some(REASON_BUILD_SCRIPT_CHANGED));
-    assert_eq!(outcome.details, vec!["system-units"]);
-}
-
-#[tokio::test]
-async fn a_changed_builder_file_no_admitted_derivation_uses_does_not_block() {
-    let fake = fake_nix(
-        "wrapper",
-        Some(evaluated_identities(
-            "26.05",
-            &[("wrapper.c", &"0".repeat(64))],
-        )),
-        &[AGENT_DRV],
-    );
-    let outcome = evaluate(&fake).await.unwrap();
-    assert_eq!(outcome.state(), "ready");
-    assert!(outcome.reviewed.builder_files.is_empty());
-}
-
-#[tokio::test]
-async fn the_tiaris_packages_build_closure_compiles() {
-    // The agent's vendored crates are local work of the Tiaris packages'
-    // closure, from the shipped Tiaris source and the commit's nixpkgs.
-    let fake = fake_nix_with(
-        "tiaris-closure",
-        Some(evaluated_identities("26.05", &[])),
-        &[AGENT_DRV, VENDOR_DRV],
-        &[AGENT_DRV, VENDOR_DRV, WRAPPER_DRV],
-        &[VENDOR_DRV],
-    );
-    let outcome = evaluate(&fake).await.unwrap();
-    assert_eq!(outcome.state(), "ready");
-    assert_eq!(outcome.tiaris_closure_size, 2);
-    assert_eq!(
-        outcome.tiaris_derivations,
-        BTreeSet::from([AGENT_DRV.to_string(), VENDOR_DRV.to_string()])
-    );
-}
-
-#[tokio::test]
-async fn fixed_output_derivations_of_the_closure_need_the_fetch_rules() {
-    let fake = fake_nix_with(
-        "tiaris-fixed-output",
-        Some(evaluated_identities("26.05", &[])),
-        &[AGENT_DRV, STAGING_DRV],
-        &[AGENT_DRV, STAGING_DRV, WRAPPER_DRV],
-        &[STAGING_DRV],
-    );
-    let outcome = evaluate(&fake).await.unwrap();
-    assert_eq!(outcome.reason, Some(REASON_SOURCE_BUILD_REQUIRED));
-    assert_eq!(outcome.details, vec!["tiaris-agent-vendor-staging"]);
-}
-
-#[tokio::test]
-async fn local_work_outside_the_tiaris_closure_stays_blocked() {
-    // The seeds' dry run also lists a compile no Tiaris package reaches.
-    let fake = fake_nix_with(
-        "tiaris-outside",
-        Some(evaluated_identities("26.05", &[])),
-        &[AGENT_DRV, FIREFOX_DRV],
-        &[AGENT_DRV, FIREFOX_DRV, WRAPPER_DRV],
-        &[],
-    );
-    let outcome = evaluate(&fake).await.unwrap();
     assert_eq!(outcome.reason, Some(REASON_SOURCE_BUILD_REQUIRED));
     assert_eq!(outcome.details, vec!["firefox-unwrapped-145.0"]);
-}
-
-#[tokio::test]
-async fn a_tiaris_closure_over_the_bound_blocks_the_commit() {
-    let crates = (0..build::MAX_TIARIS_PACKAGE_DERIVATIONS)
-        .map(|index| {
-            format!(
-                "/nix/store/{}-crate-{index}.drv",
-                format!("{index:0>32}").replace('e', "f")
-            )
-        })
-        .collect::<Vec<_>>();
-    let extra = crates
-        .iter()
-        .map(|path| (path.clone(), compile(path)))
-        .collect::<serde_json::Map<_, _>>();
-    let mut listing = vec![AGENT_DRV, WRAPPER_DRV];
-    listing.extend(crates.iter().map(String::as_str));
-    let fake = fake_nix_full(
-        "tiaris-bound",
-        Some(evaluated_identities("26.05", &[])),
-        &[AGENT_DRV],
-        &listing,
-        &crates.iter().map(String::as_str).collect::<Vec<_>>(),
-        Value::Object(extra),
-    );
-    let outcome = evaluate(&fake).await.unwrap();
-    assert_eq!(outcome.reason, Some(REASON_SOURCE_BUILD_REQUIRED));
-    assert_eq!(
-        outcome.tiaris_closure_size,
-        build::MAX_TIARIS_PACKAGE_DERIVATIONS + 1
-    );
-    assert_eq!(outcome.details.len(), 50);
+    assert_eq!(outcome.kernel_version, "6.18.59");
 }
 
 #[tokio::test]
@@ -464,54 +241,30 @@ async fn evaluation_failures_block_with_evaluation_failed() {
     let fake = fake_nix("eval", None, &[]);
     let outcome = evaluate(&fake).await.unwrap();
     assert_eq!(outcome.reason, Some(REASON_EVALUATION_FAILED));
-    assert_eq!(outcome.details, vec!["build identities"]);
+    assert_eq!(outcome.details, vec!["nixpkgs"]);
 
-    let mut incomplete = evaluated_identities("26.05", &[]);
-    incomplete["identities"]
-        .as_object_mut()
-        .unwrap()
-        .remove("stdenvNoCC");
-    let fake = fake_nix("incomplete", Some(incomplete), &[]);
-    let outcome = evaluate(&fake).await.unwrap();
-    assert_eq!(outcome.reason, Some(REASON_EVALUATION_FAILED));
-
-    let fake = fake_nix("dry-run", Some(evaluated_identities("26.05", &[])), &[]);
+    let fake = fake_nix("dry-run", Some(evaluated_release("26.05")), &[AGENT_DRV]);
     std::fs::write(fake.root.join("fail-dry-run"), "").unwrap();
     let outcome = evaluate(&fake).await.unwrap();
     assert_eq!(outcome.reason, Some(REASON_EVALUATION_FAILED));
-    assert_eq!(outcome.details, vec!["reference-standard"]);
+    assert_eq!(outcome.details, vec!["tiaris-packages"]);
+
+    let fake = fake_nix(
+        "unsafe-references",
+        Some(evaluated_release("26.05")),
+        &[AGENT_DRV],
+    );
+    std::fs::write(fake.root.join("references.json"), r#"["../../etc"]"#).unwrap();
+    let outcome = evaluate(&fake).await.unwrap();
+    assert_eq!(outcome.reason, Some(REASON_EVALUATION_FAILED));
+    assert_eq!(outcome.details, vec!["reference blueprints"]);
 }
 
 #[tokio::test]
 async fn a_commit_of_another_nixos_release_is_never_recorded() {
-    let fake = fake_nix("release", Some(evaluated_identities("26.11", &[])), &[]);
+    let fake = fake_nix("release", Some(evaluated_release("26.11")), &[]);
     let error = evaluate(&fake).await.unwrap_err().to_string();
     assert!(error.contains("does not cross releases"), "{error}");
-}
-
-#[test]
-fn reasons_are_bounded_and_ordered() {
-    let many = (0..80)
-        .map(|index| format!("drv-{index}"))
-        .collect::<Vec<_>>();
-    let outcome = decide(
-        String::new(),
-        BTreeSet::new(),
-        many.clone(),
-        BTreeMap::new(),
-        BTreeSet::new(),
-    );
-    assert_eq!(outcome.reason, Some(REASON_SOURCE_BUILD_REQUIRED));
-    assert_eq!(outcome.details, many[..50]);
-    let outcome = decide(
-        String::new(),
-        BTreeSet::from(["etc".to_string()]),
-        many,
-        BTreeMap::new(),
-        BTreeSet::new(),
-    );
-    assert_eq!(outcome.reason, Some(REASON_BUILD_SCRIPT_CHANGED));
-    assert_eq!(outcome.details, vec!["etc"]);
 }
 
 #[test]
@@ -627,12 +380,14 @@ fn metadata(last_modified: i64) -> FlakeMetadata {
 }
 
 fn ready_outcome() -> DetectedOutcome {
-    decide(
-        "6.18.59".to_string(),
-        BTreeSet::new(),
-        Vec::new(),
-        shifted_identities(),
-        BTreeSet::from([AGENT_DRV.to_string()]),
+    DetectedOutcome::ready("6.18.59".to_string())
+}
+
+fn blocked_outcome() -> DetectedOutcome {
+    DetectedOutcome::blocked(
+        "6.18.60".to_string(),
+        REASON_SOURCE_BUILD_REQUIRED,
+        vec!["libreoffice-26.2.1.2".to_string()],
     )
 }
 
@@ -668,11 +423,7 @@ async fn ready_commits_are_admitted_reported_and_kept_while_used() {
         blocked,
         DEFAULT_CHANNEL,
         &metadata(1_793_400_000),
-        &DetectedOutcome::blocked(
-            "6.18.60".to_string(),
-            REASON_BUILD_SCRIPT_CHANGED,
-            vec!["wrapper.c".to_string()],
-        ),
+        &blocked_outcome(),
     )
     .await
     .unwrap();
@@ -704,7 +455,7 @@ async fn ready_commits_are_admitted_reported_and_kept_while_used() {
             "detected_at": value[1]["detected_at"],
         })
     );
-    assert_eq!(value[0]["reason"], "build_script_changed");
+    assert_eq!(value[0]["reason"], "source_build_required");
     // Manage's wire carries the reason only; the names stay local.
     assert!(value[0].get("reason_details").is_none());
 
@@ -746,9 +497,17 @@ async fn ready_commits_are_admitted_reported_and_kept_while_used() {
         [older_ready, blocked, COMMIT]
     );
 
-    // A tampered profile fails closed.
-    tamper(data, COMMIT, |record| record["profile"] = json!("{}"));
-    assert!(ready_commit(data, COMMIT).await.is_err());
+    // A record an older Nest wrote: its build profile is ignored, and a
+    // verdict of the strict "Nest only" check is not used.
+    tamper(data, COMMIT, |record| {
+        record["profile"] = json!("{}");
+        record["tiaris_derivations"] = json!("[]");
+    });
+    assert!(ready_commit(data, COMMIT).await.unwrap().is_some());
+    tamper(data, blocked, |record| {
+        record["reason"] = json!("build_script_changed")
+    });
+    assert!(detected_row(data, blocked).await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -773,18 +532,16 @@ async fn inconsistent_or_corrupt_detected_records_are_not_used() {
     )
     .unwrap();
     // The rules the database used to enforce.
-    for (state, reason, profile) in [
-        ("ready", json!("evaluation_failed"), json!("{}")),
-        ("blocked", Value::Null, Value::Null),
-        ("ready", Value::Null, Value::Null),
-        ("blocked", json!("other"), Value::Null),
-        ("pending", Value::Null, json!("{}")),
+    for (state, reason) in [
+        ("ready", json!("evaluation_failed")),
+        ("blocked", Value::Null),
+        ("blocked", json!("other")),
+        ("pending", Value::Null),
     ] {
         tamper(data, COMMIT, |record| {
             *record = good.clone();
             record["state"] = json!(state);
             record["reason"] = reason.clone();
-            record["profile"] = profile.clone();
         });
         assert!(
             detected_row(data, COMMIT).await.unwrap().is_none(),
@@ -793,15 +550,10 @@ async fn inconsistent_or_corrupt_detected_records_are_not_used() {
         assert!(ready_commit(data, COMMIT).await.unwrap().is_none());
         assert!(report(pool, data).await.unwrap().is_empty());
     }
-    // A record filed under another commit, an unknown field, or garbage.
+    // A record filed under another commit, or garbage.
     tamper(data, COMMIT, |record| {
         *record = good.clone();
         record["commit_rev"] = json!("1".repeat(40));
-    });
-    assert!(detected_row(data, COMMIT).await.unwrap().is_none());
-    tamper(data, COMMIT, |record| {
-        *record = good.clone();
-        record["admit_everything"] = json!(true);
     });
     assert!(detected_row(data, COMMIT).await.unwrap().is_none());
     std::fs::write(
@@ -890,7 +642,7 @@ fn the_check_flake_evaluates_only_the_shipped_tiaris_source_and_nixpkgs() {
     // Two inputs only: nixpkgs and the shipped Tiaris source.
     assert_eq!(flake.matches("inputs.").count(), 2);
     assert!(flake.contains("tiaris-workstation-cache-seeds.nix"));
-    assert!(flake.contains("tiaris-packages = pkgs.writeText"));
+    assert!(flake.contains("tiaris-packages = pkgs.writeText \"tiaris-packages\""));
     assert!(flake.contains(&format!("manage + \"/{REFERENCE_BLUEPRINTS_DIR}\"")));
     assert!(flake.contains("referenceBlueprints = referenceNames;"));
     for profile in BUILTIN_BLUEPRINT_PROFILES {
@@ -922,8 +674,8 @@ fn the_check_flake_evaluates_only_the_shipped_tiaris_source_and_nixpkgs() {
 }
 
 /// Real evaluation of a channel commit with the local Nix. Not part of CI:
-/// it fetches nixpkgs and dry-runs both built-in Blueprints (minutes, a few
-/// GiB of narinfo traffic). Set `TIARIS_SOFTWARE_UPDATE_COMMIT`,
+/// it fetches nixpkgs and dry-runs every reference at the pin and at the
+/// commit (minutes, a few GiB of narinfo traffic). Set `TIARIS_SOFTWARE_UPDATE_COMMIT`,
 /// `TIARIS_SOFTWARE_UPDATE_MANAGE_SOURCE` (a `tarball+file://` Tiaris source)
 /// and optionally `TIARIS_SOFTWARE_UPDATE_NIX` (the Nest's Nix; 2.26 cannot
 /// read `builtins.path` sources in an isolated dry run).
@@ -949,18 +701,11 @@ async fn real_channel_commit_evaluation() {
         .unwrap();
     let _ = std::fs::remove_dir_all(&config.build.work_dir);
     eprintln!(
-        "state={} reason={:?} kernel={} tiaris_closure={} tiaris_derivations={:#?}\ndetails={:#?}\ncoverage={:#?}\ncounterparts={:#?}\nreviewed fingerprints={} stock commands={} builder files={:?}",
+        "state={} reason={:?} kernel={} details={:#?}",
         outcome.state(),
         outcome.reason,
         outcome.kernel_version,
-        outcome.tiaris_closure_size,
-        outcome.tiaris_derivations,
         outcome.details,
-        outcome.coverage,
-        outcome.counterparts,
-        outcome.reviewed.fingerprints.len(),
-        outcome.reviewed.stock_commands.len(),
-        outcome.reviewed.builder_files,
     );
 }
 
@@ -988,7 +733,7 @@ async fn only_shipped_references_are_evaluated_never_organization_jobs() {
     // shipped reference Blueprints and the plain profiles.
     let fake = fake_nix(
         "references-only",
-        Some(evaluated_identities("26.05", &[])),
+        Some(evaluated_release("26.05")),
         &[AGENT_DRV],
     );
     let root = fake.root.clone();
@@ -1011,10 +756,11 @@ async fn only_shipped_references_are_evaluated_never_organization_jobs() {
                 .1
         })
         .collect::<Vec<_>>();
-    // Tiaris packages once; each reference at the pin and once at the commit.
+    // Each reference at the release pin, then at the commit.
     assert_eq!(
         installables,
         [
+            "tiaris-packages",
             "tiaris-packages",
             "reference-standard",
             "reference-standard",
@@ -1025,33 +771,19 @@ async fn only_shipped_references_are_evaluated_never_organization_jobs() {
         ]
     );
     assert!(!calls.contains("job-"), "{calls}");
-    for call in &builds[1..] {
+    for (index, call) in builds.iter().enumerate() {
+        let flake = if index % 2 == 0 {
+            "/pin-flake#"
+        } else {
+            "/flake#"
+        };
+        assert!(call.contains(flake), "{call}");
+        // Only the public cache counts: not what this Nest built before.
         assert!(
-            call.contains("/pin-flake#") || call.contains("/flake#"),
+            call.contains("--option substituters https://cache.nixos.org/"),
             "{call}"
         );
     }
-}
-
-#[tokio::test]
-async fn a_tiaris_source_without_reference_blueprints_blocks() {
-    let fake = fake_nix(
-        "no-references",
-        Some(evaluated_identities("26.05", &[])),
-        &[AGENT_DRV],
-    );
-    std::fs::write(fake.root.join("references.json"), "[]").unwrap();
-    let outcome = evaluate(&fake).await.unwrap();
-    assert_eq!(outcome.reason, Some(REASON_REFERENCE_BLUEPRINTS_MISSING));
-
-    let fake = fake_nix(
-        "unsafe-references",
-        Some(evaluated_identities("26.05", &[])),
-        &[AGENT_DRV],
-    );
-    std::fs::write(fake.root.join("references.json"), r#"["../../etc"]"#).unwrap();
-    let outcome = evaluate(&fake).await.unwrap();
-    assert_eq!(outcome.reason, Some(REASON_EVALUATION_FAILED));
 }
 
 #[test]
@@ -1069,10 +801,9 @@ fn provenance_needs_the_branch_to_contain_the_commit_after_the_pin() {
 }
 
 #[test]
-fn failed_commits_are_evaluated_again_at_most_daily_and_after_an_update() {
+fn failed_checks_are_tried_again_at_most_daily() {
     let now = Utc.with_ymd_and_hms(2026, 10, 31, 12, 0, 0).unwrap();
-    let build = "0.2.49 release=0.2.49 source=a tiaris=b";
-    let row = |reason: Option<&str>, hours_ago: i64, derived_by: &str| DetectedRow {
+    let row = |reason: Option<&str>, hours_ago: i64| DetectedRow {
         commit_rev: COMMIT.to_string(),
         channel: DEFAULT_CHANNEL.to_string(),
         last_modified: "2026-10-29T17:25:25Z".to_string(),
@@ -1081,120 +812,69 @@ fn failed_commits_are_evaluated_again_at_most_daily_and_after_an_update() {
         state: if reason.is_some() { "blocked" } else { "ready" }.to_string(),
         reason: reason.map(str::to_string),
         reason_details: "[]".to_string(),
-        profile: None,
-        tiaris_derivations: "[]".to_string(),
         detected_at: (now - chrono::Duration::hours(hours_ago)).to_rfc3339(),
-        derived_by: derived_by.to_string(),
+        derived_by: String::new(),
     };
-    assert!(needs_evaluation_by(None, now, build));
+    assert!(needs_evaluation(None, now));
     for reason in [
         REASON_EVALUATION_FAILED,
         REASON_PROVENANCE_UNVERIFIED,
         REASON_INSUFFICIENT_DISK,
     ] {
-        assert!(!needs_evaluation_by(
-            Some(&row(Some(reason), 1, build)),
-            now,
-            build
-        ));
-        assert!(!needs_evaluation_by(
-            Some(&row(Some(reason), 23, build)),
-            now,
-            build
-        ));
-        assert!(needs_evaluation_by(
-            Some(&row(Some(reason), 24, build)),
-            now,
-            build
-        ));
+        assert!(!needs_evaluation(Some(&row(Some(reason), 23)), now));
+        assert!(needs_evaluation(Some(&row(Some(reason), 24)), now));
     }
-    for reason in [
-        REASON_BUILD_SCRIPT_CHANGED,
-        REASON_SOURCE_BUILD_REQUIRED,
-        REASON_REFERENCE_BLUEPRINTS_MISSING,
-    ] {
-        assert!(!needs_evaluation_by(
-            Some(&row(Some(reason), 48, build)),
-            now,
-            build
-        ));
-        // A Nest update (another build or shipped Tiaris source) may ship
-        // the references or reviewed content the commit lacked.
-        assert!(needs_evaluation_by(
-            Some(&row(
-                Some(reason),
-                1,
-                "0.2.48 release=0.2.48 source=a tiaris=c"
-            )),
-            now,
-            build
-        ));
-    }
-    // Ready commits are derived again through their stale profile instead.
-    assert!(!needs_evaluation_by(
-        Some(&row(None, 48, "other")),
-        now,
-        build
+    // A commit that needs a new compile is not asked again, and a ready
+    // commit stays ready.
+    assert!(!needs_evaluation(
+        Some(&row(Some(REASON_SOURCE_BUILD_REQUIRED), 48)),
+        now
     ));
+    assert!(!needs_evaluation(Some(&row(None, 48)), now));
 }
 
 #[tokio::test]
-async fn a_profile_from_another_nest_build_is_derived_again() {
-    let stores = stores("rederive").await;
+async fn startup_forgets_what_another_nest_build_held_back() {
+    let stores = stores("other-build").await;
     let (pool, data) = (&stores.pool, stores.data.as_path());
-    store_detected(
-        pool,
-        data,
-        COMMIT,
-        DEFAULT_CHANNEL,
-        &metadata(1_793_294_725),
-        &ready_outcome(),
-    )
-    .await
-    .unwrap();
-    assert!(ready_commit(data, COMMIT).await.unwrap().is_some());
-    assert!(stale_ready_rows(data).await.unwrap().is_empty());
-    assert_eq!(report(pool, data).await.unwrap()[0].state, "ready");
-    assert_eq!(ready_commits_in_use(pool, data).await.unwrap(), [COMMIT]);
-    for (field, value) in [
-        ("schema", json!(PROFILE_SCHEMA - 1)),
-        ("nest_build", json!("0.2.47 release=other")),
+    let [ready, strict, compile, own] = ["1", "2", "3", "4"].map(|digit| digit.repeat(40));
+    for (commit, outcome) in [
+        (&ready, ready_outcome()),
+        (&strict, blocked_outcome()),
+        (&compile, blocked_outcome()),
+        (&own, blocked_outcome()),
     ] {
-        let mut stored: Value = serde_json::from_str(
-            &detected_row(data, COMMIT)
-                .await
-                .unwrap()
-                .unwrap()
-                .profile
-                .unwrap(),
+        store_detected(
+            pool,
+            data,
+            commit,
+            DEFAULT_CHANNEL,
+            &metadata(1_793_294_725),
+            &outcome,
         )
+        .await
         .unwrap();
-        let current = stored[field].clone();
-        stored[field] = value;
-        tamper(data, COMMIT, |record| {
-            record["profile"] = json!(stored.to_string())
-        });
-        // Never re-mapped: the commit admits nothing, is not reported or
-        // kept as ready, until derived again.
-        assert!(ready_commit(data, COMMIT).await.is_err());
-        assert_eq!(stale_ready_rows(data).await.unwrap().len(), 1);
-        let reported = report(pool, data).await.unwrap();
-        assert_eq!(reported[0].state, "blocked");
-        assert_eq!(
-            reported[0].reason.as_deref(),
-            Some(REASON_REDERIVATION_PENDING)
-        );
-        assert!(ready_commits_in_use(pool, data).await.unwrap().is_empty());
-        stored[field] = current;
-        tamper(data, COMMIT, |record| {
-            record["profile"] = json!(stored.to_string())
+    }
+    // Records of the Nest release before this one: a ready commit, a verdict
+    // of the removed strict check, and a verdict this build could give too.
+    for commit in [&ready, &strict, &compile] {
+        tamper(data, commit, |record| {
+            record["derived_by"] = json!("0.2.173 release=0.2.173 source=a tiaris=b");
+            if *commit == strict {
+                record["reason"] = json!("build_script_changed");
+            }
         });
     }
-    // A profile in the format before this schema is stale too.
-    tamper(data, COMMIT, |record| {
-        record["profile"] = json!(r#"{"identities":{},"reviewed":{}}"#)
-    });
-    assert_eq!(stale_ready_rows(data).await.unwrap().len(), 1);
+    assert!(forget_verdicts_of_other_builds(data).await);
+    let left = detected_rows(data)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.commit_rev)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(left, BTreeSet::from([ready, own]));
+    assert!(!detected_dir(data).join(format!("{strict}.json")).exists());
+    assert!(!forget_verdicts_of_other_builds(data).await);
 }
 
 /// Provenance of a real commit through the GitHub API. Not part of CI.
@@ -1212,20 +892,16 @@ async fn real_commit_provenance() {
 }
 
 #[tokio::test]
-async fn the_check_keeps_one_isolated_store_at_a_time() {
-    let fake = fake_nix(
-        "one-store",
-        Some(evaluated_identities("26.05", &[])),
-        &[AGENT_DRV],
-    );
+async fn the_check_keeps_one_private_store_at_a_time() {
+    let fake = fake_nix("one-store", Some(evaluated_release("26.05")), &[AGENT_DRV]);
     let root = fake.root.clone();
     let outcome = evaluate_with(&fake, true).await.unwrap();
     let stores = std::fs::read_to_string(root.join("stores")).unwrap();
     let _ = std::fs::remove_dir_all(&root);
     assert_eq!(outcome.state(), "ready");
-    // Seven dry runs (Tiaris packages, three references twice) and their
-    // derivation queries, each with its store alone.
-    assert!(stores.lines().count() >= 7, "{stores}");
+    // Eight dry runs (four references, each at the pin and at the commit)
+    // and their derivation queries, each with its store alone.
+    assert!(stores.lines().count() >= 8, "{stores}");
     assert!(stores.lines().all(|count| count.trim() == "1"), "{stores}");
 }
 
@@ -1242,7 +918,7 @@ async fn a_cancelled_check_removes_its_work_directory() {
         let path = path.clone();
         async move {
             let work = CheckWorkDir::create(path).unwrap();
-            let read_only = work.path.join("stores/source-policy-store-x/nix/store/y");
+            let read_only = work.path.join("stores/dry-run-store-x/nix/store/y");
             std::fs::create_dir_all(&read_only).unwrap();
             std::fs::set_permissions(&read_only, std::fs::Permissions::from_mode(0o555)).unwrap();
             std::future::pending::<()>().await;

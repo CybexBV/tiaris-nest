@@ -8,7 +8,6 @@ use base64::Engine as _;
 use serde_json::json;
 
 use super::*;
-use crate::build::ReviewedContent;
 
 const COMMIT: &str = "6f06d204d8f2d8761d9da78778745974a3216381";
 const OLDER_COMMIT: &str = "1111111111111111111111111111111111111111";
@@ -108,13 +107,6 @@ fn insert_scan(
 }
 
 async fn insert_detected(db: &TestDb, commit: &str, ready: bool) {
-    let profile = serde_json::to_string(&super::super::StoredProfile {
-        schema: super::super::PROFILE_SCHEMA,
-        nest_build: super::super::nest_build_identity(),
-        identities: BTreeMap::new(),
-        reviewed: ReviewedContent::default(),
-    })
-    .unwrap();
     let record = super::super::DetectedRow {
         commit_rev: commit.into(),
         channel: "nixos-26.05".into(),
@@ -124,8 +116,6 @@ async fn insert_detected(db: &TestDb, commit: &str, ready: bool) {
         state: if ready { "ready" } else { "blocked" }.into(),
         reason: (!ready).then(|| "source_build_required".into()),
         reason_details: "[]".into(),
-        profile: ready.then_some(profile),
-        tiaris_derivations: "[]".into(),
         detected_at: "2026-10-31T03:12:00Z".into(),
         derived_by: String::new(),
     };
@@ -944,19 +934,6 @@ async fn only_blueprint_jobs_at_ready_detected_commits_are_candidates() {
     let mut other = spec(EARLIER_CANDIDATE, 3, OLDER_COMMIT, &[]);
     other["build_input"]["kind"] = json!("desktop_experience_nixos_module");
     insert_job(&db, "other", other, EARLIER_OUT, "2026-10-21T05:00:00Z").await;
-    assert!(
-        next_candidate(&db.pool, &db.data, &[PIN.to_string()], Utc::now())
-            .await
-            .unwrap()
-            .is_none()
-    );
-    // A ready commit whose profile another Nest build derived admits nothing.
-    tamper_detected(&db, COMMIT, |record| {
-        record["state"] = json!("ready");
-        record["reason"] = Value::Null;
-        record["profile"] =
-            json!(r#"{"schema":0,"nest_build":"old","identities":{},"reviewed":{}}"#);
-    });
     assert!(
         next_candidate(&db.pool, &db.data, &[PIN.to_string()], Utc::now())
             .await

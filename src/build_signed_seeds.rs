@@ -1,4 +1,4 @@
-//! Signed appliance outputs available to an otherwise isolated source preflight.
+//! Which store paths carry a valid signature of the appliance release key.
 use std::collections::{BTreeSet, HashSet};
 use std::time::Duration;
 

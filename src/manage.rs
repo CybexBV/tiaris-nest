@@ -6248,7 +6248,7 @@ mod tests {
             nar_hash: "sha256-loLMnbbS4KhmG2ln9EY6f0YMNCA273Yx02oWYQ9IMeE=".to_string(),
             kernel_version: "6.18.59".to_string(),
             state: "blocked".to_string(),
-            reason: Some("build_script_changed".to_string()),
+            reason: Some("source_build_required".to_string()),
             detected_at: "2026-10-31T03:12:00Z".to_string(),
         };
         let value = serde_json::to_value(&detected).unwrap();
@@ -6261,7 +6261,7 @@ mod tests {
                 "nar_hash": "sha256-loLMnbbS4KhmG2ln9EY6f0YMNCA273Yx02oWYQ9IMeE=",
                 "kernel_version": "6.18.59",
                 "state": "blocked",
-                "reason": "build_script_changed",
+                "reason": "source_build_required",
                 "detected_at": "2026-10-31T03:12:00Z",
             })
         );
