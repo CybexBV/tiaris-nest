@@ -8,10 +8,10 @@ machine-readable reason, a short detail and a plain-English remedy.
 | Check | What it tests | Reasons it fails |
 | --- | --- | --- |
 | `network_boot` | The Nest's boot answer is served; the school's DHCP answers; no other server hands out boot information; computers do not keep asking without receiving the answer | `boot_service_unavailable`, `no_dhcp_server`, `other_boot_server`, `boot_answer_dropped` |
-| `dns` | Manage, the software cache and directory hosts resolve | `name_not_resolved` |
+| `dns` | Manage, the software cache (where it is on) and directory hosts resolve | `name_not_resolved` |
 | `time` | The clock is synchronized; when not, whether NTP is blocked | `ntp_blocked`, `clock_not_synchronized` |
 | `manage` | HTTPS to Manage with a trusted certificate and a Tiaris answer | `unreachable`, `https_intercepted` (names the issuer), `certificate_mismatch`, `certificate_expired`, `clock_wrong`, `tls_failed`, `unexpected_answer` |
-| `software_cache` | The same for `cache.tiaris.com` | the same |
+| `software_cache` | The same for the software cache Manage names (`site_check.software_cache_url`). Where the cache is off Manage names none, computers never use the host, and the check is `not_applicable` (`software_cache_off`) | the same |
 | `directory` | LDAPS with a certificate computers trust (public roots plus the private CA Manage holds), when the organization uses a directory | `unreachable`, `certificate_untrusted`, `certificate_mismatch`, `certificate_expired`, `tls_failed` |
 
 ## When it runs

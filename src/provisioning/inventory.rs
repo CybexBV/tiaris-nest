@@ -73,12 +73,19 @@ pub struct NestProvisioningInventory {
     pub ethernet_interfaces: Vec<NestProvisioningEthernetInterface>,
     #[serde(default)]
     pub disks: Vec<NestProvisioningDisk>,
+    /// Paths of disks left out of `disks` because they have no serial number
+    /// and so no name that stays the same across restarts (a VirtIO Block
+    /// disk on Proxmox). The approved disk is found again by that name
+    /// before it is erased, so such a disk can never be approved. Never sent
+    /// to Tiaris; the hardware check on this server's screen names it.
+    #[serde(skip)]
+    pub disks_without_serial: Vec<String>,
 }
 
 pub(crate) async fn collect_inventory() -> Result<NestProvisioningInventory> {
     let mut ethernet_interfaces = collect_ethernet_interfaces().await?;
     ethernet_interfaces.sort_by(|left, right| left.id.cmp(&right.id));
-    let mut disks = collect_disks().await?;
+    let (mut disks, disks_without_serial) = collect_disks().await?;
     disks.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(NestProvisioningInventory {
         manufacturer: clean(&read_trimmed("/sys/class/dmi/id/sys_vendor"), 256),
@@ -101,6 +108,7 @@ pub(crate) async fn collect_inventory() -> Result<NestProvisioningInventory> {
         virtualization: clean(&command_text("systemd-detect-virt", &["--vm"]).await, 256),
         ethernet_interfaces,
         disks,
+        disks_without_serial,
     })
 }
 
@@ -708,7 +716,7 @@ async fn collect_ethernet_interfaces() -> Result<Vec<NestProvisioningEthernetInt
     Ok(interfaces)
 }
 
-async fn collect_disks() -> Result<Vec<NestProvisioningDisk>> {
+async fn collect_disks() -> Result<(Vec<NestProvisioningDisk>, Vec<String>)> {
     let output = Command::new("lsblk")
         .args([
             "--json",
@@ -723,11 +731,22 @@ async fn collect_disks() -> Result<Vec<NestProvisioningDisk>> {
         bail!("lsblk could not provide bounded disk inventory")
     }
     let value: Value = serde_json::from_slice(&output.stdout).context("parse lsblk inventory")?;
+    disks_from_lsblk(&value, stable_disk_id)
+}
+
+/// The disks Tiaris may approve, and the paths of disks without a stable
+/// name. One such disk must not stop the whole hardware check: it is left
+/// out and named, like a removable or small disk is listed and refused.
+fn disks_from_lsblk(
+    value: &Value,
+    stable_id: impl Fn(&Path) -> Result<Option<String>>,
+) -> Result<(Vec<NestProvisioningDisk>, Vec<String>)> {
     let rows = value
         .get("blockdevices")
         .and_then(Value::as_array)
         .ok_or_else(|| anyhow!("lsblk inventory omitted blockdevices"))?;
     let mut disks = Vec::new();
+    let mut without_serial = Vec::new();
     for row in rows {
         if row.get("type").and_then(Value::as_str) != Some("disk") {
             continue;
@@ -757,7 +776,10 @@ async fn collect_disks() -> Result<Vec<NestProvisioningDisk>> {
         if size_bytes < MIN_DISK_BYTES {
             blocker_codes.push("disk_too_small".to_string());
         }
-        let id = stable_disk_id(Path::new(path))?;
+        let Some(id) = stable_id(Path::new(path))? else {
+            without_serial.push(clean(path, 256));
+            continue;
+        };
         disks.push(NestProvisioningDisk {
             id,
             path: clean(path, 256),
@@ -772,10 +794,12 @@ async fn collect_disks() -> Result<Vec<NestProvisioningDisk>> {
             blocker_codes,
         });
     }
-    Ok(disks)
+    Ok((disks, without_serial))
 }
 
-fn stable_disk_id(path: &Path) -> Result<String> {
+/// The disk's name under `/dev/disk/by-id`, which udev makes from its serial
+/// number or WWN; `None` for a disk that reports neither.
+fn stable_disk_id(path: &Path) -> Result<Option<String>> {
     let target =
         fs::canonicalize(path).with_context(|| format!("resolve disk path {}", path.display()))?;
     let mut candidates = Vec::new();
@@ -791,16 +815,7 @@ fn stable_disk_id(path: &Path) -> Result<String> {
         }
     }
     candidates.sort_by_key(|name| (disk_id_priority(name), name.clone()));
-    candidates
-        .into_iter()
-        .next()
-        .map(|name| clean(&name, 512))
-        .ok_or_else(|| {
-            anyhow!(
-                "disk {} has no stable /dev/disk/by-id identity",
-                path.display()
-            )
-        })
+    Ok(candidates.into_iter().next().map(|name| clean(&name, 512)))
 }
 
 fn disk_id_priority(name: &str) -> u8 {
@@ -1004,6 +1019,7 @@ mod tests {
                 eligible: true,
                 blocker_codes: Vec::new(),
             }],
+            disks_without_serial: Vec::new(),
         }
     }
 
@@ -1080,6 +1096,27 @@ mod tests {
             blocker_codes: vec!["disk_too_small".into()],
         };
         assert!(!disk.eligible);
+    }
+
+    #[test]
+    fn a_disk_without_a_stable_name_is_left_out_and_named() {
+        // A VirtIO Block disk without a serial has no /dev/disk/by-id name.
+        // It used to fail the whole inventory, and setup looped without a cause.
+        let lsblk = json!({"blockdevices": [
+            {"name": "sda", "kname": "no-such-a", "path": "/dev/sda", "type": "disk",
+             "size": MIN_DISK_BYTES, "rm": false, "hotplug": false, "ro": false},
+            {"name": "vda", "kname": "no-such-b", "path": "/dev/vda", "type": "disk",
+             "size": MIN_DISK_BYTES, "rm": false, "hotplug": false, "ro": false},
+            {"name": "sr0", "kname": "sr0", "path": "/dev/sr0", "type": "rom", "size": 0},
+        ]});
+        let (disks, without_serial) = disks_from_lsblk(&lsblk, |path| {
+            Ok((path == Path::new("/dev/sda")).then(|| "scsi-0QEMU_HARDDISK_1".to_string()))
+        })
+        .unwrap();
+        assert_eq!(disks.len(), 1);
+        assert_eq!(disks[0].id, "scsi-0QEMU_HARDDISK_1");
+        assert!(disks[0].eligible);
+        assert_eq!(without_serial, vec!["/dev/vda".to_string()]);
     }
 
     #[test]

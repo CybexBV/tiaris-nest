@@ -1282,7 +1282,7 @@ async fn a_claimed_setup_that_ended_gives_the_installed_nest_its_full_wait_again
     assert!(waited.is_err());
     assert!(starts.lock().unwrap().is_empty());
     let deadline = context.starts_installed_at.unwrap();
-    assert!(deadline >= before + chrono::Duration::minutes(10));
+    assert!(deadline >= before + chrono::Duration::minutes(START_INSTALLED_AFTER_MINUTES));
     server.abort();
 }
 

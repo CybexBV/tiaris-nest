@@ -331,6 +331,17 @@ class PermissionLayout(unittest.TestCase):
 
         return Umask()
 
+    def test_the_running_nest_names_its_own_boot_entry_for_the_next_start(self):
+        # B26: with the Nest ISO still attached a virtual machine starts the
+        # installer again; BootNext keeps the next start on the installed disk.
+        import boot_next
+        efivars = self.root / 'efivars'
+        self.assertFalse(boot_next.start_from_this_disk_next_time(efivars))  # no UEFI variables: start as before
+        efivars.mkdir()
+        (efivars / ('BootCurrent-' + boot_next.GLOBAL)).write_bytes(b'\x06\x00\x00\x00\x03\x00')
+        self.assertTrue(boot_next.start_from_this_disk_next_time(efivars))
+        self.assertEqual((efivars / ('BootNext-' + boot_next.GLOBAL)).read_bytes(), b'\x07\x00\x00\x00\x03\x00')
+
     def test_first_boot_private_parent_and_public_leaves_ignore_service_umask(self):
         cache = self.root / 'cache'
         with self.strict_umask():
