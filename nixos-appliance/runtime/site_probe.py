@@ -32,7 +32,13 @@ import time
 SCHEMA = 'tiaris.nest.boot-probe.v1'
 REQUEST_SCHEMA = 'tiaris.nest.site-check-request.v1'
 MAGIC = b'\x63\x82\x53\x63'
-PROBE_SECONDS = 3.0
+# How long the probe waits for answers. A DHCP server checks that an address is
+# free before it offers it to a computer it does not know: dnsmasq (most small
+# routers) pings it for 3 seconds, ISC dhcpd for 1, Windows Server up to 5. With
+# a 3-second wait the probe gave up a moment before dnsmasq answered, and the
+# check said "no DHCP server" on a network whose DHCP server works. A computer's
+# own firmware waits 4 seconds and then asks again.
+PROBE_SECONDS = 8.0
 # A computer whose DISCOVER the Nest answered this often within the window,
 # with no boot request in between, did not receive the answers.
 DROP_OFFERS = 3
