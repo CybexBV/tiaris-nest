@@ -77,8 +77,10 @@ in {
       # substitution explicitly; recovery media retains release-only trust.
       # The Tiaris software cache serves what cache.nixos.org does not build
       # (unfree apps, NVIDIA, directory sign-in); Manage supplies its access
-      # token, which src/software_cache.rs writes to the netrc file. Without it
-      # the cache answers 401, which Nix treats as "not here".
+      # token, which src/software_cache.rs writes to the netrc file. Only then
+      # is the cache a substituter, after cache.nixos.org: the root unit
+      # tiaris-nest-self-cache-trust adds it through the include below. Where
+      # the cache is off, Nix never asks that host. Its key is trusted here.
       # The Nest's own signed export comes first: a build after the daily
       # garbage collection takes what the Nest already exported from its own
       # disk, not from the internet. Its key is trusted through the include
@@ -87,7 +89,6 @@ in {
       substituters = lib.mkForce [
         "file:///var/cache/tiaris-nest/www/cache?priority=10"
         "https://cache.nixos.org"
-        "https://cache.tiaris.com"
       ];
       trusted-public-keys = lib.mkForce [
         "tiaris-nest-appliance-1:${a.releasePublicKey}"
@@ -99,9 +100,11 @@ in {
       experimental-features = [ "nix-command" "flakes" ]; # existing Blueprint jobs use governed flakes
       auto-optimise-store = false; # source exposure explicitly preserves nlink=1
     };
-    # Root-written, one validated `extra-trusted-public-keys` line naming this
-    # Nest's own cache key (runtime/self_cache_trust.py); absent until the
-    # Nest has generated its key. Appliance updates never depend on it: they
+    # Root-written (runtime/self_cache_trust.py): one validated
+    # `extra-trusted-public-keys` line naming this Nest's own cache key, absent
+    # until the Nest has generated its key, and the fixed line that adds the
+    # Tiaris software cache as a substituter while Manage gives access to it.
+    # Appliance updates never depend on it: they
     # import with no substituters and check every closure member against the
     # signed release (generation_update.verify_store_closure).
     nix.extraOptions = ''
@@ -265,7 +268,7 @@ in {
     };
     systemd.paths.tiaris-nest-self-cache-trust = {
       wantedBy = [ "multi-user.target" ];
-      pathConfig.PathChanged = [ "/var/lib/tiaris-nest/state/agent/cache-public.pem" "/var/lib/tiaris-nest/state/cache-public.pem" ];
+      pathConfig.PathChanged = [ "/var/lib/tiaris-nest/state/agent/cache-public.pem" "/var/lib/tiaris-nest/state/cache-public.pem" "/var/lib/tiaris-nest/state/agent/software-cache.netrc" ];
     };
     systemd.timers.tiaris-nest-gc = { wantedBy = [ "timers.target" ]; timerConfig = { OnCalendar = "daily"; Persistent = true; }; };
     # Mask both login paths. A dedicated unit avoids getty@.service.d's

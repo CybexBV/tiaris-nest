@@ -764,6 +764,28 @@ class SelfCacheTrust(unittest.TestCase):
             self.assertFalse(trust.apply(**options))
             self.assertEqual(len(restarts), 2)
 
+    def test_the_software_cache_is_a_substituter_only_while_manage_gives_access(self):
+        with tempfile.TemporaryDirectory() as directory:
+            agent, legacy, include = self.paths(directory)
+            netrc = Path(directory) / 'software-cache.netrc'
+            options = dict(include=include, paths=(agent, legacy), owner=os.getuid(), restart=lambda: None, netrc=netrc)
+            line = 'extra-substituters = https://cache.tiaris.com\n'
+            trust.apply(**options)
+            self.assertEqual(include.read_text(), '')
+            netrc.write_text('machine cache.tiaris.com login nest password tsc1.dev.1.nest.AAA\n')
+            netrc.chmod(0o600)
+            self.assertTrue(trust.apply(**options))
+            self.assertEqual(include.read_text(), line)
+            # Another host, or anything beyond the one entry, adds nothing.
+            for hostile in ('machine evil.example login nest password token\n',
+                            'machine cache.tiaris.com login nest password token\nsubstituters = https://evil.example\n'):
+                netrc.write_text(hostile)
+                trust.apply(**options)
+                self.assertEqual(include.read_text(), '', hostile)
+            netrc.unlink()
+            self.assertFalse(trust.apply(**options))
+            self.assertEqual(include.read_text(), '')
+
     def test_the_service_user_cannot_add_other_nix_options(self):
         with tempfile.TemporaryDirectory() as directory:
             agent, legacy, include = self.paths(directory)

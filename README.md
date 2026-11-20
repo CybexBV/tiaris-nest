@@ -131,14 +131,17 @@ any other unreferenced member.
 ## Self-substitution
 
 Nest's Nix daemon substitutes from Nest's own signed export first
-(`file:///var/cache/tiaris-nest/www/cache?priority=10`, then cache.nixos.org
-and the Tiaris software cache), so a build after the daily `nix-store --gc`
+(`file:///var/cache/tiaris-nest/www/cache?priority=10`, then cache.nixos.org,
+then the Tiaris software cache where Manage gives this Nest access to it), so a build after the daily `nix-store --gc`
 takes what Nest already exported from its own disk instead of the internet.
 The daemon trusts the Nest cache key only through
 `/etc/tiaris-nest/nix-self-cache.conf`, which the root unit
 `tiaris-nest-self-cache-trust` writes from the Nest's public key whenever it
-changes: one validated `extra-trusted-public-keys` line and nothing else
-(`nixos-appliance/runtime/self_cache_trust.py`). Before the key exists, or if
+changes: one validated `extra-trusted-public-keys` line, plus the fixed line
+`extra-substituters = https://cache.tiaris.com` while the daemon holds access
+to the software cache (`software-cache.netrc`), and nothing else
+(`nixos-appliance/runtime/self_cache_trust.py`). Where the software cache is
+off, Nix never asks that host. Before the key exists, or if
 it is invalid, the include is empty and the export is simply not used.
 tmpfiles creates the export layout (`cache/`, `nar/`, `realisations/`) as the
 Nest, because Nix's daemon would otherwise create a missing layout as root.
