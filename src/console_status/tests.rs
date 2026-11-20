@@ -172,6 +172,7 @@ fn a_nest_that_started_without_tiaris_says_so_after_two_minutes() {
     // names what it waits for instead of showing "Starting" for ten minutes.
     let mut tracker = ReadinessTracker::default();
     let mut current = observation(121);
+    current.last_contact = Some(at(-600));
     current.contacted_this_boot = false;
     current.health_ready = false;
     let status = tracker.evaluate(&current);
