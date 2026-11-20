@@ -31,6 +31,10 @@ const ATTENTION_AFTER_CHECKS: u32 = 6;
 /// Tiaris normally hears from Nest every sync interval (at most an hour, 30 s
 /// by default). Ten silent minutes means the link, not the schedule, failed.
 const TIARIS_UNREACHABLE_AFTER_SECONDS: i64 = 10 * 60;
+/// A Nest that starts reaches Tiaris within seconds. One that has not after
+/// two minutes started without it (a restart during an internet fault): its
+/// services run, and the screen says what it waits for instead of "Starting".
+const TIARIS_UNREACHABLE_AFTER_START_SECONDS: i64 = 2 * 60;
 const RECENT_INSTALL_START_SECONDS: i64 = 10 * 60;
 const MAX_STATUS_BYTES: usize = 16 * 1024;
 const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -42,7 +46,7 @@ const SERVICE_GID: u32 = 985;
 
 /// Units whose failure needs attention, in the retired console's order.
 const WATCHED_UNITS: [(&str, &str); 8] = [
-    ("tiaris-nest-first-boot.service", "First boot"),
+    ("tiaris-nest-first-boot.service", "Start-up checks"),
     ("tiaris-nest-network-runtime.service", "Network runtime"),
     ("tiaris-nest-firewall.service", "Firewall"),
     ("tiaris-nest.service", "Tiaris Nest service"),
@@ -300,7 +304,12 @@ impl ReadinessTracker {
                 contact.max(observation.observing_since)
             });
         let silent_seconds = (observation.now - reference).num_seconds();
-        if silent_seconds > TIARIS_UNREACHABLE_AFTER_SECONDS {
+        let allowed_silence = if observation.contacted_this_boot {
+            TIARIS_UNREACHABLE_AFTER_SECONDS
+        } else {
+            TIARIS_UNREACHABLE_AFTER_START_SECONDS
+        };
+        if silent_seconds > allowed_silence {
             self.reset();
             status.state = ConsoleState::Attention;
             status.attention = Some(unreachable_attention(observation, &name));
@@ -453,7 +462,7 @@ fn unreachable_attention(observation: &Observation, name: &str) -> Attention {
             let minutes = (observation.now - contact).num_minutes().max(0);
             (
                 format!(
-                    "Last contact was at {} UTC. Check the network connection on {interface}.",
+                    "Last contact was at {} UTC. Check the network connection on {interface}. Installing and updating computers waits until Tiaris answers.",
                     contact.format("%H:%M")
                 ),
                 format!("Unreachable · {}", format_minutes(minutes)),

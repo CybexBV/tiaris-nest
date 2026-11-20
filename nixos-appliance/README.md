@@ -285,7 +285,7 @@ envelope, or, with no usable envelope, STATE in partition 1 and the
 loading `\EFI\systemd\systemd-bootx64.efi` from that ESP's partition GUID)
 registers and shows the claim screen first: claimed, the new session runs the
 existing flow and the old STATE is a different session's; not claimed within
-10 minutes (from this boot's first claim screen, kept in
+3 minutes (from this boot's first claim screen, kept in
 `/run/tiaris-nest-claim/starts-installed-at` across service restarts, network
 or not, and started again when a claimed setup ends), it starts the installed
 Nest, with the envelope as the completed-install path does, without one by
@@ -333,9 +333,23 @@ incarnation. No manual disk wipe or automatic foreign-state resume is permitted.
 A completed same-media boot selects the exact installed EFI
 entry and reboots automatically, including when ISO remains attached.
 
-First boot checks protected ownership, mounted store/state, actual booted closure,
-identity and network, stages credential-free immutable iPXE/TFTP files and enables
-managed readiness. TFTP readiness verifies exact complete transfers; HTTP boot
+Every start runs the start-up checks (`tiaris-nest-first-boot.service`; the name
+is historical): protected ownership, mounted store/state, actual booted closure
+and identity, and staging the credential-free immutable iPXE/TFTP files. They read
+only the Nest's own disk. nginx, the boot file server, SSH and the Nest service
+require them, so a Nest restarted while the internet or Tiaris is unreachable (a
+power cut: the internet comes back last) still starts all of them. Reaching Tiaris
+is a fact the Nest reports, not a condition to start: `tiaris-nest-network-guard`
+(required by nothing) keeps the approved network when Tiaris answers on it, keeps
+the DHCP fallback when a fixed address does not reach Tiaris and DHCP does, and
+goes back to the approved network when Tiaris answers on neither. The Nest service
+then needs only an address on its interface (`tiaris-nest-network-runtime`, retried
+each minute). What needs Tiaris waits: network start is answered only with an
+inventory from Tiaris of the last five minutes, and installs, updates and builds
+need Tiaris. The screen says "can't reach Tiaris" two minutes after such a start.
+The running Nest also names its own UEFI entry as BootNext (`runtime/boot_next.py`),
+so a virtual machine that still has the Nest ISO attached starts the Nest, not
+the installer, at the next start. TFTP readiness verifies exact complete transfers; HTTP boot
 readiness uses the current local IPv4 origin. Administration stays in Tiaris.
 
 ## tty1 screens
@@ -386,7 +400,8 @@ file) every 15 seconds and after each accepted Tiaris report, schema
 `tiaris.nest-console-status.v1`. `state` is `attention` > `starting` >
 `healthy`: a failed watched unit is `service_failed` with its friendly name;
 Tiaris silence for more than ten minutes (measured from the later of the last
-contact and daemon start) is `tiaris_unreachable` with `since` the last contact;
+contact and daemon start; two minutes while this boot has not reached Tiaris
+at all) is `tiaris_unreachable` with `since` the last contact;
 six consecutive not-ready checks spanning 75 seconds is `not_ready`. Otherwise
 `starting` has `stage` `first_boot`, `enrolling` (no accepted Tiaris report this
 boot) or `services` (units, local PXE readiness and discovery not yet ready).

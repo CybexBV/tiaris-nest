@@ -189,18 +189,31 @@ in {
       after = [ "local-fs.target" "systemd-tmpfiles-setup.service" ]; unitConfig.DefaultDependencies = false;
       unitConfig.RequiresMountsFor = [ "/var/lib/tiaris-nest/control" ];
     };
+    # The start-up checks, at every start (the name is historical). They read
+    # only the Nest's own disk and never wait for the network or for Tiaris:
+    # nginx, the boot file server, SSH and the Nest service require this unit,
+    # and a Nest restarted during an internet fault must still start them.
     systemd.services.tiaris-nest-first-boot = (rootService "first-boot") // {
-      wantedBy = [ "multi-user.target" ]; after = [ "network-online.target" "sshd-keygen.service" "systemd-tmpfiles-setup.service" ];
+      wantedBy = [ "multi-user.target" ]; after = [ "sshd-keygen.service" "systemd-tmpfiles-setup.service" ];
       # sshd Requires= this unit, so a failed attempt fails sshd's start job for
       # the boot. The network-runtime timer retries this unit through Nest; pull
       # sshd into that transaction so recovery SSH starts once this succeeds.
-      wants = [ "network-online.target" "sshd.service" ];
+      wants = [ "sshd.service" ];
       requires = [ "sshd-keygen.service" ];
       before = [ "tiaris-nest.service" "nginx.service" "tftpd-hpa.service" ];
       unitConfig.RequiresMountsFor = [ "/var/lib/tiaris-nest/state" "/var/lib/tiaris-nest/control" "/var/lib/tiaris-nest/status" "/nix" ];
       environment.TIARIS_IPXE_SOURCE = toString ipxe;
       environment.TIARIS_HANDOFF_SOURCE = "${./autoexec.ipxe}";
       serviceConfig = { Type = "oneshot"; ExecStart = command "first-boot"; RemainAfterExit = true; TimeoutStartSec = "180s"; };
+    };
+    # Chooses the approved network or, for a fixed address that cannot reach
+    # Tiaris while DHCP can, the DHCP fallback. Nothing requires it: when
+    # Tiaris does not answer at all the approved network stays and the Nest
+    # service starts and reports the silence (runtime/tiaris-nest-network-guard).
+    systemd.services.tiaris-nest-network-guard = (rootService "network-guard") // {
+      wantedBy = [ "multi-user.target" ]; after = [ "tiaris-nest-first-boot.service" "network-online.target" ]; wants = [ "network-online.target" ];
+      before = [ "tiaris-nest-network-runtime.service" "tiaris-nest.service" ];
+      serviceConfig = { Type = "oneshot"; ExecStart = command "network-guard"; RemainAfterExit = true; TimeoutStartSec = "240s"; };
     };
     systemd.services.tiaris-nest-firewall = (rootService "firewall") // {
       wantedBy = [ "multi-user.target" ]; after = [ "tiaris-nest-first-boot.service" ]; before = [ "sshd.service" ];
@@ -211,8 +224,8 @@ in {
       serviceConfig = { ExecStart = "${pkgs.tftp-hpa}/bin/in.tftpd --foreground --listen --address 0.0.0.0:69 --user tftp --secure /var/cache/tiaris-nest/tftp"; Restart = "on-failure"; };
     };
     systemd.services.tiaris-nest = {
-      wantedBy = [ "multi-user.target" ]; after = [ "network-online.target" "tiaris-nest-first-boot.service" "tiaris-nest-network-runtime.service" "nginx.service" "tftpd-hpa.service" "nix-daemon.service" ];
-      requires = [ "tiaris-nest-first-boot.service" "tiaris-nest-network-runtime.service" ]; wants = [ "network-online.target" "nginx.service" "tftpd-hpa.service" "nix-daemon.service" ];
+      wantedBy = [ "multi-user.target" ]; after = [ "network-online.target" "tiaris-nest-first-boot.service" "tiaris-nest-network-guard.service" "tiaris-nest-network-runtime.service" "nginx.service" "tftpd-hpa.service" "nix-daemon.service" ];
+      requires = [ "tiaris-nest-first-boot.service" "tiaris-nest-network-runtime.service" ]; wants = [ "network-online.target" "tiaris-nest-network-guard.service" "nginx.service" "tftpd-hpa.service" "nix-daemon.service" ];
       environment = { HOME = "/var/cache/tiaris-nest/agent/home"; XDG_CACHE_HOME = "/var/cache/tiaris-nest/agent/cache"; XDG_CONFIG_HOME = "/var/cache/tiaris-nest/agent/config"; XDG_STATE_HOME = "/var/cache/tiaris-nest/agent/state"; TMPDIR = "/var/cache/tiaris-nest/agent/tmp"; NIX_USER_CONF_FILES = "/dev/null"; };
       # vulnix scans update candidates (src/software_updates/findings.rs); its
       # NVD database is cached in /var/lib/tiaris-nest/state/agent/vulnix.
@@ -235,7 +248,7 @@ in {
       wantedBy = [ "multi-user.target" ]; after = [ "network.target" ];
       serviceConfig = { ExecStart = command "time"; Restart = "always"; RestartSec = "5s"; DynamicUser = true; AmbientCapabilities = [ "CAP_NET_BIND_SERVICE" ]; CapabilityBoundingSet = [ "CAP_NET_BIND_SERVICE" ]; NoNewPrivileges = true; ProtectSystem = "strict"; ProtectHome = true; PrivateTmp = true; PrivateDevices = true; RestrictAddressFamilies = [ "AF_INET" "AF_UNIX" ]; MemoryMax = "64M"; };
     };
-    systemd.services.tiaris-nest-network-runtime = (rootService "network-runtime") // { after = [ "tiaris-nest-first-boot.service" "network-online.target" ]; wants = [ "network-online.target" ]; before = [ "tiaris-nest.service" ]; serviceConfig = { Type = "oneshot"; ExecStart = command "network-runtime"; TimeoutStartSec = "30s"; }; };
+    systemd.services.tiaris-nest-network-runtime = (rootService "network-runtime") // { after = [ "tiaris-nest-first-boot.service" "tiaris-nest-network-guard.service" "network-online.target" ]; wants = [ "network-online.target" ]; before = [ "tiaris-nest.service" ]; serviceConfig = { Type = "oneshot"; ExecStart = command "network-runtime"; TimeoutStartSec = "30s"; }; };
     systemd.timers.tiaris-nest-network-runtime = { wantedBy = [ "timers.target" ]; timerConfig = { OnBootSec = "1min"; OnUnitActiveSec = "1min"; }; };
     # Updates are prepared while the Nest serves computers: verification and
     # import yield CPU and disk to them (generation_update.prepare).

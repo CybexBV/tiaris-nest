@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Materialize only protected state and inspect the actually booted generation."""
+"""Start-up checks, at every start: materialize protected state and inspect the booted generation."""
 import hashlib
 import os
 from pathlib import Path
 import subprocess
 from appliance_state import CONTROL, STATUS, STATE, INBOX, UID, GID, current, directory, load, read, run, save, write
+from boot_next import start_from_this_disk_next_time
 from mount_policy import require_bind_mount, require_mount
 
 
@@ -55,13 +56,17 @@ def main():
     if not body.startswith(b'#!ipxe\n') or not 64 <= len(body) <= 4096:
         raise ValueError('invalid iPXE handoff')
     write(Path('/var/cache/tiaris-nest/tftp/autoexec.ipxe'), body, mode=0o644, group=0)
+    # Everything here reads the Nest's own disk. Nothing waits for the network
+    # or for Tiaris: nginx, the boot file server, SSH and the Nest service
+    # require this unit, and a Nest restarted without internet must start them.
+    # The network profile and the address follow in tiaris-nest-network-guard
+    # and tiaris-nest-network-runtime.
     run('/usr/lib/tiaris-nest/tiaris-nest-bootstrap', 'validate-installed-state')
-    run('/usr/lib/tiaris-nest/tiaris-nest-network-guard', timeout=120)
-    run('/usr/lib/tiaris-nest/tiaris-nest-bootstrap', 'reconcile-network-runtime')
     run('/usr/bin/tiaris-nest', '--config', '/etc/tiaris-nest/config.toml', 'validate-appliance-config')
     run('sshd', '-t')
     from generation_update import recover_boot
     recover_boot()
+    start_from_this_disk_next_time()
 
 
 if __name__ == '__main__':

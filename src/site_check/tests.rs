@@ -435,6 +435,24 @@ fn tempfile_dir() -> std::path::PathBuf {
 }
 
 #[test]
+fn the_software_cache_is_checked_only_where_manage_names_one() {
+    // Where the cache is off Manage sends no address; the built-in
+    // cache.tiaris.com used to be checked anyway and failed behind a filter.
+    assert_eq!(software_cache_target(&Targets::default()), None);
+    let on = Targets {
+        software_cache_url: Some("https://cache.tiaris.com/".into()),
+        ..Targets::default()
+    };
+    assert_eq!(
+        software_cache_target(&on),
+        Some((
+            "https://cache.tiaris.com".to_string(),
+            ("cache.tiaris.com".to_string(), 443)
+        ))
+    );
+}
+
+#[test]
 fn manage_targets_are_validated() {
     let targets = validate_targets(&json!({
         "requested_at": "2026-11-14T10:00:00Z",

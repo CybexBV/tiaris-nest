@@ -95,6 +95,8 @@ pub struct RuntimeSettings {
     pub public_base_url: String,
     pub bootloader_filename: String,
     pub menu_timeout_ms: u32,
+    /// The organization's language, for the network-start menu.
+    pub menu_language: boot::Language,
 }
 
 impl RuntimeSettings {
@@ -103,6 +105,7 @@ impl RuntimeSettings {
             public_base_url: config.public_base_url().to_string(),
             bootloader_filename: config.boot.bootloader_filename.clone(),
             menu_timeout_ms: config.boot.menu_timeout_ms,
+            menu_language: boot::Language::default(),
         }
     }
 }

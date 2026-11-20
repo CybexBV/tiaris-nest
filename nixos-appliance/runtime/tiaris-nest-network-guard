@@ -1,4 +1,13 @@
 #!/usr/bin/env bash
+# Chooses the Nest's network profile once per start. Reaching Tiaris is a
+# fact the Nest reports, never a condition to start: after a power cut the
+# school's internet comes back last, and the Nest must serve from what it has.
+#
+# - Tiaris answers on the approved profile: keep it.
+# - A fixed address that cannot reach Tiaris while DHCP can: the address is
+#   wrong for this network, so the DHCP fallback stays active (with its marker).
+# - Tiaris answers on neither: the internet is down, not the address. The
+#   approved profile goes back on and the Nest's services start with it.
 set -Eeuo pipefail
 umask 077
 
@@ -13,7 +22,8 @@ install -m 0600 "$approved" "$active"
 /usr/lib/tiaris-nest/tiaris-nest-netplan-activate
 stored_origin="$(jq -er '.manage_origin' "$control_dir/provisioning-state.json")"
 # The build's own origin for its own or its one legacy name (a Nest installed
-# for manage.cybex.net reaches manage.tiaris.com); any other origin fails boot.
+# for manage.cybex.net reaches manage.tiaris.com); any other origin is refused
+# (the start-up checks refuse it too: validate-installed-state).
 origin="$(/usr/lib/tiaris-nest/tiaris-nest-bootstrap effective-manage-origin "$stored_origin")"
 test -n "$origin"
 
@@ -34,7 +44,7 @@ management_reachable() {
 }
 
 if management_reachable 30; then
-  # The approved profile reaches Management again: DHCP recovery is over.
+  # The approved profile reaches Tiaris again: DHCP recovery is over.
   rm -f "$control_dir/network-fallback-active"
   sync -f "$control_dir"
   exit 0
@@ -42,21 +52,35 @@ fi
 
 dhcp4="$(jq -r '.network.ethernets["tiaris-nest"].dhcp4 | if type == "boolean" then tostring else error("invalid approved DHCP mode") end' "$approved")"
 if [[ "$dhcp4" != false ]]; then
-  echo "error: DHCP could not reach Tiaris" >&2
-  exit 1
+  # DHCP has no other profile to try. The approved profile stays.
+  rm -f "$control_dir/network-fallback-active"
+  sync -f "$control_dir"
+  echo "Tiaris does not answer; the Nest starts on its approved network" >&2
+  exit 0
 fi
+
 install -m 0600 "$fallback" "$active"
 /usr/lib/tiaris-nest/tiaris-nest-netplan-activate
-approved_sha256="$(sha256sum "$approved" | awk '{print $1}')"
-[[ "$approved_sha256" =~ ^[0-9a-f]{64}$ ]]
-marker="$(mktemp "$control_dir/.network-fallback-active.XXXXXX")"
-jq -n --arg approved_sha256 "$approved_sha256" \
-  '{schema:"tiaris.nest.network-fallback.v1",approved_sha256:$approved_sha256}' \
-  > "$marker"
-chmod 0600 "$marker"
-chown root:root "$marker"
-sync -f "$marker"
-mv -f "$marker" "$control_dir/network-fallback-active"
+if management_reachable 60; then
+  approved_sha256="$(sha256sum "$approved" | awk '{print $1}')"
+  [[ "$approved_sha256" =~ ^[0-9a-f]{64}$ ]]
+  marker="$(mktemp "$control_dir/.network-fallback-active.XXXXXX")"
+  jq -n --arg approved_sha256 "$approved_sha256" \
+    '{schema:"tiaris.nest.network-fallback.v1",approved_sha256:$approved_sha256}' \
+    > "$marker"
+  chmod 0600 "$marker"
+  chown root:root "$marker"
+  sync -f "$marker"
+  # DHCP is now the verified active recovery profile; keep its selector.
+  mv -f "$marker" "$control_dir/network-fallback-active"
+  sync -f "$control_dir"
+  echo "the fixed address does not reach Tiaris and DHCP does; the Nest starts on DHCP" >&2
+  exit 0
+fi
+
+# Neither profile reaches Tiaris: start on the approved one.
+install -m 0600 "$approved" "$active"
+/usr/lib/tiaris-nest/tiaris-nest-netplan-activate
+rm -f "$control_dir/network-fallback-active"
 sync -f "$control_dir"
-# DHCP is now the verified active recovery profile; keep its selector.
-management_reachable 60
+echo "Tiaris does not answer on the fixed address or on DHCP; the Nest starts on its approved network" >&2

@@ -10,7 +10,7 @@
 //!
 //! On a server that already holds an installed Nest the ISO is there to
 //! reinstall or recover it (or was left in): it shows the claim screen and
-//! starts the installed Nest only when nobody claims it within 10 minutes.
+//! starts the installed Nest only when nobody claims it within 3 minutes.
 //! A setup that Management closed before this run changed the disk always
 //! leads back to the claim screen with a new code.
 //!
@@ -54,8 +54,11 @@ const REGISTRATION_FILE: &str = "registration.json";
 const ENVELOPE_FILE: &str = "envelope.bin";
 const ORGANIZATION_FILE: &str = "organization";
 const STARTS_INSTALLED_FILE: &str = "starts-installed-at";
-/// How long a server that already runs a Nest waits for a new claim.
-const START_INSTALLED_AFTER_MINUTES: i64 = 10;
+/// How long a server that already runs a Nest waits for a new claim. Long
+/// enough to type the code when someone started the ISO on purpose, short for
+/// a restart that only found the ISO still attached (the running Nest names
+/// its own boot entry for the next start: nixos-appliance/runtime/boot_next.py).
+const START_INSTALLED_AFTER_MINUTES: i64 = 3;
 const LETTER_ALPHABET: &str = "ABCDEFGHJKMNPQRTVWXY";
 const MAX_HARDWARE_CHARS: usize = 80;
 const MAX_TEXT_CHARS: usize = 200;
@@ -421,7 +424,7 @@ fn installed_boot_entry() -> Option<PathBuf> {
     }
 }
 
-/// Offer the claim until the 10-minute deadline, then start the installed
+/// Offer the claim until the deadline, then start the installed
 /// Nest with `start`. `None` once it is starting. When it cannot be started
 /// the claim screen stays, without a deadline.
 pub(super) async fn claim_installed<Started>(
@@ -1390,7 +1393,7 @@ impl RunStore {
     }
 
     /// A claimed setup ended: forget it, and the claim screen that returns
-    /// gives an installed Nest its full 10 minutes again.
+    /// gives an installed Nest its full wait again.
     pub(super) fn forget_claimed(&self) -> Result<()> {
         self.remove(&[
             ENVELOPE_FILE,
