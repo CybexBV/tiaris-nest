@@ -2,8 +2,9 @@
 """One GitHub repository may have more than one name.
 
 The owner renamed `CybexHQ/james` to `CybexHQ/tiaris-nest` and
-`CybexHQ/development` to `CybexHQ/tiaris` (2026-11-15); new records and URLs
-spell the new (`current`) names. GitHub redirects the old names, but
+`CybexHQ/development` to `CybexHQ/tiaris` (2026-11-15), and moved both from
+the account `CybexHQ` to the organization `CybexBV` (2026-11-20); new records
+and URLs spell the new (`current`) names. GitHub redirects the old names, but
 after a rename its API and `GITHUB_REPOSITORY` report the new one, while
 signed, immutable releases keep the URLs they were published under. Code that
 compares repository names or GitHub URLs must therefore treat every name of a

@@ -29,14 +29,17 @@ def load(name, path):
 
 R = load('github_repositories_under_test', TOOL)
 P = load('rename_release_predecessor', ROOT / 'nixos-appliance/qualification/release_predecessor.py')
-OLD, NEW = 'CybexHQ/james', 'CybexHQ/tiaris-nest'
-OLD_TIARIS, NEW_TIARIS = 'CybexHQ/development', 'CybexHQ/tiaris'
-UNRELATED = ('CybexHQ/manage', 'CybexHQ/james-extra', 'other/james', 'cybexhq/james', 'CybexHQ', '', None)
+OLD, NEW = 'CybexHQ/james', 'CybexBV/tiaris-nest'
+OLD_TIARIS, NEW_TIARIS = 'CybexHQ/development', 'CybexBV/tiaris'
+# Before the move to the CybexBV organization (2026-11-20).
+RENAMED, RENAMED_TIARIS = 'CybexHQ/tiaris-nest', 'CybexHQ/tiaris'
+UNRELATED = ('CybexHQ/manage', 'CybexBV/manage', 'CybexHQ/james-extra', 'other/james', 'other/tiaris-nest',
+             'cybexhq/james', 'CybexHQ', '', None)
 
 
 class NamesTests(unittest.TestCase):
     def test_both_names_of_each_repository_are_the_same_repository(self):
-        for old, new in ((OLD, NEW), (OLD_TIARIS, NEW_TIARIS)):
+        for old, new in ((OLD, NEW), (OLD_TIARIS, NEW_TIARIS), (RENAMED, NEW), (RENAMED_TIARIS, NEW_TIARIS)):
             for left, right in ((old, new), (new, old), (old, old), (new, new)):
                 with self.subTest(left=left, right=right):
                     self.assertTrue(R.same_repository(left, right))
@@ -56,8 +59,8 @@ class NamesTests(unittest.TestCase):
         data = json.loads((ROOT / 'release/github-repositories.json').read_text())
         for role in ('nest', 'tiaris'):
             self.assertIn(data[role]['current'], data[role]['names'])
-        self.assertEqual(set(R.NEST_NAMES), {OLD, NEW})
-        self.assertEqual(set(R.TIARIS_NAMES), {OLD_TIARIS, NEW_TIARIS})
+        self.assertEqual(set(R.NEST_NAMES), {OLD, RENAMED, NEW})
+        self.assertEqual(set(R.TIARIS_NAMES), {OLD_TIARIS, RENAMED_TIARIS, NEW_TIARIS})
 
     def test_old_name_signed_url_matches_the_url_derived_from_the_new_name(self):
         signed = f'https://github.com/{OLD}/releases/download/v0.2.99/tiaris-nest-release.json'

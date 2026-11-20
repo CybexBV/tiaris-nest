@@ -1,11 +1,11 @@
 {
-  "about": "GitHub names of the Nest and Tiaris repositories. `current` is the name new records and URLs use; `names` lists every name that is the same repository. A rename adds the new name to `names` and later moves `current`; a name is never removed, because signed, immutable releases keep the name they were published under. Read by tools/github_repositories.py (Python and workflow shell) and release/workstation-netboot.nix.",
+  "about": "GitHub names of the Nest and Tiaris repositories. `current` is the name new records and URLs use; `names` lists every name that is the same repository. A rename or a move to another owner (CybexHQ to CybexBV, 2026-11-20) adds the new name to `names` and later moves `current` (only names GitHub ever used); a name is never removed, because signed, immutable releases keep the name they were published under. Read by tools/github_repositories.py (Python and workflow shell) and release/workstation-netboot.nix.",
   "nest": {
-    "current": "CybexHQ/tiaris-nest",
-    "names": ["CybexHQ/james", "CybexHQ/tiaris-nest"]
+    "current": "CybexBV/tiaris-nest",
+    "names": ["CybexHQ/james", "CybexHQ/tiaris-nest", "CybexBV/tiaris-nest"]
   },
   "tiaris": {
-    "current": "CybexHQ/tiaris",
-    "names": ["CybexHQ/development", "CybexHQ/tiaris"]
+    "current": "CybexBV/tiaris",
+    "names": ["CybexHQ/development", "CybexHQ/tiaris", "CybexBV/tiaris"]
   }
 }

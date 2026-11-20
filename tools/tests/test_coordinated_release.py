@@ -272,7 +272,7 @@ class CoordinatedReleaseTests(unittest.TestCase):
                 self.assertIn('version = "' + candidate + '"', (root / 'Cargo.toml').read_text())
                 self.assertIn('version = "' + candidate + '"', (root / 'Cargo.lock').read_text())
                 pin = json.loads((root / 'release/workstation-netboot-source.json').read_text())
-                self.assertEqual(pin, {'repository': 'CybexHQ/tiaris', 'revision': 'a' * 40,
+                self.assertEqual(pin, {'repository': 'CybexBV/tiaris', 'revision': 'a' * 40,
                                        'runtime_version': '1.0.108'})
 
     def test_development_candidate_rejects_other_prereleases_and_non_advancing_versions(self):
@@ -325,7 +325,7 @@ class CoordinatedReleaseTests(unittest.TestCase):
         # Either name of the Tiaris repository (release/github-repositories.json).
         self.assertIn('assert builtins.elem sourcePin.repository tiarisNames;', expression)
         names = json.loads((ROOT / 'release/github-repositories.json').read_text())['tiaris']['names']
-        self.assertEqual(set(names), {'CybexHQ/development', 'CybexHQ/tiaris'})
+        self.assertEqual(set(names), {'CybexHQ/development', 'CybexHQ/tiaris', 'CybexBV/tiaris'})
         self.assertNotIn('CybexHQ/manage', expression)
 
     def test_pins_development_and_requires_explicit_promotion(self):
@@ -341,7 +341,7 @@ class CoordinatedReleaseTests(unittest.TestCase):
             self.assertEqual(marker['appliance_family'], 'nixos')
             self.assertNotIn('ubuntu_snapshot_id', marker)
             pin = root / 'release/workstation-netboot-source.json'
-            self.assertEqual(json.loads(pin.read_text())['repository'], 'CybexHQ/tiaris')
+            self.assertEqual(json.loads(pin.read_text())['repository'], 'CybexBV/tiaris')
             self.assertIn('version = "0.2.6"', (root / 'Cargo.lock').read_text())
             pin.write_text(pin.read_text().replace('a' * 40, 'b' * 40))
             with self.assertRaises(ValueError):
