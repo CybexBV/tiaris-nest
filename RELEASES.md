@@ -308,7 +308,7 @@ admits only the newly reserved fixture ID.
 
 Acceptance binds closure, toplevel, generation, source, permanent identity and
 observed reboot. Rollback must be appliance-initiated; a host reset never counts.
-UEFI uses Secure Boot off. Network acknowledgement, real recovery SSH login and
+UEFI uses Secure Boot off. Real recovery SSH login and
 root/password rejection, source-free Standard/Dock/Dock-fixture preparation, real PXE
 installation and managed workstation reboot/compliance remain required. Private
 serial logs and secrets are never publication evidence.

@@ -543,28 +543,6 @@ if [[ "$builtins_deliverable" != true ]]; then
 fi
 fi
 
-network_change="$work_dir/network-change.json"
-network_body="$(jq -cn --arg interface "$interface_id" \
-  '{network:{mode:"dhcp",interface_id:$interface,address_cidr:null,gateway:null,dns_servers:[]}}')"
-api POST "/v1/nest/nodes/$device_id/network-changes" "$network_body" > "$network_change"
-network_change_id="$(jq -er '.id' "$network_change")"
-test "$(jq -er '.state' "$network_change")" = requested
-network_acknowledged=false
-for _attempt in $(seq 1 120); do
-  api GET '/v1/nest/nodes?limit=100&offset=0' > "$nodes"
-  jq -e --arg device "$device_id" '.nodes[] | select(.device_id == $device)' "$nodes" > "$node"
-  reported_change_id="$(jq -r '.appliance_network.network_change.change_id // ""' "$node")"
-  reported_change_status="$(jq -r '.appliance_network.network_change.status // "idle"' "$node")"
-  if [[ "$reported_change_id" = "$network_change_id" && "$reported_change_status" = acknowledged ]]; then
-    network_acknowledged=true
-    break
-  fi
-  [[ "$reported_change_status" != failed && "$reported_change_status" != rolled_back ]]
-  kill -0 "$qemu_pid"
-  sleep 5
-done
-test "$network_acknowledged" = true
-
 ssh-keygen -q -t ed25519 -N '' -C qualification -f "$work_dir/operator-key"
 certificate_response="$work_dir/ssh-certificate.json"
 certificate_request="$(jq -cn \
@@ -663,7 +641,7 @@ jq -n \
     builtin_blueprints_deliverable:$builtins_deliverable,
     builtin_blueprints_qualified_on_new_nest:$builtins_deliverable,
     builtin_blueprints_prepublication_deferred:$workstation_runtime_prepublication_deferred,
-    two_phase_network_acknowledged:true,exact_principal_ssh_certificate:true,
+    exact_principal_ssh_certificate:true,
     ssh_login_verified:true,ssh_root_rejected:true,ssh_password_rejected:true,
     final_state:"ready",completed_at:$completed_at}' \
   > "$output"

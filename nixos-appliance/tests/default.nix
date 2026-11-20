@@ -79,7 +79,6 @@
       machine.fail("systemctl is-active tiaris-nest.service")
       machine.fail("systemctl is-active sshd.service")
       machine.succeed("test -f /usr/share/tiaris-nest/system-identity.json")
-      machine.succeed("test ! -L /etc/tiaris-nest/pxe-discovery.json && test $(stat -c %h /etc/tiaris-nest/pxe-discovery.json) = 1")
       machine.succeed("test $(stat -c %a /usr/share/tiaris-nest/manage-source) = 755")
       machine.succeed("test $(stat -c %h /usr/share/tiaris-nest/manage-source/*.tar) = 1")
       machine.succeed("mkdir -p /run/nginx /var/log/nginx")

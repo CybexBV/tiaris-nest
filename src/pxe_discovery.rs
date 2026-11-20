@@ -101,10 +101,7 @@ fn read_status(path: &Path, now: i64) -> Option<Value> {
         return None;
     }
     let status = value.get("status")?.as_str()?;
-    if !matches!(
-        status,
-        "active" | "standby" | "external" | "starting" | "unavailable"
-    ) {
+    if !matches!(status, "active" | "unavailable") {
         return None;
     }
     let reason = value.get("reason")?.as_str()?;
@@ -113,7 +110,7 @@ fn read_status(path: &Path, now: i64) -> Option<Value> {
     }
     Some(json!({"status":status,"reason":reason,
         "identity": value.get("identity").and_then(Value::as_str).filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())),
-        "operational":matches!(status,"active"|"standby"),
+        "operational":status == "active",
         "eligible":value.get("eligible").and_then(Value::as_bool).unwrap_or(false)}))
 }
 

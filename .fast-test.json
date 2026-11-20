@@ -15,6 +15,14 @@
       "timeout": 30
     },
     {
+      "name": "rust-clippy",
+      "about": "The release's Clippy command (release/beast/release-gates.sh), so a dead function left by a removal fails here and not in a release. The registered container may lack Clippy; the step adds it.",
+      "when": ["*.rs", "Cargo.toml", "Cargo.lock"],
+      "where": "beast",
+      "run": "rustup component add clippy >/dev/null 2>&1; cargo clippy --locked --all-targets --all-features -- -D warnings",
+      "timeout": 30
+    },
+    {
       "name": "rust-integration",
       "about": "A changed integration test file, on The Beast.",
       "when": ["tests/*.rs"],
@@ -37,10 +45,10 @@
   ],
   "wide": ["Cargo.toml", "Cargo.lock", "build.rs", "rust-toolchain.toml", "migrations/**", "src/lib.rs", "src/main.rs", "src/error.rs", "src/config.rs", "src/db.rs", "src/models.rs", "tests/fixtures/**"],
   "wideIfDeleted": ["src/**", "tests/**"],
-  "full": "cargo fmt --all --check && cargo test --locked && env -u CI python3 -B -m unittest discover -s nixos-appliance/tests && python3 -B -m unittest discover -s tools/tests",
+  "full": "cargo fmt --all --check && { rustup component add clippy >/dev/null 2>&1; cargo clippy --locked --all-targets --all-features -- -D warnings; } && cargo test --locked && env -u CI python3 -B -m unittest discover -s nixos-appliance/tests && python3 -B -m unittest discover -s tools/tests",
   "beast": {
     "image": "docker.io/library/rust:1.85.0-bookworm",
-    "prepare": "apt-get update -qq && apt-get install -y -qq --no-install-recommends jq zstd ripgrep >/dev/null && rustup component add rustfmt",
+    "prepare": "apt-get update -qq && apt-get install -y -qq --no-install-recommends jq zstd ripgrep >/dev/null && rustup component add rustfmt clippy",
     "network": "internet",
     "caches": ["cargo-target"]
   }

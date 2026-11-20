@@ -176,6 +176,26 @@ pub fn verify_stored() -> Result<PathBuf> {
     Ok(PathBuf::from(CONTROL))
 }
 
+/// The time zone of the schedule root verified (`verify_stored`): the
+/// organization's. `None` before the first schedule arrived.
+pub fn timezone() -> Option<chrono_tz::Tz> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::symlink_metadata(CONTROL).ok()?;
+    if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+        return None;
+    }
+    let bytes =
+        crate::provisioning::read_bounded_nofollow(Path::new(CONTROL), 64 * 1024, "schedule")
+            .ok()?;
+    timezone_of(&bytes)
+}
+
+fn timezone_of(bytes: &[u8]) -> Option<chrono_tz::Tz> {
+    let policy: SignedPolicy =
+        serde_json::from_value(super::release_v3::strict_json(bytes).ok()?).ok()?;
+    policy.schedule.timezone.parse().ok()
+}
+
 fn validate_transition(previous: &SignedPolicy, incoming: &SignedPolicy) -> Result<()> {
     ensure!(
         incoming.device_incarnation_id == previous.device_incarnation_id
@@ -195,10 +215,7 @@ mod tests {
     use ed25519_dalek::Signer;
     #[test]
     fn signed_schedule_binds_session_incarnation_revision_and_closure() {
-        let (value, envelope, _, key) = crate::provisioning::protocol::tests::signed_plan_fixture(
-            "tiaris.nest.install-plan.v1",
-            "TIARIS-NEST-INSTALL-PLAN-V1",
-        );
+        let (value, envelope, _, key) = crate::provisioning::protocol::tests::signed_plan_fixture();
         let state = crate::provisioning::DurableProvisioningState {
             schema: "tiaris.nest.provisioning-state.v1".into(),
             session_id: envelope.session_id,
@@ -285,6 +302,28 @@ mod tests {
             serde_json::from_value(serde_json::to_value(&idle).unwrap()).unwrap();
         assert_eq!(parsed.mode, Some(Mode::WhenIdle));
         assert_eq!(serde_json::to_value(Mode::WhenIdle).unwrap(), "when_idle");
+    }
+
+    #[test]
+    fn the_time_zone_comes_from_a_when_idle_policy() {
+        let policy = SignedPolicy {
+            schema: SCHEMA_V2.into(),
+            device_id: "nest-1".into(),
+            device_incarnation_id: Uuid::from_bytes([8; 16]),
+            provisioning_session_id: Uuid::from_bytes([7; 16]),
+            revision: 3,
+            mode: Some(Mode::WhenIdle),
+            schedule: Schedule {
+                timezone: "Europe/Amsterdam".into(),
+                weekdays: vec![0, 1, 2, 3, 4, 5, 6],
+                start: "02:00".into(),
+                duration_minutes: 240,
+            },
+            run_now: None,
+            signature: "signature".into(),
+        };
+        let bytes = serde_json::to_vec(&policy).unwrap();
+        assert_eq!(timezone_of(&bytes), Some(chrono_tz::Europe::Amsterdam));
     }
 
     fn sign(policy: &mut SignedPolicy, key: &ed25519_dalek::SigningKey) {

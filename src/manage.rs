@@ -223,8 +223,6 @@ struct AgentNestConfigResponse {
     #[serde(default)]
     update_schedule: Option<Value>,
     #[serde(default)]
-    network_change: Option<crate::appliance::SignedApplianceNetworkChange>,
-    #[serde(default)]
     workstation_netboot: Option<Value>,
     #[serde(default)]
     wake_on_lan: Vec<crate::wake_on_lan::ManagedWakeRequest>,
@@ -838,13 +836,6 @@ async fn sync_once_with_outcome(state: &AppState) -> Result<SyncOnceReport> {
     require_activated_identity(&managed)?;
 
     let mut first_failure = None;
-    if let Err(error) = acknowledge_pending_appliance_network_change(state, &managed).await {
-        retain_sync_failure(
-            &mut first_failure,
-            "appliance network acknowledgement",
-            error,
-        );
-    }
     if let Err(error) = sync_boot_foundation(state, &mut managed).await {
         retain_sync_failure(&mut first_failure, "boot configuration and report", error);
     }
@@ -1318,9 +1309,6 @@ async fn apply_nest_desired(
             debug!("coalesced the latest appliance update behind the in-flight download");
         }
     }
-    if let Err(error) = crate::appliance::store_network_change(desired.network_change) {
-        retain_sync_failure(first_failure, "appliance network desired state", error);
-    }
 
     let build_count_valid = desired.build_jobs.len() <= MAX_MANAGED_BUILD_JOBS;
     if !build_count_valid {
@@ -1460,32 +1448,6 @@ async fn apply_nest_desired(
             Err(error) => retain_sync_failure(first_failure, "managed cache retention", error),
         }
     }
-}
-
-async fn acknowledge_pending_appliance_network_change(
-    state: &AppState,
-    managed: &ManagedState,
-) -> Result<()> {
-    let Some(pending) = crate::appliance::pending_network_acknowledgement()? else {
-        return Ok(());
-    };
-    let device_id = managed_device_id(managed)?;
-    let path = format!(
-        "/v1/agent/devices/{device_id}/nest/network-changes/{}/acknowledge",
-        pending.change_id
-    );
-    let body = serde_json::to_vec(&json!({
-        "candidate_sha256": pending.candidate_sha256,
-    }))?;
-    let response = signed_request(state, managed, Method::POST, &path, body)
-        .await?
-        .header(CONTENT_TYPE, "application/json")
-        .send()
-        .await
-        .context("acknowledge applied appliance network candidate")?;
-    let acknowledgement: crate::appliance::SignedApplianceNetworkAcknowledgement =
-        parse_success_json(response, "acknowledge appliance network candidate").await?;
-    crate::appliance::accept_network_acknowledgement(&acknowledgement)
 }
 
 async fn fetch_nest_config(
@@ -6633,59 +6595,38 @@ mod tests {
 
     #[test]
     fn appliance_update_transport_override_is_optional_wire_data() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../protocol/fixtures/nest-appliance-v3.json"))
+                .unwrap();
         let update = json!({
             "attempt_id": "d4a17ec8-e854-4bc4-84c7-e490f51640c3",
             "requested_at": "2026-08-12T12:00:00Z",
-            "release": {
-                "schema": "tiaris.nest.appliance-release.v1",
-                "release_id": "0.2.1-dev.13",
-                "ubuntu_snapshot_id": "20260813T120000Z",
-                "tiaris_repository_snapshot": {
-                    "url": "https://releases.example/tiaris-nest-appliance-packages-0.2.1-dev.13-x86_64-linux.tar.zst",
-                    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                    "size_bytes": 1024
-                },
-                "required_package_versions": {},
-                "expected_kernel": "7.0.0-1",
-                "minimum_protocol": 4,
-                "minimum_state_schema": 2,
-                "rollback_compatible": true,
-                "release_notes": "https://releases.example/notes",
-                "signature": "signature"
-            }
+            "release": fixture["appliance_release"].clone(),
         });
 
-        let legacy: AgentNestConfigResponse =
+        let ordinary: AgentNestConfigResponse =
             serde_json::from_value(json!({"appliance_update": update.clone()})).unwrap();
         assert_eq!(
-            legacy
+            ordinary
                 .appliance_update
                 .unwrap()
                 .qualification_package_transport_url,
             None
         );
 
+        let transport = "http://127.0.0.1:18080/closure.tar.zst";
         let mut qualified = update;
-        qualified["qualification_package_transport_url"] = json!(
-            "http://127.0.0.1:18080/tiaris-nest-appliance-packages-0.2.1-dev.13-x86_64-linux.tar.zst"
-        );
+        qualified["qualification_package_transport_url"] = json!(transport);
         let current: AgentNestConfigResponse =
             serde_json::from_value(json!({"appliance_update": qualified})).unwrap();
         let current = current.appliance_update.unwrap();
         assert_eq!(
             current.qualification_package_transport_url.as_deref(),
-            Some(
-                "http://127.0.0.1:18080/tiaris-nest-appliance-packages-0.2.1-dev.13-x86_64-linux.tar.zst"
-            )
+            Some(transport)
         );
         assert_eq!(
-            current
-                .release
-                .legacy()
-                .unwrap()
-                .tiaris_repository_snapshot
-                .url,
-            "https://releases.example/tiaris-nest-appliance-packages-0.2.1-dev.13-x86_64-linux.tar.zst"
+            current.release.nixos().unwrap().release_id,
+            fixture["appliance_release"]["release_id"].as_str().unwrap()
         );
     }
 
