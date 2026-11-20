@@ -38,6 +38,9 @@ const MAX_STEPS: usize = 3;
 const REVIEW_AND_RETRY: &str = "In Tiaris, open Nest and choose Review and try again.";
 const RESTART_SAME_ISO: &str = "Restart this server from the same ISO.";
 const UNTOUCHED: &str = "Nothing was written to the disk.";
+/// How the Disk row ends for a disk left out of the inventory because it has
+/// no serial number (`NestProvisioningInventory::disks_without_serial`).
+const NO_SERIAL: &str = " · no serial number";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -421,7 +424,15 @@ pub(super) fn inventory_checks(
         None => Check::new(
             CheckId::Disk,
             CheckState::Error,
-            format!("No eligible disk · needs {}", format_memory(MIN_DISK_BYTES)),
+            match inventory.disks_without_serial.first() {
+                // Name the disk and the cause: "no eligible disk" would send
+                // the administrator looking for a larger disk.
+                Some(path) => format!(
+                    "{}{NO_SERIAL}",
+                    bounded(path, MAX_VALUE_CHARS - NO_SERIAL.chars().count())
+                ),
+                None => format!("No eligible disk · needs {}", format_memory(MIN_DISK_BYTES)),
+            },
         ),
     });
     checks.push(Check::new(CheckId::Tiaris, tiaris.0, tiaris.1));
@@ -666,6 +677,13 @@ pub(super) fn hardware_stop(checks: &[Check]) -> Option<StopDetail> {
                     None => "Connect this server to a wired network.".to_string(),
                 },
                 "Setup continues automatically once the link is up.".into(),
+            ],
+        ),
+        CheckId::Disk if failing.value.ends_with(NO_SERIAL) => (
+            "This server's disk has no serial number, so Tiaris Nest cannot be sure which disk it would erase.",
+            vec![
+                "In the virtual machine's settings, attach the disk as SCSI or SATA instead of VirtIO Block, or give it a serial number.".into(),
+                RESTART_SAME_ISO.into(),
             ],
         ),
         CheckId::Disk => (

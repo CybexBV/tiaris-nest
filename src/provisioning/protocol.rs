@@ -1183,6 +1183,7 @@ pub(crate) mod tests {
             virtualization: "kvm".to_string(),
             ethernet_interfaces: vec![interface.clone()],
             disks: vec![disk.clone()],
+            disks_without_serial: Vec::new(),
         };
         let provisioning_fingerprint = sha256_hex(
             derive_provisioning_key(&media_secret)

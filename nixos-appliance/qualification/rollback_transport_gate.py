@@ -2,7 +2,7 @@
 
 The predecessor keeps normal transport until its next zero-source DHCP request.
 That packet atomically activates the gate and records kernel reception time.
-The candidate's first HTTPS connection lets first-boot's network guard finish;
+The candidate's first HTTPS connection lets the network guard finish;
 later contact fails. DHCP retransmissions never reopen the consumed allowance.
 """
 import datetime

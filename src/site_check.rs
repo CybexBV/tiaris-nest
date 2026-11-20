@@ -10,11 +10,14 @@
 //!   information, and computers do not keep asking without receiving the
 //!   answer (a switch DHCP guard). The privileged PXE supervisor gathers this
 //!   (`nixos-appliance/runtime/site_probe.py`); this service only reads it.
-//! - `dns`: Manage, the software cache and the directory hosts resolve.
+//! - `dns`: Manage, the software cache (where it is on) and the directory
+//!   hosts resolve.
 //! - `time`: the clock is synchronized; when not, whether NTP is blocked.
 //! - `manage`, `software_cache`: HTTPS with a trusted certificate. A
 //!   certificate from an unknown authority is named by its issuer: that is
-//!   HTTPS interception.
+//!   HTTPS interception. The software cache is checked only where Manage
+//!   names one (`site_check.software_cache_url`): where it is off, computers
+//!   never use that host and the check is `not_applicable`.
 //! - `directory`: LDAPS with a certificate computers trust, when the
 //!   organization signs in with a directory.
 //!
@@ -51,7 +54,6 @@ use evaluate::{BootProbe, PxeStatus};
 
 pub const CAPABILITY: &str = "site_check_v1";
 pub const REPORT_SCHEMA: &str = "tiaris.nest.site-check.v1";
-pub const DEFAULT_SOFTWARE_CACHE_URL: &str = "https://cache.tiaris.com";
 const STATE_FILE: &str = "site-check.json";
 const STATE_SCHEMA: &str = "tiaris.nest.site-check-state.v1";
 const MAX_STATE_BYTES: u64 = 256 * 1024;
@@ -354,6 +356,19 @@ fn endpoint(url: &str) -> Option<(String, u16)> {
     Some((host, parsed.port_or_known_default()?))
 }
 
+/// The software cache to check, as its URL and endpoint: only where Manage
+/// names one. Where the cache is off Manage sends no address, computers never
+/// use the host, and a school that filters it must not get a failed check.
+fn software_cache_target(targets: &Targets) -> Option<(String, (String, u16))> {
+    let url = targets
+        .software_cache_url
+        .as_deref()?
+        .trim_end_matches('/')
+        .to_string();
+    let target = endpoint(&url)?;
+    Some((url, target))
+}
+
 /// Runs every check once.
 pub(crate) async fn check(
     state: &AppState,
@@ -369,20 +384,20 @@ pub(crate) async fn check(
         .trim_end_matches('/')
         .to_string();
     let manage = endpoint(&api_url);
-    let cache_url = targets
-        .software_cache_url
-        .clone()
-        .unwrap_or_else(|| DEFAULT_SOFTWARE_CACHE_URL.to_string());
-    let cache_url = cache_url.trim_end_matches('/').to_string();
-    let cache = endpoint(&cache_url);
+    let cache = software_cache_target(&targets);
 
     let mut hosts: Vec<(String, u16)> = Vec::new();
-    for (host, port) in manage.iter().chain(cache.iter()).cloned().chain(
-        targets
-            .directories
-            .iter()
-            .map(|directory| (directory.host.clone(), directory.port)),
-    ) {
+    for (host, port) in manage
+        .iter()
+        .chain(cache.iter().map(|(_, target)| target))
+        .cloned()
+        .chain(
+            targets
+                .directories
+                .iter()
+                .map(|directory| (directory.host.clone(), directory.port)),
+        )
+    {
         if !hosts.iter().any(|(known, _)| *known == host) {
             hosts.push((host, port));
         }
@@ -411,7 +426,7 @@ pub(crate) async fn check(
     };
     let cache_probe = async {
         match &cache {
-            Some((host, port)) => Some((
+            Some((cache_url, (host, port))) => Some((
                 probes::tls(host.clone(), *port, None).await,
                 probes::http_get(&format!("{cache_url}/nix-cache-info"), "StoreDir:").await,
             )),
@@ -454,13 +469,13 @@ pub(crate) async fn check(
         },
     };
     let cache_check = match (&cache, &cache_probe) {
-        (Some((host, _)), Some((tls, http))) => {
+        (Some((_, (host, _))), Some((tls, http))) => {
             evaluate::software_cache(host, tls, http.as_ref(), clock)
         }
         _ => Check {
             id: CheckId::SoftwareCache,
-            status: Status::CouldNotCheck,
-            reason: "software_cache_not_configured".into(),
+            status: Status::NotApplicable,
+            reason: "software_cache_off".into(),
             detail: String::new(),
             remedy: String::new(),
         },

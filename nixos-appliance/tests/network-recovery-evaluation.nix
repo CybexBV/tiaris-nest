@@ -20,5 +20,13 @@ let
     networkRuntimeCanRetryWithoutNest = !(builtins.elem "tiaris-nest.service" networkRuntime.requires);
     networkRetryTimerRemainsEnabled = builtins.elem "timers.target"
       installed.systemd.timers.tiaris-nest-network-runtime.wantedBy;
+    # A Nest restarted without internet starts its services: the start-up
+    # checks do not wait for the network, and nothing requires the one unit
+    # that asks Tiaris.
+    startUpChecksDoNotWaitForTheNetwork =
+      !(builtins.elem "network-online.target" (firstBoot.after ++ firstBoot.wants));
+    nothingRequiresTheNetworkGuard = builtins.all
+      (unit: !(builtins.elem "tiaris-nest-network-guard.service" (unit.requires or [ ])))
+      (builtins.attrValues installed.systemd.services);
   };
 in assert builtins.all (value: value) (builtins.attrValues checks); checks
