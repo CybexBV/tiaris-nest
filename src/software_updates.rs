@@ -588,7 +588,7 @@ async fn run(state: AppState) {
     }
     loop {
         let timezone = crate::appliance::nixos::is_nixos()
-            .then(crate::appliance::update_schedule::timezone)
+            .then(crate::appliance::schedule::timezone)
             .flatten()
             .unwrap_or(chrono_tz::UTC);
         let now = Utc::now();

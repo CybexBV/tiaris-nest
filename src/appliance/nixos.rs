@@ -59,50 +59,39 @@ pub fn is_nixos() -> bool {
     Path::new(IDENTITY_PATH).is_file()
 }
 pub fn queue(update: super::ManagedApplianceUpdate<ReleaseDescriptor>) -> bool {
-    match update.release {
-        ReleaseDescriptor::Legacy(release) => {
-            super::queue_update_request(super::ManagedApplianceUpdate {
-                release,
-                attempt_id: update.attempt_id,
-                requested_at: update.requested_at,
-                qualification_package_transport_url: update.qualification_package_transport_url,
-            })
-        }
-        ReleaseDescriptor::Nixos(release) => {
-            let Ok(mut state) = QUEUE.lock() else {
-                return false;
-            };
-            state.1 = Some(super::ManagedApplianceUpdate {
-                release,
-                attempt_id: update.attempt_id,
-                requested_at: update.requested_at,
-                qualification_package_transport_url: update.qualification_package_transport_url,
-            });
-            if state.0 {
-                return false;
-            }
-            state.0 = true;
-            drop(state);
-            tokio::spawn(async {
-                loop {
-                    let update = {
-                        let Ok(mut s) = QUEUE.lock() else { return };
-                        match s.1.take() {
-                            Some(v) => v,
-                            None => {
-                                s.0 = false;
-                                return;
-                            }
-                        }
-                    };
-                    if let Err(error) = store(update).await {
-                        tracing::warn!(error=%error,"NixOS appliance update staging failed");
+    let ReleaseDescriptor::Nixos(release) = update.release;
+    let Ok(mut state) = QUEUE.lock() else {
+        return false;
+    };
+    state.1 = Some(super::ManagedApplianceUpdate {
+        release,
+        attempt_id: update.attempt_id,
+        requested_at: update.requested_at,
+        qualification_package_transport_url: update.qualification_package_transport_url,
+    });
+    if state.0 {
+        return false;
+    }
+    state.0 = true;
+    drop(state);
+    tokio::spawn(async {
+        loop {
+            let update = {
+                let Ok(mut s) = QUEUE.lock() else { return };
+                match s.1.take() {
+                    Some(v) => v,
+                    None => {
+                        s.0 = false;
+                        return;
                     }
                 }
-            });
-            true
+            };
+            if let Err(error) = store(update).await {
+                tracing::warn!(error=%error,"NixOS appliance update staging failed");
+            }
         }
-    }
+    });
+    true
 }
 fn read_installed() -> Result<InstalledState> {
     let bytes = crate::provisioning::read_bounded_nofollow(
@@ -765,13 +754,11 @@ pub async fn report(state: &crate::AppState) -> Result<super::ApplianceReport> {
     ] {
         fields.insert(k.to_string(), v);
     }
-    let network = json!({"interfaces":super::command_json("ip",&["-j","address","show"]).await,"network_fallback_active":crate::provisioning::network_fallback_active().unwrap_or(true),"network_change":super::read_optional_bounded_json::<Value>(Path::new(super::NETWORK_CHANGE_STATUS_PATH),64*1024).unwrap_or_else(||json!({"status":"idle"}))});
+    let network = json!({"interfaces":super::command_json("ip",&["-j","address","show"]).await,"network_fallback_active":crate::provisioning::network_fallback_active().unwrap_or(true)});
     Ok(super::ApplianceReport {
         base_os: "nixos".into(),
         base_os_version: release.base_os_version.clone(),
         appliance_release: release.release_id.clone(),
-        ubuntu_snapshot_id: None,
-        root_generation: None,
         kernel_version: super::command_text("uname", &["-r"]).await,
         secure_boot: observed_secure_boot(),
         boot_mode: if Path::new("/sys/firmware/efi").is_dir() {

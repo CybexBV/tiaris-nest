@@ -41,11 +41,6 @@ fn network_boot_passes_when_the_answer_is_served() {
     let check = boot(Some(&pxe("active", "proxy_ready")), Some(&probe(json!({}))));
     assert_eq!(outcome(&check), (Status::Pass, "boot_answer_served"));
     assert!(check.remedy.is_empty());
-    let standby = boot(
-        Some(&pxe("standby", "peer_responder_active")),
-        Some(&probe(json!({}))),
-    );
-    assert_eq!(outcome(&standby), (Status::Pass, "peer_answers"));
 }
 
 #[test]
@@ -88,17 +83,6 @@ fn network_boot_without_evidence_is_not_a_pass() {
     );
     assert_eq!(outcome(&down), (Status::Fail, "boot_service_unavailable"));
     assert_eq!(down.detail, "inventory_stale");
-    assert_eq!(
-        outcome(&boot(
-            Some(&pxe("external", "external_dhcp_selected")),
-            None
-        )),
-        (Status::NotApplicable, "external_pxe")
-    );
-    assert_eq!(
-        outcome(&boot(Some(&pxe("starting", "electing_responder")), None)),
-        (Status::CouldNotCheck, "boot_service_starting")
-    );
     let active = pxe("active", "proxy_ready");
     assert_eq!(
         outcome(&boot(Some(&active), None)),

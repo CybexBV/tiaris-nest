@@ -16,7 +16,7 @@ _origins_spec.loader.exec_module(production_origins)
 LIFECYCLE_FLAGS = (
     'ok', 'no_disk_write_before_approval', 'identity_rotation',
     'installed_media_left_attached', 'appliance_projection_healthy',
-    'two_phase_network_acknowledged', 'exact_principal_ssh_certificate',
+    'exact_principal_ssh_certificate',
 )
 DELIVERY_FLAGS = (
     'workstation_runtime_operational', 'workstation_runtime_converged',

@@ -412,7 +412,7 @@ immutable system identity (`system`). `active_installs` counts distinct
 workstations that started the installer in the last ten minutes. The kiosk treats
 a status older than 90 seconds as stale attention.
 
-## Services and network changes
+## Services and network
 
 The NixOS module provides unprivileged Nest, sandboxed Nix daemon, nginx IPv4
 listener, immutable TFTP root, dnsmasq ProxyDHCP supervisor,
@@ -420,31 +420,21 @@ certificate-only OpenSSH, atomic management-CIDR SSH nftables policy, watchdog,
 time synchronization, bounded journald and coordinated daily GC. Nest has private
 HOME/XDG/TMP leaves and no Linux capabilities or Nix trusted-user status.
 
-PXE keeps authenticated complete/fresh inventory, same-link peer MAC checks,
-responder election, per-device placement and external-PXE mode. It never assigns
-DHCP addresses. Workstation netboot/runtime import, signed binary cache and
+PXE keeps authenticated complete/fresh inventory and per-device placement: the
+site's one Nest answers new computers and the computers assigned to it. It never
+assigns DHCP addresses. Workstation netboot/runtime import, signed binary cache and
 Blueprint builds are the existing product paths.
 
 Networkd renders STATE's approved deterministic network JSON before startup.
-A protected `network-committed.json` stores the exact signed change and
-acknowledgement identities. Recurring boot validation rechecks that durable
-authority and repairs derived approved/fallback configuration after an interrupted
-write. The original install plan remains immutable. An error before the new
-receipt is committed restores the previous network; a failure after the exact
-durable receipt preserves it for recovery.
-Historical `netplan-*.json` filenames and candidate hashing are preserved, while
+The network is the one the install plan approved; recurring boot validation
+rechecks it against that immutable plan. Changing it after install is not
+offered. Historical `netplan-*.json` filenames and candidate hashing are preserved, while
 Netplan itself is absent. Render `/run/systemd/network/10-tiaris-nest.network`
 0640 root:systemd-network, match the approved MAC/name, reload/reconfigure, then
 verify networkd selected that exact file and obtained the intended address.
 
-A signed change writes its protected prior-plan backup and candidate digest
-before activation. Commit only after the exact signed device/change/digest
-acknowledgement within 120 seconds. Timeout or failure restores the previous
-network; failed restoration is `network_rollback_failed`, never a successful
-rollback. On reboot unacknowledged changes restore the approved plan. Power loss
-after acknowledged approved-plan rename resumes receipt cleanup without replaying
-an expired change. Preserve approved-static DHCP recovery tied to the exact
-approved digest and runtime advertised-origin reconciliation.
+Preserve approved-static DHCP recovery tied to the exact approved digest and
+runtime advertised-origin reconciliation.
 
 CA keys, exact device principal and CIDRs live in STATE and rematerialize on every
 generation. SSH permits only locked `tiaris-support`, disables root/password/
@@ -541,8 +531,7 @@ Required real scenarios: generic-ISO claim, install/identity/Ready; untouched di
 on preflight failure and same-media retry; interrupted install resume; workstation
 PXE/runtime/install/adoption/Blueprint; window and Update now updates,
 holds/schedules and retention; failing-service, failed-health and nonbooting
-candidate rollback; power-cut receipt recovery; acknowledged and timed-out network
-changes; certificate-only SSH/CIDR isolation; existing-device recovery/decommission;
+candidate rollback; power-cut receipt recovery; certificate-only SSH/CIDR isolation; existing-device recovery/decommission;
 recorded V2 reinstall-required/cancelled-update fixture. Test archive and signature
 corruption, traversal/duplicates/links/size bounds, inode replacement, migration
 mismatch and Nix untrusted-user/store policy.
