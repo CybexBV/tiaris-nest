@@ -5,7 +5,6 @@
 //! that installed identity.
 
 mod inventory;
-mod network_receipt;
 mod network_runtime;
 mod nixos_install;
 mod packages;
@@ -208,26 +207,14 @@ pub fn validate_legacy_state_promotion(
     config_path: &Path,
     provisioning_keys_path: &Path,
 ) -> Result<()> {
-    validate_installed_state_inner(state_mount, config_path, provisioning_keys_path, false)
+    validate_installed_state(state_mount, config_path, provisioning_keys_path)
 }
 
-/// Recurring NixOS boot verification also accepts an authenticated network
-/// transaction committed after installation, independently of legacy migration.
+/// Recurring NixOS boot verification of the installed identity and network.
 pub fn validate_installed_state(
     state_mount: &Path,
     config_path: &Path,
     provisioning_keys_path: &Path,
-) -> Result<()> {
-    validate_installed_state_inner(state_mount, config_path, provisioning_keys_path, true)
-}
-
-pub use network_receipt::{commit_network_change, verify_committed_network_change};
-
-fn validate_installed_state_inner(
-    state_mount: &Path,
-    config_path: &Path,
-    provisioning_keys_path: &Path,
-    allow_network_changes: bool,
 ) -> Result<()> {
     let control = Path::new("/var/lib/tiaris-nest/control");
     let agent = if Path::new("/etc/tiaris-nest/legacy-state-layout").is_file() {
@@ -325,21 +312,13 @@ fn validate_installed_state_inner(
         bail!("promoted Nest agent identity is inconsistent")
     }
 
-    let committed_network =
-        allow_network_changes && control.join("network-committed.json").try_exists()?;
-    if committed_network {
-        network_receipt::restore_approved(control, &durable, None)?;
-    } else {
-        let approved: serde_json::Value = serde_json::from_slice(&read_bounded_nofollow(
-            &control.join("netplan-approved.json"),
-            1024 * 1024,
-            "promoted approved Netplan",
-        )?)?;
-        if approved != storage::netplan(&plan.network, &plan) {
-            bail!(
-                "approved Netplan is not derived from authenticated installation or committed network authority"
-            )
-        }
+    let approved: serde_json::Value = serde_json::from_slice(&read_bounded_nofollow(
+        &control.join("netplan-approved.json"),
+        1024 * 1024,
+        "promoted approved Netplan",
+    )?)?;
+    if approved != storage::netplan(&plan.network, &plan) {
+        bail!("approved Netplan is not derived from the authenticated installation")
     }
     let fallback_plan = protocol::NestProvisioningNetworkPlan {
         mode: "dhcp".to_string(),
@@ -353,7 +332,7 @@ fn validate_installed_state_inner(
         1024 * 1024,
         "promoted fallback Netplan",
     )?)?;
-    if !committed_network && fallback != storage::netplan(&fallback_plan, &plan) {
+    if fallback != storage::netplan(&fallback_plan, &plan) {
         bail!("promoted fallback Netplan is not derived from the authenticated plan")
     }
     let cidrs = read_bounded_nofollow(

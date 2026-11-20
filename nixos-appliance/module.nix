@@ -237,8 +237,6 @@ in {
     };
     systemd.services.tiaris-nest-network-runtime = (rootService "network-runtime") // { after = [ "tiaris-nest-first-boot.service" "network-online.target" ]; wants = [ "network-online.target" ]; before = [ "tiaris-nest.service" ]; serviceConfig = { Type = "oneshot"; ExecStart = command "network-runtime"; TimeoutStartSec = "30s"; }; };
     systemd.timers.tiaris-nest-network-runtime = { wantedBy = [ "timers.target" ]; timerConfig = { OnBootSec = "1min"; OnUnitActiveSec = "1min"; }; };
-    systemd.services.tiaris-nest-network-change = (rootService "network-change") // { after = [ "tiaris-nest.service" ]; serviceConfig = { Type = "oneshot"; ExecStart = command "network-change"; TimeoutStartSec = "5min"; }; };
-    systemd.paths.tiaris-nest-network-change = { wantedBy = [ "multi-user.target" ]; pathConfig.PathExists = "/var/lib/tiaris-nest/state/inbox/appliance-network-change-request.json"; };
     # Updates are prepared while the Nest serves computers: verification and
     # import yield CPU and disk to them (generation_update.prepare).
     systemd.services.tiaris-nest-appliance-update = (rootService "appliance-update") // { after = [ "tiaris-nest.service" ]; serviceConfig = { Type = "oneshot"; ExecStart = command "appliance-update"; TimeoutStartSec = "4h"; Nice = 10; IOSchedulingClass = "best-effort"; IOSchedulingPriority = 7; }; };

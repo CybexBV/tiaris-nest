@@ -46,36 +46,6 @@ async fn main() -> anyhow::Result<()> {
         println!("{}", packages.display());
         return Ok(());
     }
-    if matches!(command, Command::VerifyApplianceNetworkChange) {
-        #[cfg(unix)]
-        if effective_uid() != 0 {
-            anyhow::bail!("appliance network verification must run as root");
-        }
-        let candidate = tiaris_nest::appliance::verify_and_materialize_network_change()?;
-        println!("{}", candidate.display());
-        return Ok(());
-    }
-    if matches!(command, Command::VerifyApplianceNetworkChangeRecovery) {
-        #[cfg(unix)]
-        if effective_uid() != 0 {
-            anyhow::bail!("appliance network recovery verification must run as root");
-        }
-        let candidate = tiaris_nest::appliance::verify_and_materialize_network_change_recovery()?;
-        println!("{}", candidate.display());
-        return Ok(());
-    }
-    if matches!(command, Command::VerifyApplianceNetworkAcknowledgement) {
-        #[cfg(unix)]
-        if effective_uid() != 0 {
-            anyhow::bail!("appliance network acknowledgement verification must run as root");
-        }
-        println!(
-            "{}",
-            tiaris_nest::appliance::verify_stored_network_acknowledgement()?
-        );
-        return Ok(());
-    }
-
     let config = tiaris_nest::config::AppConfig::load(&cli.config)
         .with_context(|| format!("failed to load config from {}", cli.config.display()))?;
 
@@ -134,17 +104,6 @@ async fn main() -> anyhow::Result<()> {
         Command::VerifyApplianceUpdate => {
             unreachable!("appliance update verification exits before config loading")
         }
-        Command::VerifyApplianceNetworkChange => {
-            unreachable!("appliance network verification exits before config loading")
-        }
-        Command::VerifyApplianceNetworkChangeRecovery => {
-            unreachable!("appliance network recovery exits before config loading")
-        }
-        Command::VerifyApplianceNetworkAcknowledgement => {
-            unreachable!(
-                "appliance network acknowledgement verification exits before config loading"
-            )
-        }
     }
 }
 
@@ -177,9 +136,6 @@ fn managed_command_requires_service_user(
                 | Command::VerifyApplianceUpdatePolicy
                 | Command::VerifyApplianceDatabase { .. }
                 | Command::RehearseApplianceDatabase { .. }
-                | Command::VerifyApplianceNetworkChange
-                | Command::VerifyApplianceNetworkChangeRecovery
-                | Command::VerifyApplianceNetworkAcknowledgement
         )
 }
 

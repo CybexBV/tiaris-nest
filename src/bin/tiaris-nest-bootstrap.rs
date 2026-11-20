@@ -3,9 +3,8 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tiaris_nest::provisioning::{
     LEGACY_MANAGE_ORIGIN, MAX_ENVELOPE_VALIDITY_HOURS, NetworkRuntimeOptions, PrepareOptions,
-    REQUIRED_MANAGE_ORIGIN, SETUP_CLAIM_PROTOCOL, SETUP_STATUS_PATH, commit_network_change,
-    effective_manage_origin, prepare, reconcile_network_runtime, validate_installed_state,
-    validate_legacy_state_promotion, verify_committed_network_change,
+    REQUIRED_MANAGE_ORIGIN, SETUP_CLAIM_PROTOCOL, SETUP_STATUS_PATH, effective_manage_origin,
+    prepare, reconcile_network_runtime, validate_installed_state, validate_legacy_state_promotion,
 };
 
 #[derive(Debug, Parser)]
@@ -69,19 +68,6 @@ enum Command {
             default_value = "/usr/share/tiaris-nest/provisioning-public-keys"
         )]
         provisioning_keys: PathBuf,
-    },
-    /// Durably retain exact signed network change and acknowledgement evidence.
-    CommitNetworkChange {
-        #[arg(long)]
-        candidate: PathBuf,
-    },
-    /// Recover an already committed network transaction without fresh authority.
-    VerifyCommittedNetworkChange {
-        #[arg(long)]
-        change_id: uuid::Uuid,
-        /// Authenticate the durable receipt without repairing derived profiles.
-        #[arg(long)]
-        no_repair: bool,
     },
     /// Authenticate a dev.3 flat state migration against installed trust anchors.
     ValidateLegacyStatePromotion {
@@ -159,22 +145,6 @@ async fn main() -> Result<()> {
         } => {
             require_root()?;
             validate_installed_state(&state_mount, &config, &provisioning_keys)
-        }
-        Command::CommitNetworkChange { candidate } => {
-            require_root()?;
-            println!("{}", commit_network_change(&candidate)?);
-            Ok(())
-        }
-        Command::VerifyCommittedNetworkChange {
-            change_id,
-            no_repair,
-        } => {
-            require_root()?;
-            println!(
-                "{}",
-                verify_committed_network_change(change_id, !no_repair)?
-            );
-            Ok(())
         }
         Command::ValidateLegacyStatePromotion {
             state_mount,

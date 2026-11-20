@@ -754,7 +754,7 @@ pub async fn report(state: &crate::AppState) -> Result<super::ApplianceReport> {
     ] {
         fields.insert(k.to_string(), v);
     }
-    let network = json!({"interfaces":super::command_json("ip",&["-j","address","show"]).await,"network_fallback_active":crate::provisioning::network_fallback_active().unwrap_or(true),"network_change":super::read_optional_bounded_json::<Value>(Path::new(super::NETWORK_CHANGE_STATUS_PATH),64*1024).unwrap_or_else(||json!({"status":"idle"}))});
+    let network = json!({"interfaces":super::command_json("ip",&["-j","address","show"]).await,"network_fallback_active":crate::provisioning::network_fallback_active().unwrap_or(true)});
     Ok(super::ApplianceReport {
         base_os: "nixos".into(),
         base_os_version: release.base_os_version.clone(),

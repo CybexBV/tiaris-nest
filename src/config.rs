@@ -61,12 +61,6 @@ pub enum Command {
         #[arg(long)]
         output: PathBuf,
     },
-    /// Re-verify and materialize the currently staged signed Netplan change.
-    VerifyApplianceNetworkChange,
-    /// Re-derive a signed Netplan candidate for idempotent post-crash recovery.
-    VerifyApplianceNetworkChangeRecovery,
-    /// Re-verify the complete signed Management acknowledgement for Netplan.
-    VerifyApplianceNetworkAcknowledgement,
     SyncOnce,
     PrintConfig,
 }

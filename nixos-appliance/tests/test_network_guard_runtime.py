@@ -36,8 +36,7 @@ class NetworkGuardRuntimeTests(unittest.TestCase):
         (control / 'netplan-dhcp-fallback.json').write_text(json.dumps(fixture_plan(True)))
         (control / 'install-plan.json').write_text('{}')
         (control / 'provisioning-state.json').write_text(json.dumps({'manage_origin': stored_origin}))
-        for name in ('network-fallback-active', 'netplan-pending.sha256', 'netplan-before-change.yaml'):
-            (control / name).write_text('stale recovery evidence')
+        (control / 'network-fallback-active').write_text('stale recovery evidence')
 
         def helper(name, body):
             path = binaries / name
@@ -105,7 +104,7 @@ shutil.copyfile(*paths)
         result = self.guard(dhcp4=True, approved_failures=-1,
                             replacements={'management_reachable 30': 'management_reachable 3'})
         self.assertEqual(result.process.returncode, 1, result.process.stderr)
-        self.assertIn('DHCP could not reach Tiarisment', result.process.stderr)
+        self.assertIn('DHCP could not reach Tiaris', result.process.stderr)
         self.assertGreaterEqual(result.log.count('curl 1'), 2)
         self.assertNotIn('curl 2', result.log)
         self.assertLess(result.elapsed, 10)
@@ -121,10 +120,8 @@ shutil.copyfile(*paths)
         marker = json.loads((result.control / 'network-fallback-active').read_text())
         self.assertEqual(marker['schema'], 'tiaris.nest.network-fallback.v1')
         self.assertEqual(json.loads((result.netplan / '90-tiaris-nest.yaml').read_text()), fixture_plan(True))
-        self.assertFalse((result.control / 'netplan-pending.sha256').exists())
-        self.assertFalse((result.control / 'netplan-before-change.yaml').exists())
 
-    def test_failed_static_and_dhcp_profiles_preserve_recovery_evidence(self):
+    def test_failed_static_and_dhcp_profiles_keep_the_dhcp_fallback(self):
         result = self.guard(dhcp4=False, approved_failures=-1, fallback_failures=-1,
                             replacements={'management_reachable 30': 'management_reachable 2',
                                           'management_reachable 60': 'management_reachable 2'})
@@ -136,16 +133,13 @@ shutil.copyfile(*paths)
         self.assertEqual(json.loads((result.netplan / '90-tiaris-nest.yaml').read_text()), fixture_plan(True))
         marker = json.loads((result.control / 'network-fallback-active').read_text())
         self.assertEqual(marker['schema'], 'tiaris.nest.network-fallback.v1')
-        for name in ('netplan-pending.sha256', 'netplan-before-change.yaml'):
-            self.assertEqual((result.control / name).read_text(), 'stale recovery evidence')
 
     def test_successful_static_retry_does_not_replace_the_approved_profile_with_dhcp(self):
         result = self.guard(dhcp4=False, approved_failures=1)
         self.assertEqual(result.process.returncode, 0, result.process.stderr)
         self.assertEqual(result.log, ['activated', 'curl 1', 'curl 1'])
         self.assertEqual(json.loads((result.netplan / '90-tiaris-nest.yaml').read_text()), fixture_plan(False))
-        for name in ('network-fallback-active', 'netplan-pending.sha256', 'netplan-before-change.yaml'):
-            self.assertFalse((result.control / name).exists())
+        self.assertFalse((result.control / 'network-fallback-active').exists())
 
     def test_legacy_recorded_origin_probes_the_build_origin(self):
         # A Nest installed for manage.cybex.net boots a manage.tiaris.com build.

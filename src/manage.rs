@@ -219,8 +219,6 @@ struct AgentNestConfigResponse {
     #[serde(default)]
     update_schedule: Option<Value>,
     #[serde(default)]
-    network_change: Option<crate::appliance::SignedApplianceNetworkChange>,
-    #[serde(default)]
     workstation_netboot: Option<Value>,
     #[serde(default)]
     wake_on_lan: Vec<crate::wake_on_lan::ManagedWakeRequest>,
@@ -834,13 +832,6 @@ async fn sync_once_with_outcome(state: &AppState) -> Result<SyncOnceReport> {
     require_activated_identity(&managed)?;
 
     let mut first_failure = None;
-    if let Err(error) = acknowledge_pending_appliance_network_change(state, &managed).await {
-        retain_sync_failure(
-            &mut first_failure,
-            "appliance network acknowledgement",
-            error,
-        );
-    }
     if let Err(error) = sync_boot_foundation(state, &mut managed).await {
         retain_sync_failure(&mut first_failure, "boot configuration and report", error);
     }
@@ -1314,9 +1305,6 @@ async fn apply_nest_desired(
             debug!("coalesced the latest appliance update behind the in-flight download");
         }
     }
-    if let Err(error) = crate::appliance::store_network_change(desired.network_change) {
-        retain_sync_failure(first_failure, "appliance network desired state", error);
-    }
 
     let build_count_valid = desired.build_jobs.len() <= MAX_MANAGED_BUILD_JOBS;
     if !build_count_valid {
@@ -1456,32 +1444,6 @@ async fn apply_nest_desired(
             Err(error) => retain_sync_failure(first_failure, "managed cache retention", error),
         }
     }
-}
-
-async fn acknowledge_pending_appliance_network_change(
-    state: &AppState,
-    managed: &ManagedState,
-) -> Result<()> {
-    let Some(pending) = crate::appliance::pending_network_acknowledgement()? else {
-        return Ok(());
-    };
-    let device_id = managed_device_id(managed)?;
-    let path = format!(
-        "/v1/agent/devices/{device_id}/nest/network-changes/{}/acknowledge",
-        pending.change_id
-    );
-    let body = serde_json::to_vec(&json!({
-        "candidate_sha256": pending.candidate_sha256,
-    }))?;
-    let response = signed_request(state, managed, Method::POST, &path, body)
-        .await?
-        .header(CONTENT_TYPE, "application/json")
-        .send()
-        .await
-        .context("acknowledge applied appliance network candidate")?;
-    let acknowledgement: crate::appliance::SignedApplianceNetworkAcknowledgement =
-        parse_success_json(response, "acknowledge appliance network candidate").await?;
-    crate::appliance::accept_network_acknowledgement(&acknowledgement)
 }
 
 async fn fetch_nest_config(

@@ -21,7 +21,7 @@ use std::{
     io::{Read, Write},
     net::IpAddr,
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
-    path::{Path, PathBuf},
+    path::Path,
 };
 use tokio::process::Command;
 
@@ -36,14 +36,6 @@ const UPDATE_REQUEST_PATH: &str = "/var/lib/tiaris-nest/state/inbox/appliance-up
 const UPDATE_ROOT: &str = "/var/lib/tiaris-nest/control/appliance-updates";
 const RELEASE_PUBLIC_KEY_PATH: &str = "/usr/share/tiaris-nest/release-public-key";
 const PROVISIONING_STATE_PATH: &str = "/var/lib/tiaris-nest/control/provisioning-state.json";
-const NETWORK_CHANGE_REQUEST_PATH: &str =
-    "/var/lib/tiaris-nest/state/inbox/appliance-network-change-request.json";
-const NETWORK_CHANGE_STATUS_PATH: &str =
-    "/var/lib/tiaris-nest/status/appliance-network-change-status.json";
-const NETWORK_PENDING_PATH: &str = "/var/lib/tiaris-nest/control/netplan-pending.sha256";
-const NETWORK_ACK_PATH: &str = "/var/lib/tiaris-nest/state/inbox/netplan-acknowledgement.json";
-const NETWORK_CHANGE_SIGNATURE_DOMAIN: &str = "TIARIS-NEST-NETWORK-CHANGE-V1";
-const NETWORK_ACK_SIGNATURE_DOMAIN: &str = "TIARIS-NEST-NETWORK-ACK-V1";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -63,50 +55,6 @@ pub struct ManagedApplianceUpdate<R> {
     /// The signed release URL remains the artifact identity and production path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub qualification_package_transport_url: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ApplianceNetworkInput {
-    pub mode: String,
-    pub interface_id: String,
-    pub address_cidr: Option<String>,
-    pub gateway: Option<String>,
-    #[serde(default)]
-    pub dns_servers: Vec<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SignedApplianceNetworkChange {
-    pub schema: String,
-    pub id: uuid::Uuid,
-    pub device_id: String,
-    pub device_incarnation_id: uuid::Uuid,
-    pub revision: i64,
-    pub network: ApplianceNetworkInput,
-    pub config_sha256: String,
-    pub issued_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
-    pub signature: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SignedApplianceNetworkAcknowledgement {
-    pub schema: String,
-    pub change_id: uuid::Uuid,
-    pub device_id: String,
-    pub candidate_sha256: String,
-    pub issued_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
-    pub signature: String,
-}
-
-#[derive(Clone, Debug)]
-pub struct PendingApplianceNetworkAcknowledgement {
-    pub change_id: uuid::Uuid,
-    pub candidate_sha256: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -353,224 +301,6 @@ fn canonical_json(value: Value) -> Value {
     }
 }
 
-fn require_sha256(value: &str) -> Result<()> {
-    if value.len() != 64
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-    {
-        bail!("appliance package SHA-256 is invalid")
-    }
-    Ok(())
-}
-
-pub fn store_network_change(change: Option<SignedApplianceNetworkChange>) -> Result<()> {
-    let Some(change) = change else {
-        return Ok(());
-    };
-    if !is_managed_appliance() {
-        bail!("received an appliance network change on a non-appliance Nest host")
-    }
-    validate_network_change(&change, false)?;
-    if read_optional_bounded_json::<Value>(Path::new(NETWORK_CHANGE_STATUS_PATH), 64 * 1024)
-        .is_some_and(|status| {
-            status.get("change_id").and_then(Value::as_str) == Some(change.id.to_string().as_str())
-                && matches!(
-                    status.get("status").and_then(Value::as_str),
-                    Some("acknowledged" | "rolled_back" | "failed")
-                )
-        })
-    {
-        return Ok(());
-    }
-    if let Some(existing) = read_optional_bounded_json::<SignedApplianceNetworkChange>(
-        Path::new(NETWORK_CHANGE_REQUEST_PATH),
-        128 * 1024,
-    ) {
-        if existing.id == change.id && existing.signature == change.signature {
-            return Ok(());
-        }
-        bail!("another appliance network change is already durable")
-    }
-    // The root network-change service creates status after re-verifying this
-    // signed request. Status remains read-only to Nest.
-    write_atomic_json(Path::new(NETWORK_CHANGE_REQUEST_PATH), &change, 0o600)
-}
-
-pub fn verify_and_materialize_network_change() -> Result<PathBuf> {
-    verify_and_materialize_network_change_with_policy(false)
-}
-
-/// Re-derive an already root-committed candidate after a crash. Expiry and
-/// live-link/DAD checks are intentionally skipped only for exact byte
-/// comparison with the protected approved plan; this command never applies a
-/// network change by itself.
-pub fn verify_and_materialize_network_change_recovery() -> Result<PathBuf> {
-    verify_and_materialize_network_change_with_policy(true)
-}
-
-fn verify_and_materialize_network_change_with_policy(recovery: bool) -> Result<PathBuf> {
-    let change: SignedApplianceNetworkChange =
-        read_bounded_json(Path::new(NETWORK_CHANGE_REQUEST_PATH), 128 * 1024)?;
-    validate_network_change(&change, recovery)?;
-    let (interface_name, mac) = resolve_wired_interface(&change.network.interface_id)?;
-    if !recovery
-        && fs::read_to_string(format!("/sys/class/net/{interface_name}/operstate"))
-            .unwrap_or_default()
-            .trim()
-            != "up"
-    {
-        bail!("managed wired interface has no link")
-    }
-    if !recovery && change.network.mode == "static" {
-        let address = change
-            .network
-            .address_cidr
-            .as_deref()
-            .and_then(|value| value.split('/').next())
-            .ok_or_else(|| anyhow!("static network address is missing"))?;
-        let status = std::process::Command::new("arping")
-            .args(["-D", "-q", "-c", "2", "-I", &interface_name, address])
-            .status()
-            .context("run network duplicate-address detection")?;
-        if !status.success() {
-            bail!("static network address is already in use")
-        }
-    }
-    let mut device = serde_json::Map::new();
-    device.insert("match".to_string(), json!({"macaddress":mac}));
-    device.insert("set-name".to_string(), json!(interface_name));
-    device.insert("dhcp6".to_string(), json!(false));
-    if change.network.mode == "dhcp" {
-        device.insert("dhcp4".to_string(), json!(true));
-    } else {
-        device.insert("dhcp4".to_string(), json!(false));
-        device.insert(
-            "addresses".to_string(),
-            json!([change.network.address_cidr]),
-        );
-        device.insert(
-            "routes".to_string(),
-            json!([{"to":"default","via":change.network.gateway}]),
-        );
-        device.insert(
-            "nameservers".to_string(),
-            json!({"addresses":change.network.dns_servers}),
-        );
-    }
-    let candidate = canonical_json(json!({
-        "network": {
-            "version": 2,
-            "renderer": "networkd",
-            "ethernets": {"tiaris-nest": Value::Object(device)},
-        }
-    }));
-    let output_root = Path::new("/run/tiaris-nest-network-change");
-    fs::create_dir_all(output_root)?;
-    fs::set_permissions(output_root, fs::Permissions::from_mode(0o700))?;
-    let output = output_root.join(format!("{}.yaml", change.id));
-    write_atomic_json(&output, &candidate, 0o600)?;
-    Ok(output)
-}
-
-pub fn pending_network_acknowledgement() -> Result<Option<PendingApplianceNetworkAcknowledgement>> {
-    if !Path::new(NETWORK_CHANGE_REQUEST_PATH).is_file()
-        || !Path::new(NETWORK_PENDING_PATH).is_file()
-    {
-        return Ok(None);
-    }
-    let change: SignedApplianceNetworkChange =
-        read_bounded_json(Path::new(NETWORK_CHANGE_REQUEST_PATH), 128 * 1024)?;
-    validate_network_change(&change, false)?;
-    let candidate_sha256 = fs::read_to_string(NETWORK_PENDING_PATH)?;
-    let candidate_sha256 = candidate_sha256
-        .strip_suffix('\n')
-        .ok_or_else(|| anyhow!("pending Netplan hash is not canonical"))?
-        .to_string();
-    require_sha256(&candidate_sha256)?;
-    Ok(Some(PendingApplianceNetworkAcknowledgement {
-        change_id: change.id,
-        candidate_sha256,
-    }))
-}
-
-pub fn accept_network_acknowledgement(
-    acknowledgement: &SignedApplianceNetworkAcknowledgement,
-) -> Result<()> {
-    validate_network_acknowledgement(acknowledgement)?;
-    // Persist the complete signed acknowledgement. A bare candidate hash is
-    // not an authorization boundary: root re-verifies this exact object just
-    // before promoting the candidate.
-    write_atomic_json(Path::new(NETWORK_ACK_PATH), acknowledgement, 0o600)
-}
-
-pub fn verify_stored_network_acknowledgement() -> Result<String> {
-    let acknowledgement: SignedApplianceNetworkAcknowledgement =
-        read_bounded_json(Path::new(NETWORK_ACK_PATH), 128 * 1024)?;
-    validate_network_acknowledgement(&acknowledgement)?;
-    Ok(acknowledgement.candidate_sha256)
-}
-
-fn validate_network_acknowledgement(
-    acknowledgement: &SignedApplianceNetworkAcknowledgement,
-) -> Result<()> {
-    let change: SignedApplianceNetworkChange =
-        read_bounded_json(Path::new(NETWORK_CHANGE_REQUEST_PATH), 128 * 1024)?;
-    validate_network_change(&change, false)?;
-    let state = load_provisioning_state()?;
-    let pending = pending_network_acknowledgement()?
-        .ok_or_else(|| anyhow!("no Netplan candidate is awaiting acknowledgement"))?;
-    if acknowledgement.schema != "tiaris.nest.network-ack.v1"
-        || acknowledgement.change_id != change.id
-        || acknowledgement.change_id != pending.change_id
-        || acknowledgement.device_id != state.plan.reserved_device_id
-        || acknowledgement.candidate_sha256 != pending.candidate_sha256
-        || acknowledgement.expires_at <= Utc::now()
-        || acknowledgement.expires_at <= acknowledgement.issued_at
-        || acknowledgement.expires_at - acknowledgement.issued_at > chrono::Duration::minutes(2)
-    {
-        bail!("Management network acknowledgement does not match the pending candidate")
-    }
-    require_sha256(&acknowledgement.candidate_sha256)?;
-    verify_management_signature(
-        acknowledgement,
-        "signature",
-        &acknowledgement.signature,
-        NETWORK_ACK_SIGNATURE_DOMAIN,
-        &state.management_signing_public_key_b64,
-    )
-}
-
-fn validate_network_change(
-    change: &SignedApplianceNetworkChange,
-    allow_expired: bool,
-) -> Result<()> {
-    let state = load_provisioning_state()?;
-    if change.schema != "tiaris.nest.network-change.v1"
-        || change.id.is_nil()
-        || change.device_incarnation_id.is_nil()
-        || change.device_id != state.plan.reserved_device_id
-        || change.revision <= 0
-        || (!allow_expired && change.expires_at <= Utc::now())
-        || change.expires_at <= change.issued_at
-        || change.expires_at - change.issued_at > chrono::Duration::minutes(5)
-    {
-        bail!("appliance network change contract is invalid")
-    }
-    validate_network_input(&change.network)?;
-    let network = canonical_json(serde_json::to_value(&change.network)?);
-    if hex::encode(Sha256::digest(serde_json::to_vec(&network)?)) != change.config_sha256 {
-        bail!("appliance network change digest does not match its body")
-    }
-    verify_management_signature(
-        change,
-        "signature",
-        &change.signature,
-        NETWORK_CHANGE_SIGNATURE_DOMAIN,
-        &state.management_signing_public_key_b64,
-    )
-}
-
 pub(crate) fn verify_management_signature<T: Serialize>(
     value: &T,
     signature_field: &str,
@@ -627,106 +357,6 @@ fn load_provisioning_state() -> Result<crate::provisioning::DurableProvisioningS
         bail!("installed provisioning identity cannot verify Management changes")
     }
     Ok(state)
-}
-
-pub(crate) fn validate_network_input(network: &ApplianceNetworkInput) -> Result<()> {
-    if network.interface_id.is_empty()
-        || network.interface_id.len() > 256
-        || network.interface_id != network.interface_id.trim()
-        || network.interface_id.chars().any(char::is_control)
-    {
-        bail!("managed network interface identity is invalid")
-    }
-    match network.mode.as_str() {
-        "dhcp" => {
-            if network.address_cidr.is_some()
-                || network.gateway.is_some()
-                || !network.dns_servers.is_empty()
-            {
-                bail!("DHCP network change contains static settings")
-            }
-        }
-        "static" => {
-            let (address, prefix) = network
-                .address_cidr
-                .as_deref()
-                .and_then(|value| value.split_once('/'))
-                .ok_or_else(|| anyhow!("static network address is invalid"))?;
-            let address: std::net::Ipv4Addr = address.parse()?;
-            let prefix: u8 = prefix.parse()?;
-            let gateway: std::net::Ipv4Addr = network
-                .gateway
-                .as_deref()
-                .ok_or_else(|| anyhow!("static network gateway is missing"))?
-                .parse()?;
-            if prefix > 32 || address == gateway || !same_ipv4_subnet(address, gateway, prefix) {
-                bail!("static network address and gateway are incompatible")
-            }
-            if network.dns_servers.is_empty()
-                || network.dns_servers.len() > 4
-                || network
-                    .dns_servers
-                    .iter()
-                    .any(|value| value.parse::<std::net::Ipv4Addr>().is_err())
-            {
-                bail!("static network DNS servers are invalid")
-            }
-        }
-        _ => bail!("managed network mode is unsupported"),
-    }
-    Ok(())
-}
-
-fn same_ipv4_subnet(left: std::net::Ipv4Addr, right: std::net::Ipv4Addr, prefix: u8) -> bool {
-    let mask = if prefix == 0 {
-        0
-    } else {
-        u32::MAX << (32 - prefix)
-    };
-    u32::from(left) & mask == u32::from(right) & mask
-}
-
-pub(crate) fn resolve_wired_interface(stable_id: &str) -> Result<(String, String)> {
-    let mut matches = Vec::new();
-    for entry in fs::read_dir("/sys/class/net")? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        let root = entry.path();
-        if name == "lo"
-            || root.join("wireless").exists()
-            || fs::read_to_string(root.join("type"))?.trim() != "1"
-            || !root.join("device").exists()
-        {
-            continue;
-        }
-        let mac = fs::read_to_string(root.join("address"))?
-            .trim()
-            .to_ascii_lowercase();
-        let output = std::process::Command::new("udevadm")
-            .args([
-                "info",
-                "--query=property",
-                &format!("--path={}", root.display()),
-            ])
-            .output()?;
-        if !output.status.success() || output.stdout.len() > 1024 * 1024 {
-            bail!("could not resolve managed wired interface identity")
-        }
-        let properties = String::from_utf8(output.stdout)?;
-        let id = properties
-            .lines()
-            .find_map(|line| line.strip_prefix("ID_PATH="))
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("mac-{mac}"));
-        if id == stable_id {
-            matches.push((name, mac));
-        }
-    }
-    if matches.len() != 1 {
-        bail!("managed wired interface identity is missing or ambiguous")
-    }
-    Ok(matches.remove(0))
 }
 
 pub async fn report(state: &crate::AppState) -> Result<Option<ApplianceReport>> {
@@ -918,7 +548,7 @@ mod tests {
         assert_eq!(reported["last_success_at"], "2026-11-13T10:00:00Z");
     }
 
-    fn test_directory(label: &str) -> PathBuf {
+    fn test_directory(label: &str) -> std::path::PathBuf {
         let path =
             std::env::temp_dir().join(format!("tiaris-nest-{label}-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&path).unwrap();
