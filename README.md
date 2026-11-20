@@ -208,25 +208,6 @@ retained jobs from before the upgrade remain retryable; current Tiaris issues
 only v3 and refuses to prepare installations on a Nest without it
 (`nest_installer_closure_unsupported`). Deploy Nest before Tiaris.
 
-Source-free Blueprint preparation classifies the exact evaluated derivation
-graph in an isolated store. Deterministic NixOS composition outputs and their
-qualified tool providers are admitted by strict fingerprints, while an
-unrecognized source-producing derivation remains blocked and is reported in
-bounded `source_build_candidates` diagnostics.
-The `/etc` compositions with retained fixtures (Tiaris KDE Standard, GNOME
-Taskbar/Dock, Tiling and the generic desktop prebuild, plus the retained
-production Standard, Dock and Tiling recipes) are pinned independently of the
-configured time zone: only the zone of NixOS's single `/etc/localtime` entry
-may vary, and only as an IANA-style name (one to three `/`-separated
-components that start with a letter and contain only `A-Z a-z 0-9 _ + -`, at
-most 64 bytes). The older Standard, Dock and Hyprland `/etc` pins without a
-fixture still match only their recorded zone. NixOS's
-`xkb-validated` keyboard check is admitted for any model, layout, variant and
-option list limited to letters, digits and `_ - , : + ( )` when it uses the
-exact reviewed command with the cache-backed `xkbvalidate` and
-`xkeyboard-config` outputs. A regional time zone or keyboard layout therefore
-needs no permission to compile packages from source.
-
 Runtime integrity maintenance rechecks retained bundles every 12 hours and
 renews the active runtime's reported verification time only after a successful
 check. This keeps healthy nodes within Tiaris's 24-hour verification window.
