@@ -135,6 +135,25 @@ fn inventory_rows_follow_admission_minimums() {
 }
 
 #[test]
+fn a_disk_without_a_serial_number_is_named_with_its_cure() {
+    // A VirtIO Block disk on Proxmox: setup used to loop on "could not read
+    // this server's hardware" without a cause.
+    let (_, mut inventory) = fixture();
+    inventory.disks.clear();
+    inventory.disks_without_serial = vec!["/dev/vda".into()];
+    let checks = inventory_checks(
+        &inventory,
+        LinkFacts::default(),
+        (CheckState::Queued, "Queued"),
+    );
+    assert_eq!(checks[4].value, "/dev/vda · no serial number");
+    let stop = hardware_stop(&checks).unwrap();
+    assert!(stop.disk_untouched);
+    assert!(stop.reason.contains("no serial number"));
+    assert!(stop.steps[0].contains("SCSI or SATA"));
+}
+
+#[test]
 fn missing_link_and_disk_are_errors_with_recovery_steps() {
     let (_, mut inventory) = fixture();
     inventory.ethernet_interfaces[0].link_up = false;
