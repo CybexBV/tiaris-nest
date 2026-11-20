@@ -66,7 +66,9 @@ const START_DELAY: Duration = Duration::from_secs(60);
 const PERIOD: Duration = Duration::from_secs(6 * 3600);
 const RETRY_WHILE_NOT_PASSING: Duration = Duration::from_secs(15 * 60);
 const MIN_INTERVAL: Duration = Duration::from_secs(60);
-const BOOT_PROBE_WAIT: Duration = Duration::from_secs(15);
+// The supervisor notices the request within its five-second turn and then
+// listens for eight seconds (site_probe.py, PROBE_SECONDS).
+const BOOT_PROBE_WAIT: Duration = Duration::from_secs(30);
 const MAX_DIRECTORIES: usize = 4;
 const MAX_CA_BYTES: usize = 32 * 1024;
 
