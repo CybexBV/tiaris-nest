@@ -1,4 +1,6 @@
-{ pkgs, repoRoot ? ../., manageOrigin }:
+# `journeySystemRoots`: only the install journey's build sets it (Cargo.toml,
+# feature `journey-system-roots`); a release build trusts public roots only.
+{ pkgs, repoRoot ? ../., manageOrigin, journeySystemRoots ? false }:
 let
   repo = builtins.toPath repoRoot;
   source = pkgs.lib.cleanSourceWith {
@@ -16,6 +18,7 @@ in pkgs.rustPlatform.buildRustPackage {
   src = source;
   cargoLock.lockFile = source + "/Cargo.lock";
   TIARIS_NEST_BUILD_MANAGE_ORIGIN = manageOrigin;
+  buildFeatures = pkgs.lib.optional journeySystemRoots "journey-system-roots";
   doCheck = false; # Locked Rust tests are a separate release gate.
   postInstall = ''
     install -Dm0444 ${source}/assets/pxe-menu.png $out/share/tiaris-nest/assets/pxe-menu.png

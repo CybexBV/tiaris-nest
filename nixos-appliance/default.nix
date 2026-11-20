@@ -1,6 +1,10 @@
 { manageRepo, manageSourceArchive, manageSourceRevision, sourceRevision
 , releasePublicKey, provisioningPublicKeys, manageOrigin, sourceDateEpoch
 , system ? "x86_64-linux"
+  # Only the install journey sets this (Tiaris docs/checks.md, "The install
+  # journey"): the public certificate of its test CA. The Nest then also trusts
+  # the system store, which holds it. A release build has none.
+, journeyCaCertificate ? null
 }:
 let
   pin = import ../release/nixpkgs.nix;
@@ -9,7 +13,14 @@ let
   lib = pkgs.lib;
   publicKeys = if builtins.isString provisioningPublicKeys then builtins.fromJSON provisioningPublicKeys else provisioningPublicKeys;
   archiveInput = builtins.path { path = manageSourceArchive; name = "tiaris-manage-${manageSourceRevision}.tar"; };
-  package = import ./package.nix { inherit pkgs manageOrigin; };
+  journeyCa = if journeyCaCertificate == null then null else
+    let text = builtins.readFile (builtins.toPath journeyCaCertificate); in
+    assert builtins.stringLength text <= 16384;
+    assert lib.hasPrefix "-----BEGIN CERTIFICATE-----\n" text;
+    assert !lib.hasInfix "PRIVATE KEY" text;
+    builtins.path { path = builtins.toPath journeyCaCertificate; name = "tiaris-journey-ca.crt"; };
+  journeyTrust = lib.optional (journeyCa != null) { security.pki.certificateFiles = [ journeyCa ]; };
+  package = import ./package.nix { inherit pkgs manageOrigin; journeySystemRoots = journeyCa != null; };
   migrations = pkgs.runCommand "tiaris-nest-sqlite-migrations" { nativeBuildInputs = [ pkgs.python3 ]; } ''
     mkdir -p $out
     python3 ${./metadata.py} migrations ${../migrations} $out/sqlite-migrations.json
@@ -65,12 +76,12 @@ let
   installed = import (nixpkgs + "/nixos/lib/eval-config.nix") {
     inherit system;
     specialArgs.appliance = common;
-    modules = [ ./system.nix ];
+    modules = [ ./system.nix ] ++ journeyTrust;
   };
   live = import (nixpkgs + "/nixos/lib/eval-config.nix") {
     inherit system;
     specialArgs.appliance = common;
-    modules = [ ./iso.nix ];
+    modules = [ ./iso.nix ] ++ journeyTrust;
   };
   metadataBase = {
     schema = "tiaris.nest.appliance-closure-build.v1";

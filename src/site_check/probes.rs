@@ -181,6 +181,11 @@ fn roots(extra_ca: Option<&str>) -> RootCertStore {
             let _ = roots.add(certificate);
         }
     }
+    // A journey build trusts what its Manage client trusts (Cargo.toml).
+    #[cfg(feature = "journey-system-roots")]
+    for certificate in rustls_native_certs::load_native_certs().certs {
+        let _ = roots.add(certificate);
+    }
     roots
 }
 
