@@ -171,15 +171,6 @@ api() {
   python3 -B "$repository_root/nixos-appliance/qualification/isolated_manage_rpc.py" "${rpc_args[@]}"
 }
 
-check_delivery_policy() {
-  local delivery_policy="$work_dir/delivery-policy.json"
-  api GET '/v1/nest/delivery-policy' > "$delivery_policy"
-  # Nest-only delivery is the source-free policy (blueprint_delivery.source_free).
-  jq -e '.effective_mode == "nest_only" and .source_builds_allowed == false
-         and .effective_preparation_mode == "cached_only" and .emergency_override_mode == null' \
-    "$delivery_policy" >/dev/null
-}
-check_delivery_policy
 
 # Capture exact released revisions before package staging or VM work. The same
 # read-only admission runs in Tiaris readiness. Never reset built-ins to v1.
@@ -408,10 +399,9 @@ done
 test "$appliance_projection_ready" = true
 
 # Product-level greenfield contract: the exact candidate must converge with
-# the organization's untouched built-ins under the default source-disabled
-# delivery policy. Checking node-scoped jobs prevents an artifact retained on
-# another Nest from making this freshly installed disk appear qualified.
-check_delivery_policy
+# the organization's untouched built-ins. Checking node-scoped jobs prevents an
+# artifact retained on another Nest from making this freshly installed disk
+# appear qualified.
 
 runtime_status="$work_dir/workstation-runtime.json"
 runtime_operational=false
@@ -478,24 +468,6 @@ fi
 if [[ "$runtime_prepublication_deferred" = false && "$builtins_upgrade_deferred" = false ]]; then
 for _attempt in $(seq 1 720); do
   api GET "/v1/nest/nodes/$device_id/build/jobs?limit=200&offset=0" > "$build_jobs"
-  source_blocked_builtin_job="$(jq -c --slurpfile blueprints "$blueprints" '
-    [.jobs[]
-      | select(.status == "failed")
-      | select(.cache_metadata.error_kind == "source_build_blocked")
-      | select(.build_spec.blueprint_revision_id as $revision
-          | $blueprints[0].blueprints
-          | any(.current_revision_id == $revision))]
-    | first // empty
-  ' "$build_jobs")"
-  if [[ -n "$source_blocked_builtin_job" ]]; then
-    echo 'error: an official built-in Blueprint violates the source-free release contract' >&2
-    jq '{blueprint_id:.build_spec.blueprint_id,
-         blueprint_revision_id:.build_spec.blueprint_revision_id,status,error,
-         error_kind:.cache_metadata.error_kind,
-         source_build_candidates:.cache_metadata.source_build_candidates}' \
-      <<<"$source_blocked_builtin_job" >&2
-    exit 1
-  fi
   if jq -e --slurpfile blueprints "$blueprints" '
       ($blueprints[0].blueprints | map(.slug)) as $expected
       | ([.jobs[]
@@ -587,8 +559,7 @@ rg -q 'Permission denied' "$work_dir/password-login.log"
 rm -f -- "$work_dir/operator-key" "$work_dir/operator-key.pub" \
   "$work_dir/operator-key-cert.pub" "$certificate_response" "$work_dir/certificate-inspection.txt"
 
-# Fail closed if policy, authoring or a released revision moved during this run.
-check_delivery_policy
+# Fail closed if authoring or a released revision moved during this run.
 python3 -B "$repository_root/nixos-appliance/qualification/blueprint-catalog.py" \
   --manage-origin "$manage_origin" --token-file "$token_file" --state-dir "$TIARIS_NEST_QUALIFICATION_STATE" \
   --fixture-blueprint "${TIARIS_NEST_QUALIFICATION_FIXTURE_BLUEPRINT:-qualification_dock}" \

@@ -4,18 +4,17 @@
 //! The Nest serves finished closures from its cache and removes a job's
 //! out-link once the job ends, so garbage collection takes the closure and its
 //! derivations from the store, which vulnix needs. The scanner builds such a
-//! job again from its own build spec, through the same validation, admission
-//! and source policy as its worker, into the job's out-link, and drops that
-//! root once the scan is done.
+//! job again from its own build spec, through the same validation and
+//! admission as its worker, into the job's out-link, and drops that root once
+//! the scan is done.
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use tracing::warn;
 
 use super::{
-    WorkstationBuildProfile, admit_build_target, ensure_nix_daemon_available,
-    nix_build_command_with_nixpkgs_nar_hash, preflight_source_build_check_for_profile,
-    source_build_blocked_message, validate_build_spec,
+    admit_build_target, ensure_nix_daemon_available, nix_build_command_with_nixpkgs_nar_hash,
+    validate_build_spec,
 };
 use crate::{AppState, db, subprocess::run_cancellable_command};
 
@@ -114,17 +113,6 @@ pub(crate) async fn rebuild_for_scan(
     remove_dirs(&rebuilt.dirs);
     let command =
         nix_build_command_with_nixpkgs_nar_hash(config, admitted.target, &spec, job_id, nar_hash)?;
-    if !spec.allow_source_builds {
-        let profile = WorkstationBuildProfile::for_build(
-            admitted.nixpkgs_commit.as_deref(),
-            detected.as_ref().map(|ready| &ready.profile),
-        )
-        .context("no reviewed build profile for the job's nixpkgs commit")?;
-        let offenders = preflight_source_build_check_for_profile(config, &command, profile).await?;
-        if !offenders.is_empty() {
-            bail!("{}", source_build_blocked_message(&offenders));
-        }
-    }
     if let Some(parent) = command.out_link.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }

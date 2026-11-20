@@ -1,6 +1,7 @@
-//! Per-commit identities of the source-build preflight.
+//! Per-commit identities of the local-work classifier that the software-update
+//! check (`crate::software_updates`) runs over a commit's dry runs.
 //!
-//! The preflight admits local work only by reviewed content (store-normalized
+//! The classifier admits local work only by reviewed content (store-normalized
 //! script fingerprints, exact stock commands and builder file hashes) run by
 //! exact tool providers. The content does not depend on the nixpkgs commit;
 //! the providers do. A [`WorkstationBuildProfile`] carries the providers of
@@ -721,21 +722,6 @@ impl WorkstationBuildProfile {
             .unwrap_or(command)
     }
 
-    /// The profile a build job's preflight uses for the commit it was
-    /// admitted at: the built-in profile at the built-in commit, the ready
-    /// detected commit's persisted profile at that commit, and none for any
-    /// other commit or no commit. There is no fallback.
-    pub(crate) fn for_build<'a>(
-        admitted_commit: Option<&str>,
-        detected: Option<&'a WorkstationBuildProfile>,
-    ) -> Option<&'a Self> {
-        let commit = admitted_commit?;
-        if commit == BUILTIN_NIXPKGS_COMMIT {
-            return Some(Self::builtin());
-        }
-        detected.filter(|profile| !profile.builtin && profile.nixpkgs_commit() == commit)
-    }
-
     /// Whether `drv_path` is one of the Tiaris packages (workstation agent,
     /// gsettings helpers, patched Avahi and their uncached dependencies)
     /// evaluated from the shipped Tiaris source at this detected commit.
@@ -923,12 +909,6 @@ mod tests {
         let profile = WorkstationBuildProfile::builtin();
         assert_eq!(profile.nixpkgs_commit(), BUILTIN_NIXPKGS_COMMIT);
         assert!(profile.is_builtin());
-        assert!(std::ptr::eq(
-            WorkstationBuildProfile::for_build(Some(BUILTIN_NIXPKGS_COMMIT), None).unwrap(),
-            profile
-        ));
-        assert!(WorkstationBuildProfile::for_build(None, None).is_none());
-        assert!(WorkstationBuildProfile::for_build(Some(&"1".repeat(40)), None).is_none());
 
         // Every path a preflight check asks the profile for is an identity,
         // and the built-in profile returns the compiled bytes unchanged.
