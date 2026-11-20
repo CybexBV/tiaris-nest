@@ -26,12 +26,7 @@ const ENVELOPE_SCHEMA: &str = "tiaris.nest.provisioning-envelope.v1";
 const ENVELOPE_SIGNATURE_DOMAIN: &str = "TIARIS-NEST-PROVISIONING-ENVELOPE-V1";
 const KEY_DERIVATION_DOMAIN: &[u8] = b"TIARIS-NEST-PROVISIONING-KEY-V1\0";
 const REQUEST_SIGNATURE_DOMAIN: &str = "TIARIS-NEST-PROVISIONING-V1";
-pub(crate) const INSTALL_PLAN_SCHEMA_V1: &str = "tiaris.nest.install-plan.v1";
 pub(crate) const INSTALL_PLAN_SCHEMA_V3: &str = "tiaris.nest.install-plan.v3";
-pub(crate) const INSTALL_PLAN_SCHEMA_V2: &str = "tiaris.nest.install-plan.v2";
-const INSTALL_PLAN_SIGNATURE_DOMAIN_V1: &str = "TIARIS-NEST-INSTALL-PLAN-V1";
-const INSTALL_PLAN_SIGNATURE_DOMAIN_V2: &str = "TIARIS-NEST-INSTALL-PLAN-V2";
-pub(crate) const NETWORK_SNAPSHOT_DELIVERY: &str = "network-snapshot-v1";
 const IDENTITY_TRANSITION_SIGNATURE_DOMAIN: &str = "TIARIS-NEST-IDENTITY-TRANSITION-V1";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -396,22 +391,6 @@ pub(crate) fn verify_promoted_install_plan(
         .filter(|field| object.contains_key(**field))
         .count();
     let signature_domain = match plan.schema.as_str() {
-        INSTALL_PLAN_SCHEMA_V1
-            if package_field_count == 0
-                && plan.package_delivery.is_none()
-                && plan.appliance_release.is_none()
-                && plan.package_transport_url.is_none() =>
-        {
-            INSTALL_PLAN_SIGNATURE_DOMAIN_V1
-        }
-        INSTALL_PLAN_SCHEMA_V2
-            if package_field_count == package_fields.len()
-                && plan.package_delivery.as_deref() == Some(NETWORK_SNAPSHOT_DELIVERY)
-                && plan.appliance_release.is_some()
-                && plan.package_transport_url.is_some() =>
-        {
-            INSTALL_PLAN_SIGNATURE_DOMAIN_V2
-        }
         INSTALL_PLAN_SCHEMA_V3
             if package_field_count == 3
                 && plan.package_delivery.as_deref() == Some("system-closure-v1")
@@ -428,12 +407,8 @@ pub(crate) fn verify_promoted_install_plan(
     if plan.organization_id.is_nil()
         || plan.session_id.is_nil()
         || plan.id.is_nil()
-        || !((plan.schema == INSTALL_PLAN_SCHEMA_V3
-            && plan.base_os == "nixos"
-            && plan.base_os_version == "26.05")
-            || (plan.schema != INSTALL_PLAN_SCHEMA_V3
-                && plan.base_os == "ubuntu"
-                && plan.base_os_version == "26.04"))
+        || plan.base_os != "nixos"
+        || plan.base_os_version != "26.05"
         || plan.at_rest_protection != "none"
         || plan.plan_revision <= 0
         || plan.session_revision <= 0
@@ -523,22 +498,6 @@ fn verify_install_plan_inner(
         .filter(|field| plan_object.contains_key(**field))
         .count();
     let signature_domain = match plan.schema.as_str() {
-        INSTALL_PLAN_SCHEMA_V1
-            if package_field_count == 0
-                && plan.package_delivery.is_none()
-                && plan.appliance_release.is_none()
-                && plan.package_transport_url.is_none() =>
-        {
-            INSTALL_PLAN_SIGNATURE_DOMAIN_V1
-        }
-        INSTALL_PLAN_SCHEMA_V2
-            if package_field_count == package_fields.len()
-                && plan.package_delivery.as_deref() == Some(NETWORK_SNAPSHOT_DELIVERY)
-                && plan.appliance_release.is_some()
-                && plan.package_transport_url.is_some() =>
-        {
-            INSTALL_PLAN_SIGNATURE_DOMAIN_V2
-        }
         INSTALL_PLAN_SCHEMA_V3
             if package_field_count == 3
                 && plan.package_delivery.as_deref() == Some("system-closure-v1")
@@ -563,12 +522,8 @@ fn verify_install_plan_inner(
         || (!acknowledged_attempt && plan.inventory_sha256 != expected_inventory_sha256)
         || plan.hardware_digest != expected_hardware_digest
         || plan.provisioning_public_key_fingerprint != expected_provisioning_fingerprint
-        || !((plan.schema == INSTALL_PLAN_SCHEMA_V3
-            && plan.base_os == "nixos"
-            && plan.base_os_version == "26.05")
-            || (plan.schema != INSTALL_PLAN_SCHEMA_V3
-                && plan.base_os == "ubuntu"
-                && plan.base_os_version == "26.04"))
+        || plan.base_os != "nixos"
+        || plan.base_os_version != "26.05"
         || plan.at_rest_protection != "none"
         || plan.plan_revision <= 0
         || plan.session_revision <= 0
@@ -1124,10 +1079,8 @@ fn canonical_json(value: Value) -> Value {
 pub(crate) mod tests {
     use super::*;
 
-    pub(crate) fn signed_plan_fixture(
-        schema: &str,
-        signature_domain: &str,
-    ) -> (
+    /// A signed v3 install plan for a NixOS Nest.
+    pub(crate) fn signed_plan_fixture() -> (
         Value,
         ProvisioningEnvelope,
         NestProvisioningInventory,
@@ -1190,8 +1143,12 @@ pub(crate) mod tests {
                 .verifying_key()
                 .to_bytes(),
         );
-        let mut unsigned = json!({
-            "schema": schema,
+        let release: Value = serde_json::from_str(include_str!(
+            "../../protocol/fixtures/nest-appliance-v3.json"
+        ))
+        .unwrap();
+        let unsigned = json!({
+            "schema": INSTALL_PLAN_SCHEMA_V3,
             "id": Uuid::from_bytes([2; 16]),
             "organization_id": Uuid::from_bytes([4; 16]),
             "organization_slug": "acme-control",
@@ -1221,51 +1178,21 @@ pub(crate) mod tests {
             },
             "management_cidrs": [],
             "ssh_ca_public_keys": ["ssh-ed25519 AAAA qualification"],
-            "base_os": "ubuntu",
-            "base_os_version": "26.04",
+            "base_os": "nixos",
+            "base_os_version": "26.05",
             "release_version": "1.2.3",
             "at_rest_protection": "none",
+            "package_delivery": "system-closure-v1",
+            "appliance_release": release["appliance_release"],
+            "package_transport_url": release["appliance_release"]["system_closure"]["url"],
             "issued_at": now,
             "expires_at": now + chrono::Duration::minutes(20)
         });
-        if schema == INSTALL_PLAN_SCHEMA_V2 {
-            unsigned.as_object_mut().unwrap().extend([
-                (
-                    "package_delivery".to_string(),
-                    json!(NETWORK_SNAPSHOT_DELIVERY),
-                ),
-                (
-                    "appliance_release".to_string(),
-                    json!({
-                        "schema": "tiaris.nest.appliance-release.v1",
-                        "release_id": "1.2.3",
-                        "ubuntu_snapshot_id": "20260801T120000Z",
-                        "tiaris_repository_snapshot": {
-                            "url": "https://releases.cybex.net/tiaris-nest-appliance-packages-1.2.3-x86_64-linux.tar.zst",
-                            "sha256": "b".repeat(64),
-                            "size_bytes": 1024
-                        },
-                        "required_package_versions": {},
-                        "expected_kernel": "kernel",
-                        "minimum_protocol": 4,
-                        "minimum_state_schema": 2,
-                        "rollback_compatible": true,
-                        "release_notes": "https://releases.cybex.net/1.2.3",
-                        "signature": STANDARD.encode([0; 64])
-                    }),
-                ),
-                (
-                    "package_transport_url".to_string(),
-                    json!("http://192.168.122.1:8080/tiaris-nest-appliance-packages-1.2.3-x86_64-linux.tar.zst"),
-                ),
-            ]);
-        }
         let unsigned = canonical_json(unsigned);
         let canonical = serde_json::to_vec(&unsigned).unwrap();
         let plan_sha256 = sha256_hex(&canonical);
         let signing_key = SigningKey::from_bytes(&[9; 32]);
-        let mut payload = signature_domain.as_bytes().to_vec();
-        payload.push(b'\n');
+        let mut payload = b"TIARIS-NEST-INSTALL-PLAN-V3\n".to_vec();
         payload.extend_from_slice(&canonical);
         let signature = URL_SAFE_NO_PAD.encode(signing_key.sign(&payload).to_bytes());
         let mut plan = unsigned;
@@ -1407,8 +1334,7 @@ pub(crate) mod tests {
     #[test]
     fn retained_media_authentication_preserves_signatures_but_grants_no_fresh_authority() {
         use ed25519_dalek::Signer;
-        let (_, mut envelope, _, signing) =
-            signed_plan_fixture(INSTALL_PLAN_SCHEMA_V2, INSTALL_PLAN_SIGNATURE_DOMAIN_V2);
+        let (_, mut envelope, _, signing) = signed_plan_fixture();
         envelope.issued_at = Utc::now() - chrono::Duration::days(2);
         envelope.expires_at = envelope.issued_at + chrono::Duration::hours(24);
         let mut unsigned = serde_json::to_value(&envelope).unwrap();
@@ -1459,8 +1385,7 @@ pub(crate) mod tests {
 
     #[test]
     fn management_origin_requires_the_same_canonical_https_form_as_release_signing() {
-        let (_plan, mut envelope, _inventory, _key) =
-            signed_plan_fixture(INSTALL_PLAN_SCHEMA_V2, INSTALL_PLAN_SIGNATURE_DOMAIN_V2);
+        let (_plan, mut envelope, _inventory, _key) = signed_plan_fixture();
         envelope.manage_origin = "https://manage.example.test:8443".to_string();
         assert!(validate_envelope_fields(&envelope, &envelope.manage_origin).is_ok());
 
@@ -1479,8 +1404,7 @@ pub(crate) mod tests {
 
     #[test]
     fn setup_media_may_stay_valid_for_a_month_but_no_longer() {
-        let (_plan, mut envelope, _inventory, _key) =
-            signed_plan_fixture(INSTALL_PLAN_SCHEMA_V2, INSTALL_PLAN_SIGNATURE_DOMAIN_V2);
+        let (_plan, mut envelope, _inventory, _key) = signed_plan_fixture();
         let origin = envelope.manage_origin.clone();
         envelope.expires_at = envelope.issued_at + chrono::Duration::days(30);
         assert!(validate_envelope_fields(&envelope, &origin).is_ok());
@@ -1494,8 +1418,7 @@ pub(crate) mod tests {
     #[test]
     fn setup_media_validity_boundaries_do_not_round_up_or_reject_thirty_days() {
         use chrono::Duration;
-        let (_, mut envelope, _, _) =
-            signed_plan_fixture(INSTALL_PLAN_SCHEMA_V2, INSTALL_PLAN_SIGNATURE_DOMAIN_V2);
+        let (_, mut envelope, _, _) = signed_plan_fixture();
         let origin = envelope.manage_origin.clone();
         for (validity, accepted) in [
             (Duration::zero(), false),
@@ -1519,8 +1442,7 @@ pub(crate) mod tests {
     #[test]
     fn setup_media_clock_skew_does_not_extend_the_signed_validity_or_expiry() {
         use chrono::Duration;
-        let (_, mut envelope, _, signing) =
-            signed_plan_fixture(INSTALL_PLAN_SCHEMA_V2, INSTALL_PLAN_SIGNATURE_DOMAIN_V2);
+        let (_, mut envelope, _, signing) = signed_plan_fixture();
         let origin = envelope.manage_origin.clone();
         let now = Utc::now();
         envelope.issued_at = now + Duration::minutes(5);
@@ -1550,8 +1472,7 @@ pub(crate) mod tests {
     #[test]
     fn month_long_envelopes_still_require_the_exact_signed_timestamps() {
         use ed25519_dalek::Signer;
-        let (_, mut envelope, _, signing) =
-            signed_plan_fixture(INSTALL_PLAN_SCHEMA_V2, INSTALL_PLAN_SIGNATURE_DOMAIN_V2);
+        let (_, mut envelope, _, signing) = signed_plan_fixture();
         let directory = std::env::temp_dir().join(format!("nest-month-media-{}", Uuid::new_v4()));
         fs::create_dir(&directory).unwrap();
         let path = directory.join("envelope.bin");
@@ -1607,46 +1528,18 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn legacy_and_network_install_plans_use_distinct_exact_signature_domains() {
-        let (legacy, envelope, inventory, key) =
-            signed_plan_fixture(INSTALL_PLAN_SCHEMA_V1, INSTALL_PLAN_SIGNATURE_DOMAIN_V1);
-        let legacy =
-            verify_install_plan(legacy, &key.verifying_key(), &envelope, &inventory).unwrap();
-        assert_eq!(legacy.schema, INSTALL_PLAN_SCHEMA_V1);
-        assert!(legacy.appliance_release.is_none());
-
-        let (network, envelope, inventory, key) =
-            signed_plan_fixture(INSTALL_PLAN_SCHEMA_V2, INSTALL_PLAN_SIGNATURE_DOMAIN_V2);
-        let network =
-            verify_install_plan(network, &key.verifying_key(), &envelope, &inventory).unwrap();
-        assert_eq!(network.schema, INSTALL_PLAN_SCHEMA_V2);
-        assert_eq!(
-            network.package_delivery.as_deref(),
-            Some(NETWORK_SNAPSHOT_DELIVERY)
-        );
-
-        let (wrong_domain, envelope, inventory, key) =
-            signed_plan_fixture(INSTALL_PLAN_SCHEMA_V2, INSTALL_PLAN_SIGNATURE_DOMAIN_V1);
-        assert!(
-            verify_install_plan(wrong_domain, &key.verifying_key(), &envelope, &inventory).is_err()
-        );
-    }
-
-    #[test]
     fn fresh_install_requires_a_canonical_signed_organization_slug() {
-        let (mut missing, envelope, inventory, key) =
-            signed_plan_fixture(INSTALL_PLAN_SCHEMA_V2, INSTALL_PLAN_SIGNATURE_DOMAIN_V2);
+        let (mut missing, envelope, inventory, key) = signed_plan_fixture();
         missing.as_object_mut().unwrap().remove("organization_slug");
-        let missing = resign_plan(missing, INSTALL_PLAN_SIGNATURE_DOMAIN_V2, &key);
+        let missing = resign_plan(missing, "TIARIS-NEST-INSTALL-PLAN-V3", &key);
         let error = verify_install_plan(missing, &key.verifying_key(), &envelope, &inventory)
             .unwrap_err()
             .to_string();
         assert!(error.contains("organization slug is required"));
 
-        let (mut invalid, envelope, inventory, key) =
-            signed_plan_fixture(INSTALL_PLAN_SCHEMA_V2, INSTALL_PLAN_SIGNATURE_DOMAIN_V2);
+        let (mut invalid, envelope, inventory, key) = signed_plan_fixture();
         invalid["organization_slug"] = json!("Acme_Control");
-        let invalid = resign_plan(invalid, INSTALL_PLAN_SIGNATURE_DOMAIN_V2, &key);
+        let invalid = resign_plan(invalid, "TIARIS-NEST-INSTALL-PLAN-V3", &key);
         let error = verify_install_plan(invalid, &key.verifying_key(), &envelope, &inventory)
             .unwrap_err()
             .to_string();
@@ -1655,10 +1548,9 @@ pub(crate) mod tests {
 
     #[test]
     fn signed_predecessor_plan_without_slug_remains_promotable() {
-        let (mut plan, _envelope, _inventory, key) =
-            signed_plan_fixture(INSTALL_PLAN_SCHEMA_V2, INSTALL_PLAN_SIGNATURE_DOMAIN_V2);
+        let (mut plan, _envelope, _inventory, key) = signed_plan_fixture();
         plan.as_object_mut().unwrap().remove("organization_slug");
-        let plan = resign_plan(plan, INSTALL_PLAN_SIGNATURE_DOMAIN_V2, &key);
+        let plan = resign_plan(plan, "TIARIS-NEST-INSTALL-PLAN-V3", &key);
 
         let (plan, signer) = verify_promoted_install_plan(plan, &[key.verifying_key()]).unwrap();
 
@@ -1667,24 +1559,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn legacy_plan_rejects_even_null_network_delivery_fields() {
-        let (mut legacy, envelope, inventory, key) =
-            signed_plan_fixture(INSTALL_PLAN_SCHEMA_V1, INSTALL_PLAN_SIGNATURE_DOMAIN_V1);
-        legacy.as_object_mut().unwrap().extend([
-            ("package_delivery".to_string(), Value::Null),
-            ("appliance_release".to_string(), Value::Null),
-            ("package_transport_url".to_string(), Value::Null),
-        ]);
-        let error = verify_install_plan(legacy, &key.verifying_key(), &envelope, &inventory)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("package-delivery contract"));
-    }
-
-    #[test]
-    fn self_consistent_legacy_plan_from_untrusted_key_is_not_promoted() {
-        let (plan, _envelope, _inventory, attacker_key) =
-            signed_plan_fixture(INSTALL_PLAN_SCHEMA_V1, INSTALL_PLAN_SIGNATURE_DOMAIN_V1);
+    fn self_consistent_plan_from_untrusted_key_is_not_promoted() {
+        let (plan, _envelope, _inventory, attacker_key) = signed_plan_fixture();
         let governed_key = SigningKey::from_bytes(&[8; 32]).verifying_key();
 
         let error = verify_promoted_install_plan(plan, &[governed_key])
@@ -1695,42 +1571,20 @@ pub(crate) mod tests {
     }
     #[test]
     fn nixos_plan_requires_v3_domain_identity_and_accepts_secure_boot_off() {
-        let (mut value, envelope, mut inventory, key) =
-            signed_plan_fixture(INSTALL_PLAN_SCHEMA_V2, INSTALL_PLAN_SIGNATURE_DOMAIN_V2);
+        let (mut value, envelope, mut inventory, key) = signed_plan_fixture();
         inventory.secure_boot = false;
-        value["schema"] = INSTALL_PLAN_SCHEMA_V3.into();
-        value["base_os"] = "nixos".into();
-        value["base_os_version"] = "26.05".into();
-        value["package_delivery"] = "system-closure-v1".into();
-        let fixture: Value = serde_json::from_str(include_str!(
-            "../../protocol/fixtures/nest-appliance-v3.json"
-        ))
-        .unwrap();
-        value["appliance_release"] = fixture["appliance_release"].clone();
-        value["package_transport_url"]="https://releases.example/1.2.3/tiaris-nest-appliance-closure-1.2.3-x86_64-linux.tar.zst".into();
         value["inventory_sha256"] = inventory_sha256(&inventory).unwrap().into();
-        let sign = |value: &mut Value, domain: &str| {
-            let mut unsigned = value.clone();
-            let o = unsigned.as_object_mut().unwrap();
-            o.remove("signature");
-            o.remove("plan_sha256");
-            let body = serde_json::to_vec(&canonical_json(unsigned)).unwrap();
-            value["plan_sha256"] = sha256_hex(&body).into();
-            let mut payload = format!("{domain}\n").into_bytes();
-            payload.extend(body);
-            value["signature"] = URL_SAFE_NO_PAD.encode(key.sign(&payload).to_bytes()).into();
-        };
-        sign(&mut value, "TIARIS-NEST-INSTALL-PLAN-V3");
+        let value = resign_plan(value, "TIARIS-NEST-INSTALL-PLAN-V3", &key);
         let plan = verify_install_plan(value.clone(), &key.verifying_key(), &envelope, &inventory)
             .unwrap();
         assert!(plan.appliance_release.unwrap().nixos().is_ok());
-        sign(&mut value, INSTALL_PLAN_SIGNATURE_DOMAIN_V2);
+        let other_domain = resign_plan(value.clone(), "TIARIS-NEST-INSTALL-PLAN-V2", &key);
         assert!(
-            verify_install_plan(value.clone(), &key.verifying_key(), &envelope, &inventory)
-                .is_err()
+            verify_install_plan(other_domain, &key.verifying_key(), &envelope, &inventory).is_err()
         );
-        value["base_os"] = "ubuntu".into();
-        sign(&mut value, "TIARIS-NEST-INSTALL-PLAN-V3");
-        assert!(verify_install_plan(value, &key.verifying_key(), &envelope, &inventory).is_err());
+        let mut ubuntu = value;
+        ubuntu["base_os"] = "ubuntu".into();
+        let ubuntu = resign_plan(ubuntu, "TIARIS-NEST-INSTALL-PLAN-V3", &key);
+        assert!(verify_install_plan(ubuntu, &key.verifying_key(), &envelope, &inventory).is_err());
     }
 }

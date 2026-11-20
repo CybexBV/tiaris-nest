@@ -4,10 +4,7 @@ use serde_json::{Value, json};
 use std::os::unix::fs::MetadataExt;
 
 fn fixture() -> (SignedInstallPlan, NestProvisioningInventory) {
-    let (mut plan, envelope, mut inventory, _) = protocol::tests::signed_plan_fixture(
-        protocol::INSTALL_PLAN_SCHEMA_V1,
-        "TIARIS-NEST-INSTALL-PLAN-V1",
-    );
+    let (mut plan, envelope, mut inventory, _) = protocol::tests::signed_plan_fixture();
     plan["base_os"] = "nixos".into();
     plan["base_os_version"] = "26.05".into();
     plan["display_name"] = "Acme Nest".into();
@@ -402,10 +399,7 @@ fn process_errors_before_disk_writes_are_untouched_stops() {
 #[test]
 fn published_status_never_contains_secret_or_transport_material() {
     let (plan, inventory) = fixture();
-    let (raw_plan, envelope, _, _) = protocol::tests::signed_plan_fixture(
-        protocol::INSTALL_PLAN_SCHEMA_V2,
-        "TIARIS-NEST-INSTALL-PLAN-V2",
-    );
+    let (raw_plan, envelope, _, _) = protocol::tests::signed_plan_fixture();
     let dir = tempdir::TempDir::new();
     let (status, path) = reporter(&dir);
     status.begin();

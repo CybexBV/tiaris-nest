@@ -215,10 +215,7 @@ mod tests {
     use ed25519_dalek::Signer;
     #[test]
     fn signed_schedule_binds_session_incarnation_revision_and_closure() {
-        let (value, envelope, _, key) = crate::provisioning::protocol::tests::signed_plan_fixture(
-            "tiaris.nest.install-plan.v1",
-            "TIARIS-NEST-INSTALL-PLAN-V1",
-        );
+        let (value, envelope, _, key) = crate::provisioning::protocol::tests::signed_plan_fixture();
         let state = crate::provisioning::DurableProvisioningState {
             schema: "tiaris.nest.provisioning-state.v1".into(),
             session_id: envelope.session_id,

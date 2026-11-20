@@ -15,10 +15,7 @@ use std::{
 use uuid::Uuid;
 
 fn fixture() -> (Value, protocol::VerifiedEnvelope, NestProvisioningInventory) {
-    let (mut plan, envelope, inventory, signing) = protocol::tests::signed_plan_fixture(
-        protocol::INSTALL_PLAN_SCHEMA_V2,
-        "TIARIS-NEST-INSTALL-PLAN-V2",
-    );
+    let (mut plan, envelope, inventory, signing) = protocol::tests::signed_plan_fixture();
     let release: Value = serde_json::from_str(include_str!(
         "../../../protocol/fixtures/nest-appliance-v3.json"
     ))
