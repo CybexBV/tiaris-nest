@@ -183,6 +183,9 @@ def build(args):
                       manageSourceRevision=args.manage_source_revision, sourceRevision=args.source_revision,
                       releasePublicKey=args.release_public_key, provisioningPublicKeys=keys,
                       manageOrigin=args.expected_manage_origin, sourceDateEpoch=args.source_date_epoch)
+        if args.journey_ca_certificate:
+            # The install journey only: a test CA its Nest trusts (default.nix).
+            inputs['journeyCaCertificate'] = str(Path(args.journey_ca_certificate).absolute())
         expression = work / 'build.nix'
         expression.write_text('let args = builtins.fromJSON ' + json.dumps(json.dumps(inputs))
                               + '; in import ' + str(REPO / 'nixos-appliance') + ' args\n')
@@ -249,6 +252,8 @@ def main():
     parser.add_argument('--provisioning-public-key', action='append', required=True)
     parser.add_argument('--source-date-epoch', type=int, required=True)
     parser.add_argument('--private-key')
+    parser.add_argument('--journey-ca-certificate',
+                        help='install journey only: the public certificate of its test CA; never for a release')
     destination = parser.add_mutually_exclusive_group(required=True)
     destination.add_argument('--output-dir')
     destination.add_argument('--unsigned-output-dir')

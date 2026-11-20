@@ -13,6 +13,11 @@ publish = false
 # Real-binary compatibility transition used only by Manage's disposable
 # resilience release gate.
 resilience-qualification-epoch-2 = []
+# The install journey (Tiaris deploy/nixos/tests/install_journey_test.nix) runs
+# a disposable Manage whose certificate comes from a test CA. A journey build
+# also trusts the system certificate store, where its NixOS configuration puts
+# that CA. Release builds never set this: they trust the compiled public roots.
+journey-system-roots = ["reqwest/rustls-tls-native-roots", "dep:rustls-native-certs"]
 
 [dependencies]
 anyhow = "1.0"
@@ -33,6 +38,9 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # presents (already in the graph through reqwest).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "1"
+# Only with `journey-system-roots`: the site check's own TLS probe reads the
+# system store too (the version reqwest's native-roots feature uses).
+rustls-native-certs = { version = "0.8", optional = true }
 semver = "1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
