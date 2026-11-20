@@ -4546,6 +4546,17 @@ const PINNED_DESKTOP_NIXOS_GENERATOR_FINGERPRINTS: &[(&str, &str)] = &[
         "1887811654c77bb12eda84231deb305a53abaab0ff5de22167145112de4208ab",
         "05020cc94499606e3a2f15713d82c964de3ebadc0e8727b51c8296e99611c6d7",
     ),
+    // GNOME Dock and Taskbar system-unit recipe at Tiaris da5ab0c8: the Dock
+    // recipe above (4afc0bcc/f05a7ab5) with one more unit file in its link
+    // list, unit-tiaris-networkmanager-dns-retry.timer (Tiaris 71d96850).
+    // No command, executable provider or other byte changed. The earlier
+    // pair stays for computers on the previous runtime. The derivations and
+    // their dependent /etc, activation and system recipes are retained in
+    // generic-desktop-prebuild-dns-retry-generators.json.
+    (
+        "2c373e0992a2964430499d242b1c1c8add6b11541e62bd1ff68df40113ce4e70",
+        "7a47622b1b8dd64dde2a501a86556f3d8d1997a870c16c5d879a09fc871248c3",
+    ),
     // Current production Standard service links.
     (
         "3b67dbfcb231874c224bf7322c305ef8db88d0a72f58c60b9e42c54617134a69",
@@ -9232,6 +9243,238 @@ sleep 5
         );
     }
 
+    const DNS_RETRY_TIMER_FIXTURE: &str = include_str!(
+        "../tests/fixtures/source-policy/generic-desktop-prebuild-dns-retry-generators.json"
+    );
+    const DNS_RETRY_TIMER_UNIT: &str = "unit-tiaris-networkmanager-dns-retry.timer";
+
+    /// Per built-in profile (Dock, Taskbar): the generic prebuild's system,
+    /// activation, /etc and system-unit derivations at Tiaris da5ab0c8, and
+    /// the new timer unit both system-unit recipes link.
+    fn generic_desktop_prebuild_dns_retry_graphs() -> Vec<BTreeMap<String, Value>> {
+        let derivations: BTreeMap<String, Value> =
+            serde_json::from_str(DNS_RETRY_TIMER_FIXTURE).unwrap();
+        assert_eq!(derivations.len(), 9);
+        let graphs = derivations
+            .iter()
+            .filter(|(_, drv)| drv["name"] == "nixos-system-tiaris-nest-build-26.05pre-git")
+            .map(|(system, _)| {
+                // One profile: its system and what that reaches in the fixture.
+                let mut graph = BTreeMap::new();
+                let mut pending = vec![system.clone()];
+                while let Some(path) = pending.pop() {
+                    let Some(drv) = derivations.get(&path) else {
+                        continue;
+                    };
+                    if graph.insert(path, drv.clone()).is_none() {
+                        pending.extend(
+                            derivation_input_drvs(drv)
+                                .unwrap()
+                                .into_iter()
+                                .map(|(input, _)| input),
+                        );
+                    }
+                }
+                assert_eq!(graph.len(), 5);
+                graph
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(graphs.len(), 2);
+        graphs
+    }
+
+    #[test]
+    fn source_policy_pins_dns_retry_timer_system_units_recipe_and_executable_pair() {
+        // The GNOME system-unit recipe reviewed before the timer existed.
+        const EARLIER: (&str, &str) = (
+            "4afc0bcc0c244405ce7cc54dfe42894247429a84e5ece23d36ce45fcb870b279",
+            "f05a7ab53a3a8ef14a5a84d2cdf4bc4612ec83eef3fa1f0ede4c16a73a1281ef",
+        );
+        for derivations in generic_desktop_prebuild_dns_retry_graphs() {
+            let path = derivation_path_named(&derivations, "system-units");
+            let drv = &derivations[&path];
+            let recipe = drv["env"]["buildCommand"].as_str().unwrap();
+            let normalized = normalized_script_sha256(recipe);
+            let executable = executable_pinned_script_sha256(recipe);
+            assert_eq!(
+                normalized,
+                "2c373e0992a2964430499d242b1c1c8add6b11541e62bd1ff68df40113ce4e70"
+            );
+            assert_eq!(
+                executable,
+                "7a47622b1b8dd64dde2a501a86556f3d8d1997a870c16c5d879a09fc871248c3"
+            );
+            assert!(derivation_is_exempt_from_source_policy_with_verifier(
+                &path,
+                Some(drv),
+                &synthetic_pinned_source,
+            ));
+            // The whole difference from the earlier recipe is one unit file
+            // in the link list: without it the bytes are the earlier ones.
+            let timer = recipe
+                .split(' ')
+                .filter(|word| word.ends_with(DNS_RETRY_TIMER_UNIT))
+                .collect::<Vec<_>>();
+            assert_eq!(timer.len(), 1);
+            let earlier = recipe.replacen(&format!("{} ", timer[0]), "", 1);
+            assert_eq!(normalized_script_sha256(&earlier), EARLIER.0);
+            assert_eq!(executable_pinned_script_sha256(&earlier), EARLIER.1);
+            // Computers on the previous runtime still build the earlier one.
+            assert!(reviewed_generator_fingerprints_match(EARLIER.0, EARLIER.1));
+            // The two recipes must not share interchangeable halves.
+            assert!(!reviewed_generator_fingerprints_match(
+                &normalized,
+                EARLIER.1
+            ));
+            assert!(!reviewed_generator_fingerprints_match(
+                EARLIER.0,
+                &executable
+            ));
+            // The /etc recipe did not change: it is the generic prebuild's
+            // zone-independent pair.
+            let etc = &derivations[&derivation_path_named(&derivations, "etc")];
+            let etc_recipe =
+                etc_script_with_time_zone_placeholder(etc["env"]["buildCommand"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(
+                normalized_script_sha256(&etc_recipe),
+                "9cdb204a2eae6ce407308df14327fad4eefa0e17fe953983fe58296df530c8ad"
+            );
+            assert_eq!(
+                executable_pinned_script_sha256(&etc_recipe),
+                "5830004382ba9f7078c561efd881680f671d750960dc03289487d1971eeada42"
+            );
+        }
+    }
+
+    #[test]
+    fn source_policy_dns_retry_timer_graphs_preserve_dependency_guards() {
+        for derivations in generic_desktop_prebuild_dns_retry_graphs() {
+            let timer_path = derivation_path_named(&derivations, DNS_RETRY_TIMER_UNIT);
+            let units_path = derivation_path_named(&derivations, "system-units");
+            let etc_path = derivation_path_named(&derivations, "etc");
+            let activate_path = derivation_path_named(&derivations, "activate");
+            let system_path =
+                derivation_path_named(&derivations, "nixos-system-tiaris-nest-build-26.05pre-git");
+            for (parent, dependency) in [
+                (&units_path, &timer_path),
+                (&etc_path, &units_path),
+                (&activate_path, &etc_path),
+                (&system_path, &etc_path),
+                (&system_path, &activate_path),
+            ] {
+                assert!(
+                    derivation_input_drvs(&derivations[parent])
+                        .unwrap()
+                        .iter()
+                        .any(|(path, _)| path == dependency)
+                );
+            }
+            // The timer is a text file and nothing else: it is admitted by
+            // itself as a NixOS materialization, not by a fingerprint.
+            let timer = &derivations[&timer_path];
+            assert!(derivation_is_exempt_from_source_policy_with_verifier(
+                &timer_path,
+                Some(timer),
+                &synthetic_pinned_source,
+            ));
+            let timer_recipe = timer["env"]["buildCommand"].as_str().unwrap();
+            assert!(!reviewed_generator_fingerprints_match(
+                &normalized_script_sha256(timer_recipe),
+                &executable_pinned_script_sha256(timer_recipe),
+            ));
+            // Deliberately visit parents first: the real chain needs repeated passes.
+            let would_build = vec![
+                system_path,
+                activate_path,
+                etc_path,
+                units_path.clone(),
+                timer_path.clone(),
+            ];
+            let would_build_set = would_build.iter().cloned().collect::<HashSet<_>>();
+            for parent in &would_build[..4] {
+                assert!(
+                    !derivation_is_exempt_from_source_policy_with_verifier_and_would_build(
+                        parent,
+                        derivations.get(parent),
+                        &synthetic_pinned_source,
+                        &would_build_set,
+                    )
+                );
+            }
+            assert_eq!(
+                classify_trusted_local_derivations(
+                    &would_build,
+                    &derivations,
+                    &synthetic_pinned_source,
+                    &would_build_set,
+                ),
+                would_build_set,
+            );
+
+            let units = &derivations[&units_path];
+            let recipe = units["env"]["buildCommand"].as_str().unwrap();
+            let altered_provider = recipe.replace(
+                "ccihqmbbygsvx7jap8apl5jwp8ipy61y-lndir",
+                "ffffffffffffffffffffffffffffffff-lndir",
+            );
+            assert_ne!(altered_provider, recipe);
+            // Provider hashes are normalized by the first digest, so the paired
+            // executable digest must still reject the changed lndir.
+            assert_eq!(
+                normalized_script_sha256(&altered_provider),
+                normalized_script_sha256(recipe),
+            );
+            assert!(!reviewed_generator_fingerprints_match(
+                &normalized_script_sha256(&altered_provider),
+                &executable_pinned_script_sha256(&altered_provider),
+            ));
+            let only_timer = HashSet::from([timer_path.clone()]);
+            for (attribute, value) in [
+                (
+                    "buildCommand",
+                    format!("{recipe}\ngcc source.c -o $out/payload\n"),
+                ),
+                ("preBuild", "gcc source.c -o $out/payload".to_string()),
+                ("buildCommand", altered_provider),
+            ] {
+                let mut tainted = derivations.clone();
+                tainted.get_mut(&units_path).unwrap()["env"][attribute] = json!(value);
+                assert_eq!(
+                    classify_trusted_local_derivations(
+                        &would_build,
+                        &tainted,
+                        &synthetic_pinned_source,
+                        &would_build_set,
+                    ),
+                    only_timer,
+                    "a modified system-units recipe must reject /etc, activation and system: {attribute}"
+                );
+            }
+
+            // The unchanged recipes cannot trust a timer unit that needs
+            // unreviewed local work: a build command or a phase hook in it
+            // rejects the whole chain.
+            for (attribute, value) in [
+                ("buildCommand", "gcc source.c -o $out"),
+                ("preBuild", "gcc source.c -o $out/payload"),
+            ] {
+                let mut tainted = derivations.clone();
+                tainted.get_mut(&timer_path).unwrap()["env"][attribute] = json!(value);
+                assert!(
+                    classify_trusted_local_derivations(
+                        &would_build,
+                        &tainted,
+                        &synthetic_pinned_source,
+                        &would_build_set,
+                    )
+                    .is_empty(),
+                    "a timer unit that runs a command must reject the whole chain: {attribute}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn source_policy_pins_both_desktop_generator_fingerprints() {
         for &(normalized, executable) in PINNED_DESKTOP_NIXOS_GENERATOR_FINGERPRINTS {
@@ -12331,6 +12574,10 @@ esac
                 "regional-xkb-validated",
                 include_str!("../tests/fixtures/source-policy/regional-xkb-validated.json"),
             ),
+            (
+                "generic-desktop-prebuild-dns-retry",
+                DNS_RETRY_TIMER_FIXTURE,
+            ),
         ]
         .into_iter()
         .map(|(name, fixture)| (name, serde_json::from_str(fixture).unwrap()))
@@ -12354,6 +12601,7 @@ esac
             ("regional-taskbar-new-york-de", (10, 10)),
             ("regional-xkb-validated", (2, 2)),
             ("generic-desktop-prebuild", (3, 3)),
+            ("generic-desktop-prebuild-dns-retry", (9, 9)),
         ]);
         let profile = WorkstationBuildProfile::builtin();
         for (name, derivations) in reviewed_fixture_graphs() {
