@@ -7,6 +7,7 @@ let
   firewall = installed.systemd.services.tiaris-nest-firewall;
   nest = installed.systemd.services.tiaris-nest;
   networkRuntime = installed.systemd.services.tiaris-nest-network-runtime;
+  bootFiles = installed.systemd.services.tftpd-hpa;
   checks = {
     retryStartsRecoverySsh = builtins.elem "sshd.service" firstBoot.wants;
     sshFailureDoesNotFailFirstBoot = !(builtins.elem "sshd.service" firstBoot.requires);
@@ -25,6 +26,13 @@ let
     # that asks Tiaris.
     startUpChecksDoNotWaitForTheNetwork =
       !(builtins.elem "network-online.target" (firstBoot.after ++ firstBoot.wants));
+    # The boot file server leaves while the server has no address yet. Since
+    # the start-up checks no longer wait for the network it starts too early
+    # by itself: it waits for the network and is never given up on.
+    bootFileServerWaitsForTheNetworkAndNeverGivesUp =
+      builtins.elem "network-online.target" bootFiles.after
+      && bootFiles.serviceConfig.Restart == "always"
+      && bootFiles.startLimitIntervalSec == 0;
     nothingRequiresTheNetworkGuard = builtins.all
       (unit: !(builtins.elem "tiaris-nest-network-guard.service" (unit.requires or [ ])))
       (builtins.attrValues installed.systemd.services);

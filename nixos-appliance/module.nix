@@ -222,9 +222,16 @@ in {
       wantedBy = [ "multi-user.target" ]; after = [ "tiaris-nest-first-boot.service" ]; before = [ "sshd.service" ];
       serviceConfig = { Type = "oneshot"; ExecStart = command "firewall"; RemainAfterExit = true; };
     };
+    # The boot file server leaves at once while the server has no IPv4 address
+    # ("cannot resolve local IPv4 bind address"). It starts once the network is
+    # up and is started again for as long as it takes, without a start limit:
+    # after a power cut the school's DHCP server can come back minutes after
+    # the Nest, and a boot file server that gave up means no computer starts
+    # from the network until someone restarts the Nest.
     systemd.services.tftpd-hpa = {
-      wantedBy = [ "multi-user.target" ]; after = [ "tiaris-nest-first-boot.service" ]; requires = [ "tiaris-nest-first-boot.service" ];
-      serviceConfig = { ExecStart = "${pkgs.tftp-hpa}/bin/in.tftpd --foreground --listen --address 0.0.0.0:69 --user tftp --secure /var/cache/tiaris-nest/tftp"; Restart = "on-failure"; };
+      wantedBy = [ "multi-user.target" ]; after = [ "tiaris-nest-first-boot.service" "network-online.target" ]; wants = [ "network-online.target" ]; requires = [ "tiaris-nest-first-boot.service" ];
+      startLimitIntervalSec = 0;
+      serviceConfig = { ExecStart = "${pkgs.tftp-hpa}/bin/in.tftpd --foreground --listen --address 0.0.0.0:69 --user tftp --secure /var/cache/tiaris-nest/tftp"; Restart = "always"; RestartSec = "5s"; };
     };
     systemd.services.tiaris-nest = {
       wantedBy = [ "multi-user.target" ]; after = [ "network-online.target" "tiaris-nest-first-boot.service" "tiaris-nest-network-guard.service" "tiaris-nest-network-runtime.service" "nginx.service" "tftpd-hpa.service" "nix-daemon.service" ];
