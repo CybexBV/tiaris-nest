@@ -20,7 +20,7 @@ The ninth is the unit file both `system-units` recipes link,
 
 Source pins:
 
-- Tiaris (compiler and desktop module): `da5ab0c83cb6ec569e6fc8ea76d7a0d1f61fdc6c`.
+- Tiaris (compiler and desktop module): `da5ab0c83c256056c1d0e11c42d061f9aaf3dd29`.
   Its `export_workstation_cache_contract_fixtures` test wrote the exports.
   SHA-256: `desktop.nix`
   `52d3caa71e0754e9cd426ce7e1e663c79f5163fac315d3466fc185652ba19c5a`, `dock.nix`
@@ -68,11 +68,14 @@ the recipe without the timer.
 
 The `/etc`, `activate` and system recipes are byte-identical to the reviewed
 ones after store-path normalization. They were refused only because they
-depend on the refused `system-units`. The same commits also changed the text
-of four existing units (`tiaris-ensure-printers`, `tiaris-network-priority`,
-`tiaris-networkmanager-dns`, `tiaris-reconcile-device-restrictions`) and of
-`etc-tiaris-policy.json`; those are plain materializations the policy already
-admitted, and no recipe names their content.
+depend on the refused `system-units`.
+
+Between the two revisions the text of four existing units changed as well:
+`tiaris-networkmanager-dns` in `71d968509`, and `tiaris-ensure-printers`,
+`tiaris-network-priority` and `tiaris-reconcile-device-restrictions` in
+`a198c6781`. `b93d41efe` removed three settings from `etc-tiaris-policy.json`.
+Those are plain materializations the policy already admitted, and no recipe
+names their content.
 
 The regressions check both profiles' real graphs parents first. They assert
 the pair, that removing the one unit file gives the earlier pair, and that the
