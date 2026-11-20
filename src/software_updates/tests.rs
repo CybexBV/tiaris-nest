@@ -679,8 +679,7 @@ async fn ready_commits_are_admitted_reported_and_kept_while_used() {
 
     let ready = ready_commit(data, COMMIT).await.unwrap().unwrap();
     assert_eq!(ready.nar_hash, NAR_HASH);
-    assert_eq!(ready.profile.nixpkgs_commit(), COMMIT);
-    assert!(ready.profile.admits_tiaris_package(AGENT_DRV));
+    assert_eq!(ready.commit, COMMIT);
     assert!(ready_commit(data, blocked).await.unwrap().is_none());
     assert!(ready_commit(data, &"3".repeat(40)).await.unwrap().is_none());
 

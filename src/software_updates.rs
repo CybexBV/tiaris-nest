@@ -414,12 +414,11 @@ pub(crate) async fn report(db: &SqlitePool, data_dir: &Path) -> Result<Vec<Detec
         .collect())
 }
 
-/// A ready detected commit: the jobs it admits build with its derived
-/// profile and with nixpkgs pinned to its recorded `narHash`.
+/// A ready detected commit: the jobs it admits build with nixpkgs pinned to
+/// its recorded `narHash`.
 pub(crate) struct ReadyCommit {
     pub(crate) commit: String,
     pub(crate) nar_hash: String,
-    pub(crate) profile: WorkstationBuildProfile,
 }
 
 /// The recorded `narHash` of a commit that is ready for this Nest build.
@@ -504,17 +503,12 @@ fn ready_commit_from_row(row: DetectedRow) -> Result<ReadyCommit> {
     let last_modified = parse_timestamp(Some(&row.last_modified))
         .ok_or_else(|| anyhow!("detected commit lastModified is invalid"))?
         .timestamp();
-    let profile = WorkstationBuildProfile::derived(
-        &row.commit_rev,
-        last_modified,
-        &stored.identities,
-        tiaris,
-    )?
-    .with_reviewed_content(&stored.reviewed)?;
+    // A record whose profile no longer derives is not ready.
+    WorkstationBuildProfile::derived(&row.commit_rev, last_modified, &stored.identities, tiaris)?
+        .with_reviewed_content(&stored.reviewed)?;
     Ok(ReadyCommit {
         commit: row.commit_rev,
         nar_hash: row.nar_hash,
-        profile,
     })
 }
 

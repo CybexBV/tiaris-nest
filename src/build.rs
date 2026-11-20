@@ -27,7 +27,7 @@ use crate::{
     config::{AppConfig, BuildTargetConfig, pinned_nixpkgs_revision},
     db, manage_source,
     models::BuildJob,
-    nix_log::{InternalJsonParser, derivation_display_name},
+    nix_log::InternalJsonParser,
     protected_material,
     redact::{contains_sensitive_key_value, redact_sensitive_key_values},
     subprocess::{PIPE_DRAIN_TIMEOUT, ProcessGroup, run_bounded_command},
@@ -2294,7 +2294,6 @@ fn make_source_policy_directories_owner_writable(path: &Path) -> std::io::Result
 pub(crate) struct UnadmittedDerivations {
     /// Every local derivation the build needs, apart from signed seeds.
     pub(crate) would_build: Vec<String>,
-    pub(crate) paths: Vec<String>,
     /// The subset rejected even when every other local derivation is
     /// trusted: the work that is itself unreviewed, not merely waiting for a
     /// rejected input.
@@ -2770,7 +2769,6 @@ where
     }
     UnadmittedDerivations {
         would_build,
-        paths,
         rejected_on_their_own,
         derivations,
         changed_builder_files,
@@ -7681,16 +7679,6 @@ esac
             })
     }
 
-    fn authenticated_substitutes_are_preferred(args: &[String]) -> bool {
-        ["always-allow-substitutes", "require-sigs"]
-            .iter()
-            .all(|option| {
-                args.windows(3).any(|window| {
-                    window[0] == "--option" && window[1] == *option && window[2] == "true"
-                })
-            })
-    }
-
     fn software_inventory_test_spec(software_package_refs: Vec<String>) -> ValidatedBuildSpec {
         ValidatedBuildSpec {
             artifact_type: "nixos_closure".to_string(),
@@ -8089,7 +8077,7 @@ sleep 5
             flake: "/srv/tiaris-nest/build-inputs/tiaris".to_string(),
             attr: "packages.x86_64-linux.desktop-experience".to_string(),
         };
-        let mut spec = ValidatedBuildSpec {
+        let spec = ValidatedBuildSpec {
             artifact_type: "nixos_closure".to_string(),
             target: "blueprint".to_string(),
             system: "x86_64-linux".to_string(),
@@ -11553,9 +11541,9 @@ esac
             .classify(profile)
             .map(|unadmitted| {
                 unadmitted
-                    .paths
+                    .rejected_on_their_own
                     .iter()
-                    .map(|path| derivation_display_name(path))
+                    .map(|path| crate::nix_log::derivation_display_name(path))
                     .collect()
             })
     }
@@ -11803,7 +11791,7 @@ esac
             flake: "/srv/tiaris-nest/build-inputs/tiaris".to_string(),
             attr: "packages.x86_64-linux.desktop-experience".to_string(),
         };
-        let mut spec = ValidatedBuildSpec {
+        let spec = ValidatedBuildSpec {
             artifact_type: "nixos_closure".to_string(),
             target: "blueprint".to_string(),
             system: "x86_64-linux".to_string(),
@@ -12507,7 +12495,7 @@ esac
         let (detected, _) = shifted_detected_profile(BTreeSet::from([agent.to_string()]));
         let compile = |path: &str| {
             json!({
-                "name": derivation_display_name(path),
+                "name": crate::nix_log::derivation_display_name(path),
                 "builder": "/nix/store/cccccccccccccccccccccccccccccccc-bash-5.3p9/bin/bash",
                 "env": {"buildPhase": "cargo build --release"},
                 "inputSrcs": [],
@@ -12752,13 +12740,6 @@ esac
     {
         let would_build = derivations.keys().cloned().collect::<Vec<_>>();
         let set = would_build.iter().cloned().collect::<HashSet<_>>();
-        let trusted = classify_trusted_local_derivations_for_profile(
-            profile,
-            &would_build,
-            derivations,
-            verify_source,
-            &set,
-        );
         let rejected_on_their_own = would_build
             .iter()
             .filter(|path| {
@@ -12774,11 +12755,6 @@ esac
             .cloned()
             .collect();
         UnadmittedDerivations {
-            paths: would_build
-                .iter()
-                .filter(|path| !trusted.contains(*path))
-                .cloned()
-                .collect(),
             would_build,
             rejected_on_their_own,
             derivations: derivations.clone(),
