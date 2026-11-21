@@ -5,10 +5,10 @@ Release policy fast-v1 (2026-11-02): a production Nest release needs the
 release contracts, the Rust production gate, a reproducible signed build,
 attestation, immutable publication, published-bytes verification and the
 public closure qualified through the candidate downloader. Warm and cold VM
-qualification are not on the release path; they run on demand from
-`.github/workflows/nest-vm-qualification.yml` for the owner's nightly. The
-release notes record that explicitly as `Tiaris-VM-Qualification: nightly`;
-promotion never claims VM evidence it did not check.
+qualification are not on the release path; they run only when someone starts
+`.github/workflows/nest-vm-qualification.yml`. The release notes record that
+explicitly as `Tiaris-VM-Qualification: on-demand`; promotion never claims VM
+evidence it did not check.
 """
 import argparse
 import hashlib
@@ -26,7 +26,9 @@ import release_predecessor as predecessor
 EVIDENCE = 'tiaris-nest-public-closure-qualification.json'
 FILES = {EVIDENCE}
 CLOSURE_JOB = 'Verify published closure through the candidate downloader'
-POLICY = 'Tiaris-VM-Qualification: nightly'
+POLICY = 'Tiaris-VM-Qualification: on-demand'
+# Releases staged before 21 November 2026 say `nightly` for the same policy.
+POLICIES = (POLICY, 'Tiaris-VM-Qualification: nightly')
 PENDING = 'Tiaris-Public-Closure: required'
 
 
@@ -99,11 +101,12 @@ def main():
     owners = [f'Tiaris-Release-Workflow: https://github.com/{name}/actions/runs/{args.run}'
               for name in predecessor.repositories.names(args.repository)]
     markers = [f'Tiaris-Candidate-Artifact-ID: {args.candidate_id}',
-               f'Tiaris-Candidate-Artifact-SHA256: {args.candidate_digest}', POLICY]
+               f'Tiaris-Candidate-Artifact-SHA256: {args.candidate_digest}']
     if (staged.get('immutable') is not True or staged['draft']
             or staged['target_commitish'] != args.source
             or not any(owner in lines for owner in owners)
-            or any(marker not in lines for marker in markers)):
+            or any(marker not in lines for marker in markers)
+            or sum(policy in lines for policy in POLICIES) != 1):
         raise ValueError('Immutable staged release does not belong to this candidate and release policy')
     base = f'https://github.com/{args.repository}/releases/download/{args.tag}/'
     with tempfile.TemporaryDirectory(prefix='nest-stable-promotion-') as temporary:
@@ -150,7 +153,7 @@ def main():
             raise ValueError('Staged release lacks its pending public-closure marker')
         if args.verify_only:
             print('Exact immutable candidate passed public closure qualification '
-                  '(VM qualification: nightly); production approval is still required')
+                  '(VM qualification: on demand); production approval is still required')
             return
         notes = directory / 'notes.md'
         notes.write_text(body.replace(PENDING, '\n'.join(passed)) + '\n')
@@ -160,10 +163,10 @@ def main():
     inventory = lambda release: sorted((a['id'], a['name'], a['digest'], a['size']) for a in release['assets'])
     if (promoted['id'] != staged['id'] or not promoted.get('immutable') or promoted['draft']
             or promoted['prerelease'] or inventory(promoted) != inventory(staged)
-            or POLICY not in (promoted.get('body') or '').splitlines()
+            or not any(policy in (promoted.get('body') or '').splitlines() for policy in POLICIES)
             or api('releases/latest')['id'] != promoted['id']):
         raise ValueError('Stable promotion did not preserve immutable release identity')
-    print('Immutable release promoted after exact public closure acceptance (VM qualification: nightly)')
+    print('Immutable release promoted after exact public closure acceptance (VM qualification: on demand)')
 
 
 if __name__ == '__main__':

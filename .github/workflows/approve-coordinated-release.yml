@@ -14,7 +14,7 @@ on:
         type: string
       # Release policy fast-v1: the public-closure evidence artifact of the
       # exact release run. No warm or cold VM proof is required for promotion;
-      # the release notes record `Tiaris-VM-Qualification: nightly`.
+      # the release notes record `Tiaris-VM-Qualification: on-demand`.
       artifact-id:
         required: true
         type: string

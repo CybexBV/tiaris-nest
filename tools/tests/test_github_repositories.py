@@ -226,7 +226,7 @@ class ReleaseToolTests(unittest.TestCase):
                'TIARIS_NEST_RELEASE_ARTIFACT_ID': '9', 'TIARIS_NEST_RELEASE_ARTIFACT_DIGEST': 'f' * 64}
         body = '\n'.join((f'Tiaris-Release-Workflow: https://github.com/{OLD}/actions/runs/42',
                           'Tiaris-Candidate-Artifact-ID: 9', 'Tiaris-Candidate-Artifact-SHA256: ' + 'f' * 64,
-                          'Tiaris-VM-Qualification: nightly', 'Tiaris-Public-Closure: required'))
+                          'Tiaris-VM-Qualification: on-demand', 'Tiaris-Public-Closure: required'))
         release = {'id': 123, 'tag_name': 'v0.2.2', 'name': 'Tiaris Nest v0.2.2', 'body': body,
                    'target_commitish': 'a' * 40, 'prerelease': True, 'draft': True, 'immutable': False}
         def api(path, pages=False):
