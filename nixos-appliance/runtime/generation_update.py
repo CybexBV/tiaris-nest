@@ -603,7 +603,11 @@ def drop_prepared(owner=0):
 
 def stage():
     """Prepare as soon as an update arrives, wait until the signed policy lets
-    it start (Update now, the Nest being idle, or the night), then switch."""
+    it start (Update now, the Nest being idle, or the night) and the Nest has
+    just reached Tiaris, then switch. The candidate must reach Tiaris again
+    before it stays (`commit`), so a Nest that is cut off keeps what it
+    prepared and waits (`no_manage_contact`) instead of switching, failing
+    that check and going back."""
     if not REQUEST.exists():
         return
     with maintenance_lock():
@@ -614,19 +618,22 @@ def stage():
             drop_prepared()
             prepared = prepare()
         attempt = prepared['attempt_id']
-        if started(attempt):
-            waiting = None
-        else:
-            # The journal says why the Nest starts its own update, and once
-            # per release and stage why it does not yet.
-            waiting, why = waiting_for()
-            release = prepared.get('target_release') or 'the requested release'
-            if waiting is None:
-                print(f'Starting the update to {release}, because {why or "the update policy allows it"}.', flush=True)
-            elif last_report(attempt).get('stage') != waiting:
-                print(f'Not starting the update to {release} yet, because {why or waiting}.', flush=True)
+        # An activation that a restart interrupted goes on without asking the
+        # policy again; it also switches only once the Nest reaches Tiaris.
+        resumed = started(attempt)
+        waiting, why = (None, 'it had started before the Nest restarted') if resumed else waiting_for()
+        if waiting is None and not contact_fresh():
+            waiting, why = 'no_manage_contact', 'the Nest has not reached Tiaris in the last 90 seconds'
+        # The journal says why the Nest starts its own update, and once per
+        # release and stage why it does not yet.
+        release = prepared.get('target_release') or 'the requested release'
+        if waiting is None:
+            print(f'Starting the update to {release}, because {why or "the update policy allows it"}.', flush=True)
+        elif last_report(attempt).get('stage') != waiting:
+            print(f'Not starting the update to {release} yet, because {why or waiting}.', flush=True)
         if waiting:
-            emit_status(prepared, 'waiting_window', waiting)
+            # Reports only move forward: a resumed activation stays started.
+            emit_status(prepared, 'preparing' if resumed else 'waiting_window', waiting)
             return
         activate(prepared)
 
@@ -686,7 +693,9 @@ class ManageContactFailed(RuntimeError):
 def await_health():
     """The candidate stays once three checks in a row, within 210 seconds,
     found it healthy by itself and in fresh contact with Tiaris. When its own
-    health held three times in a row, only the contact was missing."""
+    health held three times in a row, only the contact was missing: the Nest
+    reached Tiaris just before the switch (`stage`), so the candidate lost a
+    working link."""
     deadline = time.monotonic() + 210
     healthy = reached = 0
     only_contact_missing = False

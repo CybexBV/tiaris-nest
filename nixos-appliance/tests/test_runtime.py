@@ -214,7 +214,7 @@ class PrepareThenSwitch(unittest.TestCase):
         (self.roots / ('pending-' + self.attempt)).unlink()
         self.assertIsNone(self.found())
 
-    def run_stage(self, prepared, waiting, started=False):
+    def run_stage(self, prepared, waiting, started=False, contact=True):
         calls = []
         with patch.object(update, 'REQUEST', self.directory / 'request.json'), \
                 patch.object(update, 'maintenance_lock', return_value=nullcontext()), \
@@ -226,6 +226,7 @@ class PrepareThenSwitch(unittest.TestCase):
                 patch.object(update, 'drop_prepared', side_effect=lambda: calls.append('drop')), \
                 patch.object(update, 'prepare', side_effect=lambda: calls.append('prepare') or self.prepared), \
                 patch.object(update, 'waiting_for', side_effect=lambda: calls.append('gate') or (waiting, 'why')), \
+                patch.object(update, 'contact_fresh', return_value=contact), \
                 patch.object(update, 'last_report', return_value={}), \
                 patch.object(update, 'started', return_value=started), \
                 patch.object(update, 'activate', side_effect=lambda receipt: calls.append('activate')), \
@@ -239,6 +240,15 @@ class PrepareThenSwitch(unittest.TestCase):
         self.assertEqual(self.run_stage(self.prepared, None), ['gate', 'activate'])
         # After a crash during activation the report never goes back to waiting.
         self.assertEqual(self.run_stage(self.prepared, 'nest_busy', started=True), ['activate'])
+
+    def test_a_nest_that_cannot_reach_tiaris_keeps_what_it_prepared_and_waits(self):
+        # The candidate would have to reach Tiaris to stay: switching now
+        # ends in a rollback, and the next try downloads everything again.
+        self.assertEqual(self.run_stage(self.prepared, None, contact=False),
+                         ['gate', ('waiting_window', 'no_manage_contact')])
+        # Also an activation that a power cut interrupted; its report stays started.
+        self.assertEqual(self.run_stage(self.prepared, None, started=True, contact=False),
+                         [('preparing', 'no_manage_contact')])
 
     def test_a_replaced_request_leaves_nothing_prepared_behind(self):
         staging, control = self.directory / 'staging', self.directory / 'control'

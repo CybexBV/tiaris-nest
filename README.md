@@ -501,7 +501,11 @@ release and rehearses the database (status `waiting_window`, stage
 the switch: **Update now**, the Nest being idle, or the night period the policy
 names (the deadline for a Nest that is never idle). There are no modes: a policy
 signed earlier with mode `window` is read the same way. While it waits the stage
-is `nest_busy`. At the switch
+is `nest_busy`. The switch also waits until the Nest has just reached Tiaris (a
+report Tiaris accepted in this boot, at most 90 seconds ago): stage
+`no_manage_contact`. The candidate must reach Tiaris to stay, so a Nest that is
+cut off would switch, go back and download the release again; it keeps what it
+prepared instead and switches when the link is back. At the switch
 root checks the closure again, seals the next generation and selects it for one
 boot. Holds, active builds, maintenance leases and network transactions defer
 it. The service polls requests every 30 seconds.
@@ -525,8 +529,8 @@ until the Nest has been up for 30 minutes: then the daemon serves nothing.
 The known-good EFI default stays in place until repeated fresh local health
 and permanent-identity Tiaris contact succeed. Failure returns to the known-good
 generation and reports a reason: `manage_contact_failed` when the candidate was
-healthy by itself three checks in a row and only did not reach Tiaris, else
-`local_health_failed`. Durable receipts recover power loss without
+healthy by itself three checks in a row and only did not reach Tiaris (it lost
+a link that worked just before the switch), else `local_health_failed`. Durable receipts recover power loss without
 turning an unfinished attempt into success. Retention preserves current plus
 two preceding known-good generations. The old Ubuntu snapshot cutoff and
 root-service immediate-update override are not NixOS policy inputs.
