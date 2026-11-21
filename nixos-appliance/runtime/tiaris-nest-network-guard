@@ -6,8 +6,12 @@
 # - Tiaris answers on the approved profile: keep it.
 # - A fixed address that cannot reach Tiaris while DHCP can: the address is
 #   wrong for this network, so the DHCP fallback stays active (with its marker).
-# - Tiaris answers on neither: the internet is down, not the address. The
-#   approved profile goes back on and the Nest's services start with it.
+# - Tiaris answers on neither: the internet is down, and this start cannot
+#   tell which address works. The Nest starts on the profile it last reached
+#   Tiaris with: the DHCP fallback when its marker for this approved profile
+#   is still there (the marker stays), the approved profile otherwise. Nothing
+#   probes again until the next start, so a Nest that served the school on
+#   DHCP must not go back to a fixed address that never worked here.
 set -Eeuo pipefail
 umask 077
 
@@ -43,6 +47,34 @@ management_reachable() {
   return 1
 }
 
+approved_sha256="$(sha256sum "$approved" | awk '{print $1}')"
+[[ "$approved_sha256" =~ ^[0-9a-f]{64}$ ]]
+
+# The marker selects the DHCP profile for the periodic network task, the boot
+# service and the Nest's report. Written new each time, so its readers always
+# find a root-owned 0600 file.
+write_fallback_marker() {
+  local marker
+  marker="$(mktemp "$control_dir/.network-fallback-active.XXXXXX")"
+  jq -n --arg approved_sha256 "$approved_sha256" \
+    '{schema:"tiaris.nest.network-fallback.v1",approved_sha256:$approved_sha256}' \
+    > "$marker"
+  chmod 0600 "$marker"
+  chown root:root "$marker"
+  sync -f "$marker"
+  mv -f "$marker" "$control_dir/network-fallback-active"
+  sync -f "$control_dir"
+}
+
+# An earlier start reached Tiaris on DHCP and not on this approved profile.
+fallback_marker_current() {
+  local marker="$control_dir/network-fallback-active"
+  [[ -f "$marker" && ! -L "$marker" ]] || return 1
+  jq -e --arg approved_sha256 "$approved_sha256" \
+    '.schema == "tiaris.nest.network-fallback.v1" and .approved_sha256 == $approved_sha256' \
+    "$marker" >/dev/null 2>&1
+}
+
 if management_reachable 30; then
   # The approved profile reaches Tiaris again: DHCP recovery is over.
   rm -f "$control_dir/network-fallback-active"
@@ -62,23 +94,21 @@ fi
 install -m 0600 "$fallback" "$active"
 /usr/lib/tiaris-nest/tiaris-nest-netplan-activate
 if management_reachable 60; then
-  approved_sha256="$(sha256sum "$approved" | awk '{print $1}')"
-  [[ "$approved_sha256" =~ ^[0-9a-f]{64}$ ]]
-  marker="$(mktemp "$control_dir/.network-fallback-active.XXXXXX")"
-  jq -n --arg approved_sha256 "$approved_sha256" \
-    '{schema:"tiaris.nest.network-fallback.v1",approved_sha256:$approved_sha256}' \
-    > "$marker"
-  chmod 0600 "$marker"
-  chown root:root "$marker"
-  sync -f "$marker"
   # DHCP is now the verified active recovery profile; keep its selector.
-  mv -f "$marker" "$control_dir/network-fallback-active"
-  sync -f "$control_dir"
+  write_fallback_marker
   echo "the fixed address does not reach Tiaris and DHCP does; the Nest starts on DHCP" >&2
   exit 0
 fi
 
-# Neither profile reaches Tiaris: start on the approved one.
+if fallback_marker_current; then
+  # Neither profile reaches Tiaris, and DHCP is the one that last did: it is
+  # already active, and it stays, with its marker.
+  write_fallback_marker
+  echo "Tiaris does not answer on the fixed address or on DHCP; the Nest starts on DHCP, which reached Tiaris last" >&2
+  exit 0
+fi
+
+# Neither profile reaches Tiaris and DHCP never did: start on the approved one.
 install -m 0600 "$approved" "$active"
 /usr/lib/tiaris-nest/tiaris-nest-netplan-activate
 rm -f "$control_dir/network-fallback-active"

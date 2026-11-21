@@ -1,4 +1,5 @@
 """Execute the boot network guard and first-boot unit graph with disposable fixtures."""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -26,7 +27,8 @@ def fixture_plan(dhcp4):
 class NetworkGuardRuntimeTests(unittest.TestCase):
     """The guard re-applies the approved profile; networkd then resets the link."""
 
-    def guard(self, *, dhcp4, approved_failures, fallback_failures=0, replacements=None, stored_origin=ORIGIN):
+    def guard(self, *, dhcp4, approved_failures, fallback_failures=0, replacements=None, stored_origin=ORIGIN,
+              marker='stale recovery evidence'):
         temporary = self.enterContext(tempfile.TemporaryDirectory())
         root = Path(temporary)
         control, netplan, binaries = root / 'control', root / 'netplan', root / 'bin'
@@ -36,7 +38,7 @@ class NetworkGuardRuntimeTests(unittest.TestCase):
         (control / 'netplan-dhcp-fallback.json').write_text(json.dumps(fixture_plan(True)))
         (control / 'install-plan.json').write_text('{}')
         (control / 'provisioning-state.json').write_text(json.dumps({'manage_origin': stored_origin}))
-        (control / 'network-fallback-active').write_text('stale recovery evidence')
+        (control / 'network-fallback-active').write_text(marker)
 
         def helper(name, body):
             path = binaries / name
@@ -135,6 +137,23 @@ shutil.copyfile(*paths)
         self.assertLess(result.elapsed, 10)
         self.assertEqual(json.loads((result.netplan / '90-tiaris-nest.yaml').read_text()), fixture_plan(False))
         self.assertFalse((result.control / 'network-fallback-active').exists())
+
+    def test_a_fixed_address_without_tiaris_stays_on_the_dhcp_fallback_it_last_worked_on(self):
+        # The fixed address never worked on this network and the Nest served
+        # the school on DHCP. A power cut brings the internet back last:
+        # nothing probes again after this start, so going back to the fixed
+        # address would leave the Nest unreachable until someone restarts it.
+        approved = json.dumps(fixture_plan(False))
+        marker = json.dumps({'schema': 'tiaris.nest.network-fallback.v1',
+                             'approved_sha256': hashlib.sha256(approved.encode()).hexdigest()})
+        result = self.guard(dhcp4=False, approved_failures=-1, fallback_failures=-1, marker=marker,
+                            replacements={'management_reachable 30': 'management_reachable 2',
+                                          'management_reachable 60': 'management_reachable 2'})
+        self.assertEqual(result.process.returncode, 0, result.process.stderr)
+        self.assertEqual(result.log.count('activated'), 2)
+        self.assertEqual(json.loads((result.netplan / '90-tiaris-nest.yaml').read_text()), fixture_plan(True))
+        self.assertEqual(json.loads((result.control / 'network-fallback-active').read_text()), json.loads(marker))
+        self.assertEqual((result.control / 'network-fallback-active').stat().st_mode & 0o777, 0o600)
 
     def test_successful_static_retry_does_not_replace_the_approved_profile_with_dhcp(self):
         result = self.guard(dhcp4=False, approved_failures=1)
