@@ -646,27 +646,60 @@ def effective_manage_origin(stored):
     return result.stdout.strip() or None
 
 
-def contact_ready(receipt):
-    value = load(STATE / 'agent/manage-contact.json', owner=UID, maximum=16384)
-    identity = load(STATE / 'agent/manage-state.json', owner=UID)
-    plan = load(CONTROL / 'provisioning-state.json')
-    timestamp = datetime.datetime.fromisoformat(value['reported_at'].replace('Z', '+00:00'))
-    age = (datetime.datetime.now(datetime.timezone.utc) - timestamp).total_seconds()
-    return (value['schema'] == 'tiaris.nest.manage-contact.v1'
-        and value['boot_id'] == Path('/proc/sys/kernel/random/boot_id').read_text().strip()
-        and value['device_id'] == identity['device_id']
-        and value['public_key_fingerprint'] == identity['public_key_fingerprint']
-        and value['manage_origin'] == effective_manage_origin(plan['manage_origin'])
-        and 0 <= age <= 90)
+def contact_fresh():
+    """Whether this Nest, as itself, reached its Tiaris in this boot at most
+    90 seconds ago. The daemon records every report Tiaris accepted, about
+    every 30 seconds. Anything unreadable is no contact."""
+    try:
+        value = load(STATE / 'agent/manage-contact.json', owner=UID, maximum=16384)
+        identity = load(STATE / 'agent/manage-state.json', owner=UID)
+        plan = load(CONTROL / 'provisioning-state.json')
+        timestamp = datetime.datetime.fromisoformat(value['reported_at'].replace('Z', '+00:00'))
+        age = (datetime.datetime.now(datetime.timezone.utc) - timestamp).total_seconds()
+        return (value['schema'] == 'tiaris.nest.manage-contact.v1'
+            and value['boot_id'] == Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+            and value['device_id'] == identity['device_id']
+            and value['public_key_fingerprint'] == identity['public_key_fingerprint']
+            and value['manage_origin'] == effective_manage_origin(plan['manage_origin'])
+            and 0 <= age <= 90)
+    except Exception:
+        return False
 
 
-def health_ready(receipt):
-    for unit in ('tiaris-nest', 'tiaris-nest-first-boot', 'tiaris-nest-firewall', 'nginx', 'tftpd-hpa', 'nix-daemon', 'sshd'):
-        if subprocess.run(['systemctl', 'is-active', '--quiet', unit], timeout=5).returncode:
-            return False
-    run('curl', '--fail', '--silent', '--show-error', '--noproxy', '*', '--max-time', '10',
-        'http://127.0.0.1:8080/healthz?tiaris_fresh=1', timeout=12)
-    return contact_ready(receipt)
+def local_health_ready():
+    """Whether the Nest's own services run and it serves computers."""
+    try:
+        for unit in ('tiaris-nest', 'tiaris-nest-first-boot', 'tiaris-nest-firewall', 'nginx', 'tftpd-hpa', 'nix-daemon', 'sshd'):
+            if subprocess.run(['systemctl', 'is-active', '--quiet', unit], timeout=5).returncode:
+                return False
+        run('curl', '--fail', '--silent', '--show-error', '--noproxy', '*', '--max-time', '10',
+            'http://127.0.0.1:8080/healthz?tiaris_fresh=1', timeout=12)
+    except Exception:
+        return False
+    return True
+
+
+class ManageContactFailed(RuntimeError):
+    """The candidate is healthy by itself but did not reach Tiaris."""
+
+
+def await_health():
+    """The candidate stays once three checks in a row, within 210 seconds,
+    found it healthy by itself and in fresh contact with Tiaris. When its own
+    health held three times in a row, only the contact was missing."""
+    deadline = time.monotonic() + 210
+    healthy = reached = 0
+    only_contact_missing = False
+    while time.monotonic() < deadline:
+        healthy = healthy + 1 if local_health_ready() else 0
+        reached = reached + 1 if healthy and contact_fresh() else 0
+        if reached >= 3:
+            return
+        only_contact_missing = only_contact_missing or healthy >= 3
+        time.sleep(5)
+    if only_contact_missing:
+        raise ManageContactFailed('candidate did not reach Tiaris before the health deadline')
+    raise RuntimeError('candidate health deadline expired')
 
 
 def retain(receipt, installed):
@@ -705,18 +738,7 @@ def commit():
                 raise ValueError('booted migration inventory differs')
             verify_observed_versions(receipt['release']['required_system_versions'])
             verify_boot_entry(receipt['candidate_loader_entry'], receipt['system_toplevel'])
-            deadline, successes = time.monotonic() + 210, 0
-            while time.monotonic() < deadline:
-                try:
-                    ready = health_ready(receipt)
-                except Exception:
-                    ready = False
-                successes = successes + 1 if ready else 0
-                if successes >= 3:
-                    break
-                time.sleep(5)
-            else:
-                raise RuntimeError('candidate health deadline expired')
+            await_health()
             save(COMMIT, {'schema': 'tiaris.nest.system-commit-intent.v3', 'pending_sha256': hashlib.sha256(read(PENDING)).hexdigest(), 'attempt_id': receipt['attempt_id']})
             set_default(receipt['candidate_loader_entry'])
             installed = {'schema': 'tiaris.nest.installed-appliance.v3', 'release': receipt['release'],
@@ -733,13 +755,14 @@ def commit():
             except Exception as error:
                 # Success is already durable; pruning is separate maintenance.
                 print('Committed generation needs retained-generation cleanup: ' + type(error).__name__, flush=True)
-        except Exception:
+        except Exception as failure:
             if terminal_matches(receipt):
                 raise # durable success must never be rewritten as rollback
+            reason = 'manage_contact_failed' if isinstance(failure, ManageContactFailed) else 'local_health_failed'
             save(ROLLBACK, {'schema': 'tiaris.nest.system-rollback-intent.v3',
-                'pending_sha256': hashlib.sha256(read(PENDING)).hexdigest(), 'reason': 'local_health_failed', 'attempt_id': receipt['attempt_id']})
+                'pending_sha256': hashlib.sha256(read(PENDING)).hexdigest(), 'reason': reason, 'attempt_id': receipt['attempt_id']})
             restore_source(receipt)
-            emit_status(receipt, 'health_checking', 'rollback_pending', 'local_health_failed')
+            emit_status(receipt, 'health_checking', 'rollback_pending', reason)
             os.sync()
             run('systemctl', '--no-block', 'reboot')
             raise

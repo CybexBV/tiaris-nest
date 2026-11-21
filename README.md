@@ -524,7 +524,9 @@ until the Nest has been up for 30 minutes: then the daemon serves nothing.
 
 The known-good EFI default stays in place until repeated fresh local health
 and permanent-identity Tiaris contact succeed. Failure returns to the known-good
-generation and reports a reason. Durable receipts recover power loss without
+generation and reports a reason: `manage_contact_failed` when the candidate was
+healthy by itself three checks in a row and only did not reach Tiaris, else
+`local_health_failed`. Durable receipts recover power loss without
 turning an unfinished attempt into success. Retention preserves current plus
 two preceding known-good generations. The old Ubuntu snapshot cutoff and
 root-service immediate-update override are not NixOS policy inputs.

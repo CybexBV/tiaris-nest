@@ -185,7 +185,7 @@ def validate_transition(manifest, digest, previous, previous_digest, evidence, s
         raise ValueError('Transition did not reach the exact automatic terminal outcome')
     if rollback:
         if (evidence.get('automatic_rollback') is not True or evidence.get('fallback_reboot_observed') is not True
-                or evidence.get('rollback_reason') != 'local_health_failed'
+                or evidence.get('rollback_reason') != 'manage_contact_failed'
                 or evidence.get('fault') != 'owned_candidate_manage_transport_gate_until_automatic_fallback'):
             raise ValueError('Rollback requires appliance-initiated recovery with a reason')
         validate_rollback_gate(evidence)
