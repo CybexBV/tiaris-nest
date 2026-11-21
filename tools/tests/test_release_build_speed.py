@@ -128,6 +128,19 @@ class ReleaseGateWiringTests(unittest.TestCase):
             self.assertIn(f'gate_{gate}() {{', script)
         contracts = script.split('gate_contracts() {', 1)[1].split('\n}\n', 1)[0]
         self.assertIn('  gate_bash_syntax\n  gate_shellcheck\n', contracts)
+        rust = script.split('gate_rust() {', 1)[1].split('\n}\n', 1)[0]
+        self.assertIn('  gate_expiry\n  cargo audit --ignore', rust)
+
+    def test_the_expiry_gate_needs_only_date_and_fails_after_the_review_date(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            for today, expected in (('2027-02-01', 0), ('2027-02-02', 1)):
+                with self.subTest(today=today):
+                    fake = Path(temporary) / 'date'
+                    fake.write_text(f'#!/bin/sh\necho {today}\n')
+                    fake.chmod(0o755)
+                    result = subprocess.run(['bash', str(GATES), 'expiry'], capture_output=True, text=True,
+                                            env={'PATH': f'{temporary}:/usr/bin:/bin'}, timeout=30)
+                    self.assertEqual(result.returncode, expected, result.stderr)
 
 
 @unittest.skipUnless(shutil.which('git') and shutil.which('setsid') and shutil.which('ps'),
@@ -144,7 +157,7 @@ class ReleaseGateRunTests(unittest.TestCase):
         # The real start/join/stop, with the gates replaced by commands from the
         # fixture's environment: start runs the copy inside the clean checkout.
         real = GATES.read_text()
-        fake = real.replace('  contracts | rust | nix | bash-syntax | shellcheck)\n'
+        fake = real.replace('  contracts | rust | nix | bash-syntax | shellcheck | expiry)\n'
                             '    [ "$#" -eq 1 ] || { echo "usage: $0 GATE" >&2; exit 2; }\n'
                             '    "gate_${1//-/_}"\n',
                             '  contracts | rust | nix)\n'

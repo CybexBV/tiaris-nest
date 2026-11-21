@@ -94,7 +94,7 @@ def inspect(expected_immutable_id=None):
         f'Tiaris-Release-Workflow: {values["GITHUB_SERVER_URL"]}/{name}/actions/runs/{values["GITHUB_RUN_ID"]}',
         f'Tiaris-Candidate-Artifact-ID: {values["TIARIS_NEST_RELEASE_ARTIFACT_ID"]}',
         f'Tiaris-Candidate-Artifact-SHA256: {values["TIARIS_NEST_RELEASE_ARTIFACT_DIGEST"]}',
-        'Tiaris-VM-Qualification: nightly',
+        'Tiaris-VM-Qualification: on-demand',
         'Tiaris-Public-Closure: required')) for name in repositories.names(repository)}
     if (type(release.get('id')) is not int or release['id'] <= 0
             or release.get('name') != f'Tiaris Nest {tag}'
