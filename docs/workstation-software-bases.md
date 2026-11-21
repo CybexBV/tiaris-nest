@@ -69,9 +69,12 @@ Manage offers it as a software update.
   API's rate limit, records `blocked`, `provenance_unverified`.
 - **Retries and time.** A recorded commit is evaluated again when its
   evaluation, provenance or disk check failed at least a day ago. At startup
-  the record of every commit another Nest build held back is removed and the
-  channel is read again at once: an update of the Nest may be what the
-  commit waited for. A ready commit stays ready. A request from Manage
+  the record of every commit another Nest build held back is removed, and an
+  updated Nest whose new build has recorded no commit yet reads the channel
+  again at once: the update may be what the commit waited for. A newly
+  installed Nest has no records and waits for the daily check: the
+  evaluation is heavy and its first hours are the school's install day. A
+  ready commit stays ready. A request from Manage
   repeats only the channel lookup. One commit's
   evaluation is bounded to 60 minutes (`evaluation_failed`, `time limit`).
 - **Disk.** The check needs 4 GiB free in the build work directory

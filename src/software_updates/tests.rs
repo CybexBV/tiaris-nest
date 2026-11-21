@@ -1004,6 +1004,42 @@ async fn ready_commits_of_an_older_nest_are_taken_over_and_its_records_left_alon
     assert!(serde_json::from_value::<RecordOfNest0_2_173>(own).is_err());
 }
 
+#[tokio::test]
+async fn only_an_updated_nest_looks_at_the_channel_when_it_starts() {
+    // A newly installed Nest waits for the nightly check: the evaluation is
+    // heavy and would run while the school installs its first computers.
+    let stores = stores("startup-look").await;
+    let (pool, data) = (&stores.pool, stores.data.as_path());
+    assert!(!updated_nest_has_not_looked(data).await);
+    // Records of Nest 0.2.173, whatever they say: this Nest was updated.
+    crate::state_files::write(
+        &older_nests_detected_dir(data),
+        &format!("{COMMIT}.json"),
+        DETECTED_SCHEMA,
+        MAX_DETECTED_RECORD_BYTES,
+        &json!({}),
+    )
+    .unwrap();
+    assert!(updated_nest_has_not_looked(data).await);
+    // Once this build has recorded a commit it follows the daily check.
+    store_detected(
+        pool,
+        data,
+        COMMIT,
+        DEFAULT_CHANNEL,
+        &metadata(1_793_294_725),
+        &ready_outcome(),
+    )
+    .await
+    .unwrap();
+    assert!(!updated_nest_has_not_looked(data).await);
+    // A record of another build of this Nest: updated, not looked yet.
+    tamper(data, COMMIT, |record| {
+        record["derived_by"] = json!("0.2.174 release=0.2.174 source=a tiaris=b");
+    });
+    assert!(updated_nest_has_not_looked(data).await);
+}
+
 /// Provenance of a real commit through the GitHub API. Not part of CI.
 /// Set `TIARIS_SOFTWARE_UPDATE_COMMIT` (and optionally `..._CHANNEL`).
 #[tokio::test]
