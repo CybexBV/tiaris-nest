@@ -106,7 +106,20 @@ pub(crate) fn state_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("software-updates")
 }
 
+/// Where this Nest keeps its detected commits.
 fn detected_dir(data_dir: &Path) -> PathBuf {
+    state_dir(data_dir).join("detected-commits")
+}
+
+/// Where Nest 0.2.173 and older keep theirs, with a build profile in each
+/// record. Such a Nest can run again after this one: an update that fails
+/// its health check goes back to it, and its generation stays in the boot
+/// menu. It cannot read a record without a profile, and it writes its own
+/// verdict over the record of the channel's newest commit. So this Nest
+/// takes the ready commits from that folder (`adopt_ready_commits_of_older_nests`)
+/// and writes nothing there: each of the two finds its records as it left
+/// them.
+fn older_nests_detected_dir(data_dir: &Path) -> PathBuf {
     state_dir(data_dir).join("detected")
 }
 
@@ -120,8 +133,8 @@ const MAX_CHECK_STATE_BYTES: u64 = 64 * 1024;
 /// Detected commits kept: every ready one a Blueprint job uses, then the
 /// newest. The report sends at most `MAX_REPORTED_DETECTED_COMMITS`.
 const MAX_DETECTED_RECORDS: usize = 64;
-/// A record with another reason is not used. Those an older Nest wrote for
-/// the strict "Nest only" check are removed at startup.
+/// A record with another reason is not used: those of an older Nest's strict
+/// "Nest only" check.
 const DETECTED_REASONS: [&str; 4] = [
     REASON_SOURCE_BUILD_REQUIRED,
     REASON_EVALUATION_FAILED,
@@ -247,8 +260,8 @@ pub(crate) async fn apply_managed(
     Ok(())
 }
 
-/// One detected commit, one record each (`detected/<commit>.json`). Fields
-/// an older Nest wrote and this one does not know are ignored.
+/// One detected commit, one record each (`detected-commits/<commit>.json`).
+/// Fields an older Nest wrote and this one does not know are ignored.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct DetectedRow {
     commit_rev: String,
@@ -493,10 +506,14 @@ async fn run(state: AppState) {
         Ok(_) => {}
         Err(error) => warn!(error = %error, "could not read software update check state"),
     }
-    // After an update of this Nest, what the previous build held back is
-    // forgotten and the channel is looked at again now rather than at the
-    // daily check: the update may be what it waited for.
-    if forget_verdicts_of_other_builds(&state.config.paths.data_dir).await {
+    // After an update of this Nest, the ready commits of the previous build
+    // stay, what it held back is forgotten, and the channel is looked at
+    // again now rather than at the daily check: the update may be what it
+    // waited for.
+    let data_dir = &state.config.paths.data_dir;
+    adopt_ready_commits_of_older_nests(data_dir).await;
+    let forgot = forget_verdicts_of_other_builds(data_dir).await;
+    if forgot || !this_build_has_a_verdict(data_dir).await {
         // The network may come up after the Nest: try for some minutes.
         for attempt in 1..=STARTUP_CHECK_ATTEMPTS {
             match check(&state).await {
@@ -667,6 +684,48 @@ fn needs_evaluation(existing: Option<&DetectedRow>, now: DateTime<Utc>) -> bool 
         ) && parse_timestamp(Some(&row.detected_at))
             .is_none_or(|detected| now - detected >= RETRY_INTERVAL)
     })
+}
+
+/// Take over the ready commits Nest 0.2.173 and older recorded
+/// (`older_nests_detected_dir`), so the Blueprints released on them keep
+/// building. A commit this Nest has a record of keeps it. What the older
+/// Nest held back is not taken over, and its records are left as they are.
+async fn adopt_ready_commits_of_older_nests(data_dir: &Path) {
+    let older = older_nests_detected_dir(data_dir);
+    let dir = detected_dir(data_dir);
+    let _guard = crate::state_files::lock(&dir).await;
+    for name in crate::state_files::list(&older, ".json", 4 * MAX_DETECTED_RECORDS) {
+        let commit = name.trim_end_matches(".json");
+        if !valid_commit(commit) || matches!(detected_row(data_dir, commit).await, Ok(Some(_))) {
+            continue;
+        }
+        let ready = crate::state_files::read::<DetectedRow>(
+            &older,
+            &name,
+            DETECTED_SCHEMA,
+            MAX_DETECTED_RECORD_BYTES,
+        )
+        .filter(|row| row.is_valid(commit) && row.state == "ready");
+        let Some(row) = ready else { continue };
+        if let Err(error) = crate::state_files::write(
+            &dir,
+            &name,
+            DETECTED_SCHEMA,
+            MAX_DETECTED_RECORD_BYTES,
+            &row,
+        ) {
+            warn!(%commit, error = %format!("{error:#}"), "could not take over a ready commit of an older Nest");
+        }
+    }
+}
+
+/// Whether this Nest build has recorded a commit. One that has not looks at
+/// the channel when it starts.
+async fn this_build_has_a_verdict(data_dir: &Path) -> bool {
+    let build = nest_build_identity();
+    detected_rows(data_dir)
+        .await
+        .is_ok_and(|rows| rows.iter().any(|row| row.derived_by == build))
 }
 
 /// Remove the record of every commit another Nest build held back, whatever

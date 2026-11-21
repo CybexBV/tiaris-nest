@@ -855,8 +855,8 @@ async fn startup_forgets_what_another_nest_build_held_back() {
         .await
         .unwrap();
     }
-    // Records of the Nest release before this one: a ready commit, a verdict
-    // of the removed strict check, and a verdict this build could give too.
+    // Records of another Nest build: a ready commit, a verdict with a reason
+    // this build does not have, and a verdict this build could give too.
     for commit in [&ready, &strict, &compile] {
         tamper(data, commit, |record| {
             record["derived_by"] = json!("0.2.173 release=0.2.173 source=a tiaris=b");
@@ -875,6 +875,103 @@ async fn startup_forgets_what_another_nest_build_held_back() {
     assert_eq!(left, BTreeSet::from([ready, own]));
     assert!(!detected_dir(data).join(format!("{strict}.json")).exists());
     assert!(!forget_verdicts_of_other_builds(data).await);
+}
+
+/// A record as Nest 0.2.173 reads it (`src/software_updates.rs` of 4738fba):
+/// no other fields, and all of them but `profile` are required.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct RecordOfNest0_2_173 {
+    commit_rev: String,
+    channel: String,
+    last_modified: String,
+    nar_hash: String,
+    kernel_version: String,
+    state: String,
+    reason: Option<String>,
+    reason_details: String,
+    profile: Option<String>,
+    tiaris_derivations: String,
+    detected_at: String,
+    derived_by: String,
+}
+
+#[tokio::test]
+async fn ready_commits_of_an_older_nest_are_taken_over_and_its_records_left_alone() {
+    // Nest 0.2.173 can run again after this one (a failed update goes back
+    // to it; its generation stays in the boot menu). It must find its
+    // records as it left them, and none it cannot read.
+    let stores = stores("older-nest").await;
+    let (pool, data) = (&stores.pool, stores.data.as_path());
+    let [ready, held, decided, new] = ["1", "2", "3", "4"].map(|digit| digit.repeat(40));
+    let older = older_nests_detected_dir(data);
+    let record = |commit: &str, reason: Value| {
+        json!({
+            "commit_rev": commit, "channel": DEFAULT_CHANNEL,
+            "last_modified": "2026-11-01T00:00:00Z", "nar_hash": NAR_HASH,
+            "kernel_version": "6.18.59",
+            "state": if reason.is_null() { "ready" } else { "blocked" },
+            "profile": if reason.is_null() { json!("{}") } else { Value::Null },
+            "reason": reason, "reason_details": "[]", "tiaris_derivations": "[]",
+            "detected_at": "2026-11-02T03:00:00Z",
+            "derived_by": "0.2.173 release=0.2.173 source=a tiaris=b",
+        })
+    };
+    assert!(serde_json::from_value::<RecordOfNest0_2_173>(record(&ready, Value::Null)).is_ok());
+    for (commit, reason) in [
+        (&ready, Value::Null),
+        (&held, json!("build_script_changed")),
+        (&decided, Value::Null),
+    ] {
+        crate::state_files::write(
+            &older,
+            &format!("{commit}.json"),
+            DETECTED_SCHEMA,
+            MAX_DETECTED_RECORD_BYTES,
+            &record(commit, reason),
+        )
+        .unwrap();
+    }
+    let older_records = || {
+        let mut records = std::fs::read_dir(&older)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .map(|path| (path.clone(), std::fs::read(path).unwrap()))
+            .collect::<Vec<_>>();
+        records.sort();
+        records
+    };
+    let before = older_records();
+    // This Nest already decided on one of the commits, and records a new one.
+    for (commit, outcome) in [(&decided, blocked_outcome()), (&new, ready_outcome())] {
+        store_detected(
+            pool,
+            data,
+            commit,
+            DEFAULT_CHANNEL,
+            &metadata(1_793_294_725),
+            &outcome,
+        )
+        .await
+        .unwrap();
+    }
+
+    adopt_ready_commits_of_older_nests(data).await;
+
+    assert!(ready_commit(data, &ready).await.unwrap().is_some());
+    assert!(detected_row(data, &held).await.unwrap().is_none());
+    assert!(ready_commit(data, &decided).await.unwrap().is_none());
+    assert_eq!(older_records(), before);
+    // Why this Nest keeps its records apart: the older one cannot read them.
+    let own: Value = crate::state_files::read(
+        &detected_dir(data),
+        &format!("{new}.json"),
+        DETECTED_SCHEMA,
+        MAX_DETECTED_RECORD_BYTES,
+    )
+    .unwrap();
+    assert!(serde_json::from_value::<RecordOfNest0_2_173>(own).is_err());
 }
 
 /// Provenance of a real commit through the GitHub API. Not part of CI.
