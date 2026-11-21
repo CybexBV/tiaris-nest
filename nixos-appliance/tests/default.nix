@@ -99,11 +99,14 @@
       machine.succeed("runuser -u tiaris-nest -- nix-build /etc/qualification/build.nix --no-out-link | xargs cat | grep -Fx tiaris-daemon-build")
       machine.succeed("ip link add enp-test type dummy")
       machine.succeed("ip link set enp-test address 02:00:00:00:00:42 up")
+      # networkd starts only after the approved plan is rendered
+      # (tiaris-nest-network-render), so the plan is in place first, as on
+      # an installed Nest.
+      machine.succeed("install -d -m0750 -o root -g tiaris-nest /var/lib/tiaris-nest/control")
+      machine.succeed("install -m0600 /etc/qualification/network.json /var/lib/tiaris-nest/control/netplan-approved.json")
       machine.succeed("install -m0600 /etc/qualification/network.json /etc/netplan/90-tiaris-nest.yaml")
       machine.succeed("/usr/lib/tiaris-nest/tiaris-nest-netplan-activate")
       machine.wait_until_succeeds("ip -4 address show dev enp-test | grep -F 192.0.2.42/24")
-      machine.succeed("install -d -m0750 -o root -g tiaris-nest /var/lib/tiaris-nest/control")
-      machine.succeed("install -m0600 /etc/qualification/network.json /var/lib/tiaris-nest/control/netplan-approved.json")
       machine.succeed("printf '192.0.2.0/24\\n2001:db8::/32\\n' > /var/lib/tiaris-nest/control/management-cidrs.txt")
       machine.succeed("chmod 0640 /var/lib/tiaris-nest/control/management-cidrs.txt")
       machine.succeed("/usr/lib/tiaris-nest/tiaris-nest-firewall")
