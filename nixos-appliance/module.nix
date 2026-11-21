@@ -234,6 +234,9 @@ in {
       startLimitIntervalSec = 0;
       serviceConfig = { ExecStart = "${pkgs.tftp-hpa}/bin/in.tftpd --foreground --listen --address 0.0.0.0:69 --user tftp --secure /var/cache/tiaris-nest/tftp"; Restart = "always"; RestartSec = "5s"; };
     };
+    # The watchdog restarts a hung daemon: it is told the daemon lives only
+    # while its own HTTP server answers on loopback (src/main.rs). Five
+    # minutes leave a busy Nest alone.
     systemd.services.tiaris-nest = {
       wantedBy = [ "multi-user.target" ]; after = [ "network-online.target" "tiaris-nest-first-boot.service" "tiaris-nest-network-guard.service" "tiaris-nest-network-runtime.service" "nginx.service" "tftpd-hpa.service" "nix-daemon.service" ];
       requires = [ "tiaris-nest-first-boot.service" "tiaris-nest-network-runtime.service" ]; wants = [ "network-online.target" "tiaris-nest-network-guard.service" "nginx.service" "tftpd-hpa.service" "nix-daemon.service" ];
@@ -241,7 +244,7 @@ in {
       # vulnix scans update candidates (src/software_updates/findings.rs); its
       # NVD database is cached in /var/lib/tiaris-nest/state/agent/vulnix.
       path = [ pkgs.nix pkgs.git pkgs.openssh pkgs.coreutils pkgs.iproute2 pkgs.systemd pkgs.vulnix ];
-      serviceConfig = { MemoryAccounting = true; Type = "notify"; NotifyAccess = "all"; WatchdogSec = "30s"; User = "tiaris-nest"; Group = "tiaris-nest"; ExecStart = "${a.package}/bin/tiaris-nest --config /etc/tiaris-nest/config.toml serve"; Restart = "always"; RestartSec = "3s"; UMask = "0077"; NoNewPrivileges = true; PrivateTmp = true; PrivateDevices = true; ProtectSystem = "strict"; ProtectHome = true; ProtectKernelTunables = true; ProtectKernelModules = true; ProtectControlGroups = true; CapabilityBoundingSet = ""; AmbientCapabilities = ""; RestrictAddressFamilies = [ "AF_UNIX" "AF_INET" "AF_INET6" "AF_NETLINK" ]; ReadWritePaths = [ "/var/lib/tiaris-nest/state/agent" "/var/lib/tiaris-nest/state/inbox" "/var/cache/tiaris-nest" "/run/lock/tiaris-nest/maintenance.lock" "/run/tiaris-nest" ];
+      serviceConfig = { MemoryAccounting = true; Type = "notify"; NotifyAccess = "all"; WatchdogSec = "5min"; User = "tiaris-nest"; Group = "tiaris-nest"; ExecStart = "${a.package}/bin/tiaris-nest --config /etc/tiaris-nest/config.toml serve"; Restart = "always"; RestartSec = "3s"; UMask = "0077"; NoNewPrivileges = true; PrivateTmp = true; PrivateDevices = true; ProtectSystem = "strict"; ProtectHome = true; ProtectKernelTunables = true; ProtectKernelModules = true; ProtectControlGroups = true; CapabilityBoundingSet = ""; AmbientCapabilities = ""; RestrictAddressFamilies = [ "AF_UNIX" "AF_INET" "AF_INET6" "AF_NETLINK" ]; ReadWritePaths = [ "/var/lib/tiaris-nest/state/agent" "/var/lib/tiaris-nest/state/inbox" "/var/cache/tiaris-nest" "/run/lock/tiaris-nest/maintenance.lock" "/run/tiaris-nest" ];
         # Public console projection (console-status.json, 0644) for the root
         # tty1 kiosk. Preserved across restarts so a stopped daemon leaves a
         # visibly stale status instead of an apparent first boot.
