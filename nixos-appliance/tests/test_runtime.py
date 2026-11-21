@@ -274,6 +274,55 @@ class PrepareThenSwitch(unittest.TestCase):
         self.assertLess(stage.index('waiting_for()'), stage.index('activate(prepared)'))
 
 
+class RoomForAnUpdate(unittest.TestCase):
+    """An update is refused for disk space only after the Nest made room."""
+    def test_cache_retention_is_asked_first_and_garbage_goes_only_when_still_short(self):
+        for retention_frees, expected in ((60, ['retention']), (10, ['retention', 'gc']), (None, ['retention', 'gc'])):
+            with self.subTest(retention_frees=retention_frees):
+                free, steps = [40], []
+                def retention(*command, **kwargs):
+                    # As the service user, for exactly the bytes the verifier named.
+                    self.assertEqual(command[:5], ('setpriv', '--reuid', '985', '--regid', '985'))
+                    self.assertEqual(command[-3:], ('free-cache-space', '--available-bytes', '100'))
+                    steps.append('retention')
+                    if retention_frees is None:
+                        raise subprocess.CalledProcessError(1, command)
+                    free[0] += retention_frees
+                with patch.object(update.shutil, 'disk_usage', side_effect=lambda path: SimpleNamespace(free=free[0])), \
+                        patch.object(update, 'run', side_effect=retention), \
+                        patch.object(update, 'collect_garbage', side_effect=lambda: steps.append('gc')):
+                    update.make_room(100)
+                self.assertEqual(steps, expected)
+        with patch.object(update.shutil, 'disk_usage', return_value=SimpleNamespace(free=100)), \
+                patch.object(update, 'run') as retention, patch.object(update, 'collect_garbage') as collect:
+            update.make_room(100)
+        retention.assert_not_called()
+        collect.assert_not_called()
+
+    def verify(self, *results):
+        commands, room = [], []
+        results = iter(results)
+        def verifier(command, **kwargs):
+            commands.append(command[2:])
+            code, output = next(results)
+            return SimpleNamespace(returncode=code, stdout=output, stderr='Error: insufficient_store_space' if code == 1 else '')
+        with patch.object(update.subprocess, 'run', side_effect=verifier), \
+                patch.object(update, 'make_room', side_effect=room.append):
+            try:
+                return update.verified_cache(), commands, room
+            except subprocess.CalledProcessError:
+                return None, commands, room
+
+    def test_the_verifier_refuses_for_disk_space_only_after_room_was_made(self):
+        # Enough room: nothing is freed.
+        self.assertEqual(self.verify((0, '/private/cache\n')), (Path('/private/cache'), [[]], []))
+        # Short of space: make the room the verifier names, then it passes.
+        self.assertEqual(self.verify((75, '100\n'), (0, '/private/cache\n')), (Path('/private/cache'), [[], []], [100]))
+        # Still short after making room twice: the last run may end the attempt.
+        self.assertEqual(self.verify((75, '100\n'), (75, '300\n'), (1, '')),
+                         (None, [[], [], ['--space-freed']], [100, 300]))
+
+
 class NetworkPolicy(unittest.TestCase):
     def config(self):
         return {'network': {'version': 2, 'renderer': 'networkd', 'ethernets': {'tiaris-nest': {

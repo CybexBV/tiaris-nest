@@ -14,6 +14,17 @@ use serde::Serialize;
 /// operation cannot itself fill the filesystem to the brim.
 pub const DISK_HEADROOM_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// The free space the Nest keeps on the disk that holds its store, its cache
+/// and its build work: room for one largest build, plus headroom. This is the
+/// only reserve. Cache retention keeps it free, a build needs it to start
+/// (`ensure_headroom` for one largest build is the same sum) and an appliance
+/// update must leave it after its import.
+pub fn free_space_floor(build: &crate::config::BuildConfig) -> u64 {
+    build
+        .max_artifact_size_bytes
+        .saturating_add(DISK_HEADROOM_BYTES)
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct DiskStats {
     pub path: String,

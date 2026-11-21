@@ -497,7 +497,9 @@ The Nest prepares an update as soon as it arrives, while the running release
 keeps serving: root independently verifies the bounded archive and the live
 SQLite migration inventory, imports and roots its closure, checks it against the
 release and rehearses the database (status `waiting_window`, stage
-`preparing_ahead`). Nothing touches boot state yet. Signed policy then admits
+`preparing_ahead`). An update that does not fit on the disk first makes room
+(cache retention, then garbage collection) and is refused only after that, with
+the reason `insufficient_store_space`. Nothing touches boot state yet. Signed policy then admits
 the switch: **Update now**, the Nest being idle, or the night period the policy
 names (the deadline for a Nest that is never idle). There are no modes: a policy
 signed earlier with mode `window` is read the same way. While it waits the stage

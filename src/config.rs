@@ -41,8 +41,20 @@ pub enum Command {
     Migrate,
     /// Validate a complete appliance configuration without printing it.
     ValidateApplianceConfig,
-    /// Re-verify and extract the currently staged signed NixOS update.
-    VerifyApplianceUpdate,
+    /// Re-verify and extract the currently staged signed NixOS update. Short
+    /// of disk space it changes nothing, prints the bytes that must be free
+    /// and exits 75, so the root updater can free space and ask again.
+    VerifyApplianceUpdate {
+        /// The caller freed what it could: too little space ends the attempt.
+        #[arg(long)]
+        space_freed: bool,
+    },
+    /// Make room for an appliance update: cache retention, until this many
+    /// bytes are free. The root updater runs it as the service user.
+    FreeCacheSpace {
+        #[arg(long)]
+        available_bytes: u64,
+    },
     /// Verify and persist an exact signed NixOS maintenance schedule.
     VerifyApplianceUpdatePolicy,
     /// Read-only verification of one root-owned database compatibility snapshot.

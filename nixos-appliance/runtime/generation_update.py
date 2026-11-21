@@ -10,7 +10,7 @@ import shutil
 import subprocess
 import time
 
-from appliance_state import (CONTROL, STATUS, INBOX, STATE, PROFILE, UID, canonical,
+from appliance_state import (CONTROL, STATUS, INBOX, STATE, PROFILE, UID, GID, canonical,
     current, directory, emit_status, generation_for, load, maintenance_lock, read,
     remove, run, save, set_default, sync_dir)
 
@@ -385,15 +385,68 @@ def retire_generations(rows):
     print('Retired generations that cannot run on the candidate schema: ' + ', '.join(sorted(retired)), flush=True)
 
 
-def free_space(verified):
-    usage = shutil.disk_usage('/nix/store')
-    # Root verification accounted staging and imported paths on their actual
-    # filesystems. Staging is allocated now; reserve only still-missing NARs.
-    needed = verified['missing_nar_bytes'] + 23 * 1024 ** 3
-    if usage.free < needed:
-        raise ValueError('insufficient_store_space')
+class BootPartitionFull(ValueError):
+    """The EFI partition has no room for another kernel and initrd."""
+
+
+def boot_space():
+    # Nothing to free here first: at every switch NixOS's boot loader
+    # installer removes the kernels and initrds that no kept generation
+    # names, before it copies new ones (system.nix keeps four generations).
     if shutil.disk_usage('/boot').free < 256 * 1024 ** 2:
-        raise ValueError('insufficient_esp_space')
+        raise BootPartitionFull('insufficient_esp_space')
+
+
+VERIFY = ('/usr/bin/tiaris-nest', 'verify-appliance-update')
+GIB = 1024 ** 3
+
+
+def collect_garbage():
+    for row in load(KNOWN)['generations']:
+        pin(row['system_toplevel'], 'good-' + row['system_generation'])
+    run('nix-store', '--gc', timeout=3600)
+
+
+def make_room(required):
+    """Free disk space before an update is refused for it, until `required`
+    bytes are free: the Nest drops cache files that nothing needs kept (its
+    own retention, asked for more room), then the store's garbage goes, as
+    in the daily collection. Both are best effort: the verifier looks again."""
+    # The cache and its inventory belong to the Nest service user.
+    retention = ['setpriv', '--reuid', str(UID), '--regid', str(GID), '--clear-groups',
+                 '/usr/bin/tiaris-nest', 'free-cache-space', '--available-bytes', str(required)]
+    for name, free in (('cache retention', lambda: run(*retention, timeout=1800)),
+                       ('garbage collection', collect_garbage)):
+        short = required - shutil.disk_usage('/nix/store').free
+        if short <= 0:
+            return
+        print(f'The update needs {required / GIB:.1f} GiB of free disk space, {short / GIB:.1f} GiB '
+              f'more than there is: making room by {name}.', flush=True)
+        try:
+            free()
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            print(f'Making room by {name} failed: {type(error).__name__}', flush=True)
+
+
+def verified_cache():
+    """The private cache the root verifier extracts from the staged update.
+    Short of disk space the verifier changes nothing and says how many bytes
+    must be free (exit 75). Make room and ask again: once for what is known
+    before the archive is read, once for the store paths it turns out to
+    miss. Told that space was freed, the verifier ends the attempt itself,
+    with the reason `insufficient_store_space`."""
+    for space_freed in (False, False, True):
+        command = [*VERIFY, '--space-freed'] if space_freed else list(VERIFY)
+        result = subprocess.run(command, text=True, capture_output=True, timeout=4 * 3600)
+        if result.returncode != 75:
+            break
+        make_room(int(result.stdout.strip()))
+    if result.returncode:
+        if 'insufficient_store_space' in result.stderr:
+            print('The update is refused: the disk has too little free space for it, '
+                  'also after making room.', flush=True)
+        raise subprocess.CalledProcessError(result.returncode, command, result.stdout, result.stderr)
+    return Path(result.stdout.strip())
 
 
 WINDOW = '/usr/lib/tiaris-nest/tiaris-nest-appliance-update-window'
@@ -474,7 +527,7 @@ def prepare():
         emit_status(identity, 'waiting_window', 'preparing_ahead')
     # Root verifier revalidates signature, exact inbox inode/archive, complete
     # NAR graph, live SQLite and signed policy before yielding private cache.
-    cache = Path(run('/usr/bin/tiaris-nest', 'verify-appliance-update', timeout=4 * 3600))
+    cache = verified_cache()
     attempt = safe_attempt(cache.parent.name)
     if cache != STAGING / 'private' / attempt / 'cache':
         raise ValueError('invalid verified update cache path')
@@ -486,7 +539,7 @@ def prepare():
         raise ValueError('invalid verified update receipt')
     receipt = dict(verified)
     try:
-        free_space(verified)
+        boot_space()
         run('nix', '--extra-experimental-features', 'nix-command', 'copy', '--from', 'file://' + str(cache),
             '--option', 'substituters', '', '--option', 'require-sigs', 'true', verified['system_toplevel'], timeout=4 * 3600)
         # Root the closure first so garbage collection cannot swap a
@@ -505,7 +558,8 @@ def prepare():
             (ROOTS / ('pending-' + attempt)).unlink(missing_ok=True)
             raise
     except Exception as error:
-        reason = 'rollback_database_incompatible' if isinstance(error, DatabaseIncompatible) else 'closure_import_failed'
+        reason = ('rollback_database_incompatible' if isinstance(error, DatabaseIncompatible)
+                  else 'insufficient_esp_space' if isinstance(error, BootPartitionFull) else 'closure_import_failed')
         emit_status(receipt, 'failed', 'verification_failed', reason, current()['system_generation'])
         cleanup(receipt)
         raise
@@ -749,6 +803,4 @@ def gc():
     with maintenance_lock():
         if PENDING.exists() or PREPARE.exists():
             return
-        for row in load(KNOWN)['generations']:
-            pin(row['system_toplevel'], 'good-' + row['system_generation'])
-        run('nix-store', '--gc', timeout=3600)
+        collect_garbage()
