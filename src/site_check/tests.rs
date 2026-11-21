@@ -78,11 +78,11 @@ fn network_boot_without_evidence_is_not_a_pass() {
         (Status::Fail, "boot_service_unavailable")
     );
     let down = boot(
-        Some(&pxe("unavailable", "inventory_stale")),
+        Some(&pxe("unavailable", "inventory_incomplete")),
         Some(&probe(json!({}))),
     );
     assert_eq!(outcome(&down), (Status::Fail, "boot_service_unavailable"));
-    assert_eq!(down.detail, "inventory_stale");
+    assert_eq!(down.detail, "inventory_incomplete");
     let active = pxe("active", "proxy_ready");
     assert_eq!(
         outcome(&boot(Some(&active), None)),
