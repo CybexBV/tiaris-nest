@@ -3,8 +3,8 @@
 //!
 //! A site has one Nest, so the supervisor answers every UEFI computer and needs
 //! only this Nest's identity, whether Tiaris sent its document whole, and the
-//! boot file this Nest serves. Tiaris still sends the other Nests and the
-//! computers (`peers`, `clients`) for Nests up to 0.2.177; they are ignored.
+//! boot file this Nest serves. For Nests up to 0.2.177 Tiaris still sends
+//! `peers` (only this Nest's own row) and an empty `clients`; they are ignored.
 use crate::AppState;
 use anyhow::{Result, bail};
 use axum::{Json, extract::State};
