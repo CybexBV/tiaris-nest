@@ -39,6 +39,54 @@ network = script('tiaris-nest-netplan-activate')
 firewall = script('tiaris-nest-firewall')
 first_boot = script('tiaris-nest-first-boot')
 source_copy = script('source-copy.py')
+pxe = script('tiaris-nest-pxe')
+
+
+
+class PxeDocument(unittest.TestCase):
+    NOW = 1_800_000_000
+
+    def document(self, **changes):
+        wrapper = {'received_at': self.NOW, 'bootloader_filename': 'snponly.efi',
+                   'desired': {'schema': pxe.SCHEMA, 'server_device_id': 'nest-1', 'complete': True}}
+        wrapper.update(changes)
+        return wrapper
+
+    def test_without_tiaris_the_last_document_keeps_serving_as_stale(self):
+        self.assertEqual(pxe.validate_desired(self.document(), self.NOW)[1:], ('snponly.efi', False))
+        desired, _, stale = pxe.validate_desired(self.document(), self.NOW + 7 * 24 * 3600)
+        self.assertTrue(stale)
+        self.assertEqual(desired['server_device_id'], 'nest-1')
+
+    def test_an_incomplete_withdrawn_or_malformed_document_is_refused(self):
+        for document, reason in (
+                (self.document(desired={'schema': pxe.SCHEMA, 'server_device_id': 'nest-1', 'complete': False}), 'inventory_incomplete'),
+                (self.document(desired=None), 'inventory_unavailable'),
+                (self.document(received_at='yesterday'), 'inventory_unavailable'),
+                (self.document(bootloader_filename='../x.efi'), 'inventory_unavailable'),
+                (self.document(desired={'schema': pxe.SCHEMA, 'server_device_id': 'a/b', 'complete': True}), 'invalid_identity')):
+            with self.assertRaisesRegex(pxe.Unavailable, reason):
+                pxe.validate_desired(document, self.NOW)
+
+
+class StartCheckReason(unittest.TestCase):
+    def test_a_failed_check_names_its_reason_on_the_screen_until_the_checks_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'console-status.json'
+            with patch.object(first_boot, 'directory'), \
+                    patch.object(first_boot, 'write', lambda target, body, **_: Path(target).write_bytes(body)):
+                first_boot.show_failure('The Nest settings are not valid.', path=path)
+            status = json.loads(path.read_text())
+            self.assertEqual((status['schema'], status['state']), ('tiaris.nest-console-status.v1', 'attention'))
+            self.assertEqual(status['attention']['code'], 'start_check_failed')
+            self.assertTrue(status['attention']['detail'].startswith('The Nest settings are not valid.'))
+            self.assertLessEqual(len(status['attention']['detail']), 240)
+            first_boot.clear_failure(path)
+            self.assertFalse(path.exists())
+            # The Nest service's own status is never removed.
+            path.write_text(json.dumps({'state': 'healthy'}))
+            first_boot.clear_failure(path)
+            self.assertTrue(path.exists())
 
 
 class ReadBoundary(unittest.TestCase):

@@ -9,8 +9,9 @@ Two kinds of evidence:
   architecture 7, `PXEClient` vendor class) from a fixed, locally
   administered address derived from the Nest's identity. Every answer is
   sorted: the school's DHCP server (an address), this Nest's own proxy answer,
-  another Nest of the organization, or another server that hands out boot
-  information (options 60/66/67 or a boot file) pointing elsewhere.
+  or another server that hands out boot information (options 60/66/67 or a
+  boot file) pointing elsewhere. A site has one Nest, so a second Nest
+  answering is such a server too.
 - A dropped-answer monitor: dnsmasq logs each proxy answer it sends
   (`log-dhcp`). Network boot firmware repeats the same DHCPDISCOVER (same
   transaction ID) only while no boot answer reached it; one that received the
@@ -107,11 +108,10 @@ def parse_offer(data, xid):
     }
 
 
-def classify(offers, own, peers):
+def classify(offers, own):
     """Sorts the answers to one probe (see the module comment)."""
     own_answer = False
-    dhcp, peer_answers, others = set(), set(), set()
-    known = {own, *peers}
+    dhcp, others = set(), set()
     for offer in offers:
         server = offer['server'] or offer.get('source')
         if not server:
@@ -119,20 +119,17 @@ def classify(offers, own, peers):
         if server == own:
             own_answer = True
             continue
-        if server in peers:
-            peer_answers.add(server)
-            continue
         if offer['address'] != '0.0.0.0':
             dhcp.add(server)
         boot = offer['pxe_client'] or offer['boot_file'] or offer['boot_host']
         target = offer['boot_host'] or (offer['next_server'] if offer['next_server'] != '0.0.0.0' else server)
-        if boot and target not in known:
+        if boot and target != own:
             others.add(server)
     return {'own_answer': own_answer, 'dhcp_servers': sorted(dhcp)[:MAX_LISTED],
-            'peer_answers': sorted(peer_answers)[:MAX_LISTED], 'other_boot_servers': sorted(others)[:MAX_LISTED]}
+            'other_boot_servers': sorted(others)[:MAX_LISTED]}
 
 
-def probe(interface, own, peers, identity, seconds=PROBE_SECONDS):
+def probe(interface, own, identity, seconds=PROBE_SECONDS):
     """Sends one boot DISCOVER on `interface` and sorts the answers."""
     mac = probe_mac(identity)
     xid = random.SystemRandom().randrange(1, 2 ** 32)
@@ -162,7 +159,7 @@ def probe(interface, own, peers, identity, seconds=PROBE_SECONDS):
         return {'outcome': 'error', 'error': 'probe_failed'}
     finally:
         sock.close()
-    return {'outcome': 'ok', **classify(offers, own, set(peers))}
+    return {'outcome': 'ok', **classify(offers, own)}
 
 
 class AnswerMonitor:

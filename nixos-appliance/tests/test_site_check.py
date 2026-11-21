@@ -58,28 +58,28 @@ class BootProbe(unittest.TestCase):
         ack = data.replace(bytes([53, 1, 2]), bytes([53, 1, 5]))
         self.assertIsNone(probe.parse_offer(ack, 7))
 
-    def test_sorts_school_dhcp_own_answer_and_peers(self):
+    def test_sorts_school_dhcp_own_answer_and_a_second_nest(self):
         offers = [probe.parse_offer(offer(1, '192.0.2.1', address='192.0.2.100'), 1),
                   probe.parse_offer(offer(1, OWN, next_server=OWN, options=bytes([60, 9]) + b'PXEClient'), 1),
                   probe.parse_offer(offer(1, '192.0.2.4', options=bytes([60, 9]) + b'PXEClient'), 1)]
-        result = probe.classify(offers, OWN, {'192.0.2.4'})
+        result = probe.classify(offers, OWN)
         self.assertEqual(result, {'own_answer': True, 'dhcp_servers': ['192.0.2.1'],
-                                  'peer_answers': ['192.0.2.4'], 'other_boot_servers': []})
+                                  'other_boot_servers': ['192.0.2.4']})
 
     def test_names_another_boot_server(self):
         offers = [probe.parse_offer(offer(1, '192.0.2.1', address='192.0.2.100', next_server='192.0.2.9', file=b'pxelinux.0'), 1),
                   probe.parse_offer(offer(1, '192.0.2.7', options=bytes([60, 9]) + b'PXEClient'), 1)]
-        result = probe.classify(offers, OWN, set())
+        result = probe.classify(offers, OWN)
         self.assertEqual(result['dhcp_servers'], ['192.0.2.1'])
         self.assertEqual(result['other_boot_servers'], ['192.0.2.1', '192.0.2.7'])
 
     def test_dhcp_options_pointing_at_the_nest_are_fine(self):
         offers = [probe.parse_offer(offer(1, '192.0.2.1', address='192.0.2.100', options=bytes([66, 9]) + OWN.encode()), 1)]
-        result = probe.classify(offers, OWN, set())
+        result = probe.classify(offers, OWN)
         self.assertEqual(result['other_boot_servers'], [])
 
     def test_no_answer_means_no_dhcp_server(self):
-        self.assertEqual(probe.classify([], OWN, set())['dhcp_servers'], [])
+        self.assertEqual(probe.classify([], OWN)['dhcp_servers'], [])
 
     def test_request_file(self):
         self.assertEqual(probe.requested_at({'schema': probe.REQUEST_SCHEMA, 'requested_at': 5}), 5)

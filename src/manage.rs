@@ -2287,7 +2287,7 @@ async fn apply_boot_config(state: &AppState, config: &AgentBootConfigResponse) -
     if let Some(desired) = &mut discovery {
         desired.complete &= config.clients_complete && config.profiles_complete;
     }
-    crate::pxe_discovery::persist(state, discovery.as_ref())?;
+    crate::pxe_discovery::persist(state, discovery.as_ref(), &settings.bootloader_filename)?;
     state.update_runtime_settings(RuntimeSettings {
         public_base_url: settings.public_base_url,
         bootloader_filename: settings.bootloader_filename,

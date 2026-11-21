@@ -189,7 +189,7 @@ async fn run_server(
     let app = router(state.clone());
 
     info!(%listen_addr, "tiaris-nest listening");
-    spawn_systemd_watchdog();
+    spawn_systemd_watchdog(listener.local_addr()?);
 
     axum_serve(
         listener,
@@ -200,27 +200,48 @@ async fn run_server(
     .context("server failed")
 }
 
-fn spawn_systemd_watchdog() {
+/// Tells systemd the service lives only while its own HTTP server answers a
+/// trivial request on loopback, so a hung daemon is restarted. Liveness only:
+/// readiness, PXE, Tiaris contact, locks and builds never count, and the
+/// unit's `WatchdogSec` (5 minutes) leaves room for a busy Nest.
+fn spawn_systemd_watchdog(listening: SocketAddr) {
     if std::env::var_os("NOTIFY_SOCKET").is_none() {
         return;
     }
-    tokio::spawn(async {
+    let target = liveness_target(listening);
+    tokio::spawn(async move {
         let _ = TokioCommand::new("systemd-notify")
             .arg("--ready")
             .status()
             .await;
         loop {
-            sleep(Duration::from_secs(10)).await;
-            if TokioCommand::new("systemd-notify")
-                .arg("WATCHDOG=1")
-                .status()
-                .await
-                .is_err()
-            {
-                warn!("failed to notify systemd watchdog");
+            if tiaris_nest::routes::server_answers(target).await {
+                if TokioCommand::new("systemd-notify")
+                    .arg("WATCHDOG=1")
+                    .status()
+                    .await
+                    .is_err()
+                {
+                    warn!("failed to notify systemd watchdog");
+                }
+            } else {
+                warn!("the Nest's own HTTP server did not answer its liveness request");
             }
+            sleep(Duration::from_secs(10)).await;
         }
     });
+}
+
+/// Where the server answers locally: loopback for a wildcard listener.
+fn liveness_target(listening: SocketAddr) -> SocketAddr {
+    let mut target = listening;
+    if target.ip().is_unspecified() {
+        target.set_ip(match target {
+            SocketAddr::V4(_) => std::net::Ipv4Addr::LOCALHOST.into(),
+            SocketAddr::V6(_) => std::net::Ipv6Addr::LOCALHOST.into(),
+        });
+    }
+    target
 }
 
 async fn shutdown_signal() {
