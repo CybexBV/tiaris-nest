@@ -14,6 +14,27 @@ import (nixpkgs + "/nixos/tests/make-test-python.nix") ({ pkgs, lib, ... }: {
         { address = "192.168.1.10"; prefixLength = 24; }
       ];
       environment.systemPackages = [ pkgs.python3 pkgs.curl pkgs.iproute2 ];
+      # networkd starts only after the approved network plan is rendered
+      # (tiaris-nest-network-render); an installed Nest always has one. This
+      # one names no card of the VM, so eth1 keeps the address set above.
+      system.activationScripts.ssh-policy-network-fixture = {
+        deps = [ "users" "groups" ];
+        text = ''
+          install -d -m0750 -o root -g tiaris-nest /var/lib/tiaris-nest/control
+          install -m0600 -o root -g root ${pkgs.writeText "ssh-policy-network.json" (builtins.toJSON {
+            network = {
+              version = 2;
+              renderer = "networkd";
+              ethernets.tiaris-nest = {
+                match.macaddress = "02:00:00:00:00:42";
+                set-name = "enp-absent";
+                dhcp4 = true;
+                dhcp6 = false;
+              };
+            };
+          })} /var/lib/tiaris-nest/control/netplan-approved.json
+        '';
+      };
       systemd.services.qualification-forward-target = {
         serviceConfig = {
           ExecStart = "${pkgs.python3}/bin/python3 -m http.server 8081 --bind 127.0.0.1 --directory /run/forward-target";
