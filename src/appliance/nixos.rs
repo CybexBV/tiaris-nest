@@ -348,6 +348,9 @@ pub struct InsufficientSpace {
 }
 
 /// Installation: the closure fits and leaves the Nest's free-space floor.
+/// The installer has no configuration to load: it writes the Nest's own
+/// (`provisioning::storage::nest_config`) without a build size, so the
+/// default is the floor the installed Nest keeps.
 pub fn ensure_space(path: &Path, temporary_and_missing: u64) -> Result<()> {
     let floor = crate::disk::free_space_floor(&crate::config::BuildConfig::default());
     let required = temporary_and_missing

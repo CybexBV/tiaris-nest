@@ -186,7 +186,9 @@ def restore_source(receipt):
         raise ValueError('source profile restore failed')
 
 
-def prune_candidate(receipt):
+def prune_candidate(receipt, keep_prepared=False):
+    """Remove the candidate's generation and boot entry, and the store root
+    of its prepared closure unless the update goes on waiting with it."""
     generation = receipt.get('candidate_generation')
     if generation:
         if generation == current()['system_generation']:
@@ -195,7 +197,8 @@ def prune_candidate(receipt):
         entry = Path('/boot/loader/entries') / receipt['candidate_loader_entry']
         entry.unlink(missing_ok=True)
         sync_dir(entry.parent)
-    (ROOTS / ('pending-' + safe_attempt(receipt['attempt_id']))).unlink(missing_ok=True)
+    if not keep_prepared:
+        (ROOTS / ('pending-' + safe_attempt(receipt['attempt_id']))).unlink(missing_ok=True)
     if generation:
         (ROOTS / ('good-' + generation)).unlink(missing_ok=True)
     if ROOTS.exists():
@@ -407,25 +410,32 @@ def collect_garbage():
     run('nix-store', '--gc', timeout=3600)
 
 
-def make_room(required):
+def make_room(required, collect=True):
     """Free disk space before an update is refused for it, until `required`
     bytes are free: the Nest drops cache files that nothing needs kept (its
     own retention, asked for more room), then the store's garbage goes, as
-    in the daily collection. Both are best effort: the verifier looks again."""
+    in the daily collection, unless this attempt collected it before
+    (`collect`). Both are best effort: the verifier looks again. Returns
+    whether the collection ran now."""
     # The cache and its inventory belong to the Nest service user.
     retention = ['setpriv', '--reuid', str(UID), '--regid', str(GID), '--clear-groups',
                  '/usr/bin/tiaris-nest', 'free-cache-space', '--available-bytes', str(required)]
-    for name, free in (('cache retention', lambda: run(*retention, timeout=1800)),
-                       ('garbage collection', collect_garbage)):
+    steps = [('cache retention', lambda: run(*retention, timeout=1800))]
+    if collect:
+        steps.append(('garbage collection', collect_garbage))
+    collected = False
+    for name, free in steps:
         short = required - shutil.disk_usage('/nix/store').free
         if short <= 0:
-            return
+            break
         print(f'The update needs {required / GIB:.1f} GiB of free disk space, {short / GIB:.1f} GiB '
               f'more than there is: making room by {name}.', flush=True)
+        collected = name == 'garbage collection'
         try:
             free()
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             print(f'Making room by {name} failed: {type(error).__name__}', flush=True)
+    return collected
 
 
 def verified_cache():
@@ -433,14 +443,17 @@ def verified_cache():
     Short of disk space the verifier changes nothing and says how many bytes
     must be free (exit 75). Make room and ask again: once for what is known
     before the archive is read, once for the store paths it turns out to
-    miss. Told that space was freed, the verifier ends the attempt itself,
+    miss. The store's garbage goes once: nothing becomes garbage between the
+    two. Told that space was freed, the verifier ends the attempt itself,
     with the reason `insufficient_store_space`."""
+    collect = True
     for space_freed in (False, False, True):
         command = [*VERIFY, '--space-freed'] if space_freed else list(VERIFY)
         result = subprocess.run(command, text=True, capture_output=True, timeout=4 * 3600)
         if result.returncode != 75:
             break
-        make_room(int(result.stdout.strip()))
+        if make_room(int(result.stdout.strip()), collect):
+            collect = False
     if result.returncode:
         if 'insufficient_store_space' in result.stderr:
             print('The update is refused: the disk has too little free space for it, '
@@ -571,7 +584,8 @@ def prepare():
 
 def activate(prepared):
     """The short part: recheck the rooted closure, then arm the candidate as
-    a one-shot boot and restart into it. The source stays the default."""
+    a one-shot boot and restart into it. The source stays the default. The
+    restart happens only while the Nest still reaches Tiaris (`stage`)."""
     attempt = safe_attempt(prepared['attempt_id'])
     cache = Path(prepared['cache_path'])
     receipt = {key: value for key, value in prepared.items() if key not in ('retire_generations', 'prepared_at')}
@@ -604,6 +618,16 @@ def activate(prepared):
         set_default(source['loader_entry'])
         verify_boot_entry(receipt['source_loader_entry'], receipt['source_toplevel'])
         verify_boot_entry(receipt['candidate_loader_entry'], receipt['system_toplevel'])
+        if not contact_fresh():
+            # Arming takes a while and the link to Tiaris went meanwhile. The
+            # candidate would not stay, so nothing is sealed: the Nest undoes
+            # the arming, keeps the prepared update and waits with it.
+            restore_source(receipt)
+            prune_candidate(receipt, keep_prepared=True)
+            remove(PREPARE)
+            emit_status(prepared, 'preparing', 'no_manage_contact')
+            print('Not restarting into the update yet, because the Nest lost Tiaris while it got ready.', flush=True)
+            return
         receipt['schema'] = 'tiaris.nest.pending-system-generation.v3'
         receipt['prepared_boot_id'] = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
         receipt['prepared_at'] = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -747,20 +771,18 @@ class ManageContactFailed(RuntimeError):
 def await_health():
     """The candidate stays once three checks in a row, within 210 seconds,
     found it healthy by itself and in fresh contact with Tiaris. When its own
-    health held three times in a row, only the contact was missing: the Nest
-    reached Tiaris just before the switch (`stage`), so the candidate lost a
-    working link."""
+    health held in the last three checks, only the contact was missing: the
+    Nest reached Tiaris just before the switch (`activate`), so the candidate
+    lost a working link."""
     deadline = time.monotonic() + 210
     healthy = reached = 0
-    only_contact_missing = False
     while time.monotonic() < deadline:
         healthy = healthy + 1 if local_health_ready() else 0
         reached = reached + 1 if healthy and contact_fresh() else 0
         if reached >= 3:
             return
-        only_contact_missing = only_contact_missing or healthy >= 3
         time.sleep(5)
-    if only_contact_missing:
+    if healthy >= 3:
         raise ManageContactFailed('candidate did not reach Tiaris before the health deadline')
     raise RuntimeError('candidate health deadline expired')
 
