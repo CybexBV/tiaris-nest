@@ -383,6 +383,19 @@ class RoomForAnUpdate(unittest.TestCase):
                          (None, [[], [], ['--space-freed']], [100, 300]))
 
 
+    def test_a_boot_partition_that_filled_up_before_the_switch_is_named(self):
+        prepared = {'attempt_id': '11111111-1111-4111-8111-111111111111', 'cache_path': '/cache',
+                    'system_toplevel': '/candidate', 'retire_generations': []}
+        with tempfile.TemporaryDirectory() as roots, patch.object(update, 'ROOTS', Path(roots)), \
+                patch.object(update, 'verify_store_closure'), patch.object(update, 'cleanup'), \
+                patch.object(update, 'current', return_value={'system_generation': '1'}), \
+                patch.object(update.shutil, 'disk_usage', return_value=SimpleNamespace(free=255 * 1024 ** 2)), \
+                patch.object(update, 'emit_status') as emit:
+            with self.assertRaises(update.BootPartitionFull):
+                update.activate(prepared)
+        self.assertEqual(emit.call_args.args[1:], ('failed', 'verification_failed', 'insufficient_esp_space', '1'))
+
+
 class NetworkPolicy(unittest.TestCase):
     def config(self):
         return {'network': {'version': 2, 'renderer': 'networkd', 'ethernets': {'tiaris-nest': {
