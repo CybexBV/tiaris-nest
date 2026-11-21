@@ -436,10 +436,18 @@ certificate-only OpenSSH, atomic management-CIDR SSH nftables policy, watchdog,
 time synchronization, bounded journald and coordinated daily GC. Nest has private
 HOME/XDG/TMP leaves and no Linux capabilities or Nix trusted-user status.
 
-PXE keeps authenticated complete/fresh inventory and per-device placement: the
-site's one Nest answers new computers and the computers assigned to it. It never
-assigns DHCP addresses. Workstation netboot/runtime import, signed binary cache and
-Blueprint builds are the existing product paths.
+PXE: the site's one Nest answers every UEFI computer that starts from the
+network. It never assigns DHCP addresses. The Nest service hands the supervisor
+Tiaris's last complete document (`pxe-discovery.json` beside the managed
+state); the supervisor keeps serving with it without Tiaris (reason
+`inventory_stale`). An incomplete document never replaces a complete one. Only
+a withdrawal stops the proxy: Tiaris sends none, or refuses the Nest as removed
+or replaced. The file reads in both directions across the 0.2.177 boundary: the
+supervisor takes the boot file from the Nest's own row in `peers` when 0.2.177
+wrote the file, and the service keeps writing `peers` and `clients` as Tiaris
+sent them, which the 0.2.177 supervisor needs after a rollback. Workstation
+netboot/runtime import, signed binary cache and Blueprint builds are the
+existing product paths.
 
 Networkd renders STATE's approved deterministic network JSON before startup.
 The network is the one the install plan approved; recurring boot validation

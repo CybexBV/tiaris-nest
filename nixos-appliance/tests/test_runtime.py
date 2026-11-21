@@ -58,6 +58,15 @@ class PxeDocument(unittest.TestCase):
         self.assertTrue(stale)
         self.assertEqual(desired['server_device_id'], 'nest-1')
 
+    def test_a_file_nest_0_2_177_wrote_serves_with_the_boot_file_of_its_own_row(self):
+        # What an update from 0.2.177 finds, often before it reaches Tiaris.
+        before = json.loads((RUNTIME.parents[1] / 'protocol/fixtures/pxe-discovery-nest-0.2.177.json').read_text())
+        self.assertEqual(pxe.validate_desired(before, self.NOW + 7 * 24 * 3600)[1:], ('ipxe.efi', True))
+        # 0.2.177 did not answer without its own row either.
+        before['desired']['peers'] = []
+        with self.assertRaisesRegex(pxe.Unavailable, 'awaiting_appliance_report'):
+            pxe.validate_desired(before, self.NOW)
+
     def test_an_incomplete_withdrawn_or_malformed_document_is_refused(self):
         for document, reason in (
                 (self.document(desired={'schema': pxe.SCHEMA, 'server_device_id': 'nest-1', 'complete': False}), 'inventory_incomplete'),
