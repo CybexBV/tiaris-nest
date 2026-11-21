@@ -1953,7 +1953,37 @@ pub async fn try_enforce_retention(pool: &SqlitePool, config: &AppConfig) -> Res
     Ok(true)
 }
 
+/// Make room for an appliance update before it is refused for disk space:
+/// retention as always, but until `required_available_bytes` are free. It
+/// evicts what retention may evict anyway, oldest first, and nothing that
+/// Tiaris wants kept or an active build produced. The root updater asks for
+/// this (`tiaris-nest free-cache-space`, `generation_update.make_room`).
+pub async fn free_space(
+    pool: &SqlitePool,
+    config: &AppConfig,
+    required_available_bytes: u64,
+) -> Result<()> {
+    let _mutation_lock = acquire_cache_mutation_lock(config).await?;
+    enforce_retention_until(
+        pool,
+        config,
+        required_available_bytes.max(crate::disk::free_space_floor(&config.build)),
+    )
+    .await
+}
+
 async fn enforce_retention_locked(pool: &SqlitePool, config: &AppConfig) -> Result<()> {
+    // The cache shares a filesystem with build work, runtime bundles, and
+    // /nix. Retention therefore keeps the Nest's one free-space floor as well
+    // as enforcing cache.max_bytes.
+    enforce_retention_until(pool, config, crate::disk::free_space_floor(&config.build)).await
+}
+
+async fn enforce_retention_until(
+    pool: &SqlitePool,
+    config: &AppConfig,
+    minimum_available_bytes: u64,
+) -> Result<()> {
     if config.cache.max_bytes == 0 {
         tracing::warn!(
             "cache.max_bytes is 0: Nest Cache retention is disabled and the cache root can grow without bound"
@@ -1962,13 +1992,6 @@ async fn enforce_retention_locked(pool: &SqlitePool, config: &AppConfig) -> Resu
     }
     // Artifact rows only track top-level NARs while `nix copy` stores whole
     // closures, so both the threshold and the reclaim must work on disk state.
-    // The cache shares a filesystem with build work, runtime bundles, and
-    // /nix. Retention therefore preserves enough real free space for one
-    // maximum exact installer target as well as enforcing cache.max_bytes.
-    let minimum_available_bytes = config
-        .build
-        .max_artifact_size_bytes
-        .saturating_add(crate::disk::DISK_HEADROOM_BYTES);
     let mut total = cache_disk_usage(config).await;
     let mut available_bytes = cache_available_bytes(config);
     let mut reclaim_bytes = retention_reclaim_bytes(
@@ -2103,7 +2126,7 @@ async fn enforce_retention_locked(pool: &SqlitePool, config: &AppConfig) -> Resu
             available_disk_evidence = available_bytes.is_some(),
             minimum_available_disk_bytes = minimum_available_bytes,
             remaining_reclaim_bytes = reclaim_bytes,
-            "Nest Cache cannot restore its size and installer-headroom invariants after evicting every eligible artifact"
+            "Nest Cache cannot restore its size limit and the free-space floor after evicting every eligible artifact"
         );
     }
     Ok(())
@@ -4275,17 +4298,28 @@ CA: text:sha256:02ip8n5zbxc22shv5832dwhiaci5r9c306882a058savij6rnn7s\n";
         assert_eq!(retention_reclaim_bytes(80, 64, None, 21), 16);
     }
 
-    #[tokio::test]
-    async fn retention_deletes_unprotected_cache_rows_and_files() {
+    /// A cache of two 20-byte artifacts: one an active build produced, which
+    /// retention never evicts, and one nothing protects.
+    struct RetentionFixture {
+        pool: SqlitePool,
+        config: AppConfig,
+        root: PathBuf,
+        protected_nar: PathBuf,
+        protected_narinfo: PathBuf,
+        unprotected_nar: PathBuf,
+        unprotected_narinfo: PathBuf,
+    }
+
+    async fn retention_fixture(name: &str, max_bytes: u64) -> RetentionFixture {
         let pool = db::connect_with_url("sqlite::memory:").await.unwrap();
         db::migrate(&pool).await.unwrap();
-        let root = test_temp_dir("retention");
+        let root = test_temp_dir(name);
         let cache_root = root.join("cache");
         fs::create_dir_all(cache_root.join("nar")).unwrap();
 
         let mut config = AppConfig::default();
         config.cache.root_dir = cache_root.clone();
-        config.cache.max_bytes = 25;
+        config.cache.max_bytes = max_bytes;
         config.cache.retain_recent_builds = 1;
 
         db::upsert_managed_build_job(
@@ -4367,20 +4401,55 @@ CA: text:sha256:02ip8n5zbxc22shv5832dwhiaci5r9c306882a058savij6rnn7s\n";
         )
         .await
         .unwrap();
+        RetentionFixture {
+            pool,
+            config,
+            root,
+            protected_nar,
+            protected_narinfo,
+            unprotected_nar,
+            unprotected_narinfo,
+        }
+    }
 
-        enforce_retention(&pool, &config).await.unwrap();
-
-        assert!(protected_nar.exists());
-        assert!(protected_narinfo.exists());
-        assert!(!unprotected_nar.exists());
-        assert!(!unprotected_narinfo.exists());
-        let artifacts = db::list_cache_artifacts(&pool).await.unwrap();
+    async fn assert_only_the_protected_artifact_remains(fixture: RetentionFixture) {
+        assert!(fixture.protected_nar.exists());
+        assert!(fixture.protected_narinfo.exists());
+        assert!(!fixture.unprotected_nar.exists());
+        assert!(!fixture.unprotected_narinfo.exists());
+        let artifacts = db::list_cache_artifacts(&fixture.pool).await.unwrap();
         assert_eq!(artifacts.len(), 1);
         assert_eq!(
             artifacts[0].source_build_job_id.as_deref(),
             Some("active-job")
         );
-        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(fixture.root).ok();
+    }
+
+    #[tokio::test]
+    async fn retention_deletes_unprotected_cache_rows_and_files() {
+        let fixture = retention_fixture("retention", 25).await;
+        enforce_retention(&fixture.pool, &fixture.config)
+            .await
+            .unwrap();
+        assert_only_the_protected_artifact_remains(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn asked_for_room_retention_evicts_under_the_size_cap_but_nothing_protected() {
+        let mut fixture = retention_fixture("retention-room", 1024).await;
+        // The floor is only the headroom here, so the test disk has it free.
+        fixture.config.build.max_artifact_size_bytes = 0;
+        enforce_retention(&fixture.pool, &fixture.config)
+            .await
+            .unwrap();
+        assert!(fixture.unprotected_nar.exists());
+
+        // More room than any disk has: everything retention may evict goes.
+        free_space(&fixture.pool, &fixture.config, u64::MAX)
+            .await
+            .unwrap();
+        assert_only_the_protected_artifact_remains(fixture).await;
     }
 
     #[tokio::test]

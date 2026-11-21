@@ -154,7 +154,7 @@ class Run:
             'source_revision': SOURCE, 'system_closure_sha256': d['system_closure']['sha256'],
             'system_toplevel': d['system_toplevel'], 'candidate_system_generation': '11',
             'resulting_system_generation': value['system_generation'], 'status': value['update_status'],
-            'stage': value['update_stage'], 'rollback_reason': 'local_health_failed' if self.rollback else ''}
+            'stage': value['update_stage'], 'rollback_reason': 'manage_contact_failed' if self.rollback else ''}
         return self.node_mutation(value)
 
     def api(self, path, body=None):
@@ -435,7 +435,7 @@ class TransitionTests(unittest.TestCase):
         run = Run(True)
         with tempfile.TemporaryDirectory() as temporary:
             result = run.execute(Path(temporary) / 'result.json')
-        self.assertEqual(result['rollback_reason'], 'local_health_failed')
+        self.assertEqual(result['rollback_reason'], 'manage_contact_failed')
         self.assertEqual(result['resulting_system_generation'], '7')
         self.assertEqual(result['candidate_system_generation'], '11')
         self.assertEqual(result['final_stage'], 'boot_fallback')
@@ -499,7 +499,7 @@ class TransitionTests(unittest.TestCase):
                 with self.assertRaises(ValueError): run.execute(Path(temporary) / 'result.json')
 
     def test_rollback_requires_exact_reason_and_predecessor_closure(self):
-        for mutation in (lambda n: n['appliance_package_update'].update(rollback_reason='candidate_boot_failed'),
+        for mutation in (lambda n: n['appliance_package_update'].update(rollback_reason='local_health_failed'),
                          lambda n: n.update(system_closure_sha256='f' * 64)):
             with tempfile.TemporaryDirectory() as temporary:
                 run = Run(True); run.node_mutation = lambda n: (mutation(n), n)[1]

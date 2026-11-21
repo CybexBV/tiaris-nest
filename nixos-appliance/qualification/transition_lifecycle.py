@@ -161,7 +161,8 @@ def verify_terminal(before, node, attempt, candidate, previous, rollback):
     if (node.get('update_status') != status or node.get('update_stage') != stage
             or node.get('update_attempt_id') != attempt or node.get('update_target_version') != candidate['version']):
         raise ValueError('Terminal update projection differs')
-    if (rollback and package.get('rollback_reason') != 'local_health_failed'):
+    # The gate denies the candidate only its contact with Tiaris.
+    if (rollback and package.get('rollback_reason') != 'manage_contact_failed'):
         raise ValueError('Terminal rollback reason differs')
     if not rollback and package.get('rollback_reason') not in (None, ''):
         raise ValueError('Terminal success contains a rollback reason')

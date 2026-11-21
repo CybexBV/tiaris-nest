@@ -1,12 +1,54 @@
 #!/usr/bin/env python3
 """Start-up checks, at every start: materialize protected state and inspect the booted generation."""
+import datetime
 import hashlib
+import json
 import os
 from pathlib import Path
 import subprocess
 from appliance_state import CONTROL, STATUS, STATE, INBOX, UID, GID, current, directory, load, read, run, save, write
 from boot_next import start_from_this_disk_next_time
 from mount_policy import require_bind_mount, require_mount
+
+# The console screen's status (tiaris.nest-console-status.v1). The Nest service
+# writes it, but needs these checks to pass first; so when one fails, the
+# checks say why there themselves, and clear it again once they pass.
+CONSOLE_STATUS = Path('/run/tiaris-nest/console-status.json')
+FAILED_CODE = 'start_check_failed'
+# What the screen says while each part of the checks runs.
+STEP = ['The start-up checks could not run.']
+
+
+def checking(reason):
+    STEP[0] = reason
+
+
+def failure_status(reason, now):
+    return {
+        'schema': 'tiaris.nest-console-status.v1', 'state': 'attention',
+        'updated_at': now.isoformat(timespec='seconds').replace('+00:00', 'Z'),
+        'attention': {
+            'code': FAILED_CODE, 'title': 'This Nest cannot start its services',
+            'detail': reason + ' It tries again every minute. Remote support finds the details '
+                      'in the log of tiaris-nest-first-boot.',
+            'check': {'label': 'Start-up checks', 'value': 'Failed'},
+        },
+    }
+
+
+def show_failure(reason, path=CONSOLE_STATUS, now=None):
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    # Owned like the Nest service's own runtime directory, which replaces the file.
+    directory(path.parent, 0o755, UID, GID)
+    write(path, (json.dumps(failure_status(reason, now)) + '\n').encode(), mode=0o644, group=0)
+
+
+def clear_failure(path=CONSOLE_STATUS):
+    try:
+        if json.loads(path.read_bytes()).get('attention', {}).get('code') == FAILED_CODE:
+            path.unlink()
+    except (OSError, ValueError, AttributeError):
+        pass
 
 
 def prepare_cache_directories(root=Path('/var/cache/tiaris-nest'), uid=UID, gid=GID,
@@ -26,24 +68,28 @@ def prepare_cache_directories(root=Path('/var/cache/tiaris-nest'), uid=UID, gid=
 
 
 def main():
+    checking('The data disk is not mounted as expected.')
     require_mount(STATE, required=('rw', 'nodev', 'nosuid'))
     require_bind_mount(CONTROL, STATE / 'control', required=('rw', 'nodev', 'nosuid'))
     require_bind_mount(STATUS, STATE / 'status', required=('rw', 'nodev', 'nosuid'))
     require_bind_mount(
         Path('/nix'), Path('/var/cache/tiaris-nest/nix'),
         required=('rw', 'nodev', 'nosuid'), forbidden=('noexec',), root_searchable=True)
+    checking('The Nest could not prepare its folders.')
     directory(STATE, 0o750)
     directory(CONTROL, 0o750)
     directory(STATUS, 0o750)
     directory(STATE / 'agent', 0o700, UID)
     directory(INBOX, 0o700, UID)
     prepare_cache_directories()
+    checking('The Nest settings on the data disk are missing or damaged.')
     for source, destination, mode in (
         ('config.toml', '/etc/tiaris-nest/config.toml', 0o640),
         ('ssh-ca.pub', '/etc/ssh/tiaris-nest-ca.pub', 0o644),
         ('principals', '/etc/ssh/tiaris-nest-principals', 0o644),
     ):
         write(Path(destination), read(CONTROL / source), mode=mode)
+    checking('The system files are damaged.')
     if Path('/nix/store').stat().st_uid != 0:
         raise ValueError('Nix store is not root owned')
     source = Path(os.environ['TIARIS_IPXE_SOURCE'])
@@ -61,13 +107,26 @@ def main():
     # require this unit, and a Nest restarted without internet must start them.
     # The network profile and the address follow in tiaris-nest-network-guard
     # and tiaris-nest-network-runtime.
+    checking('The installed Nest does not pass its own check.')
     run('/usr/lib/tiaris-nest/tiaris-nest-bootstrap', 'validate-installed-state')
+    checking('The Nest settings are not valid.')
     run('/usr/bin/tiaris-nest', '--config', '/etc/tiaris-nest/config.toml', 'validate-appliance-config')
+    checking('The remote support (SSH) settings are not valid.')
     run('sshd', '-t')
+    checking('The Nest could not finish its last system update.')
     from generation_update import recover_boot
     recover_boot()
+    checking('The Nest could not set itself as the disk to start from.')
     start_from_this_disk_next_time()
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except Exception:
+        try:
+            show_failure(STEP[0])
+        except Exception:
+            pass
+        raise
+    clear_failure()

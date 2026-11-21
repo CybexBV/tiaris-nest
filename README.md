@@ -464,7 +464,7 @@ The Tiaris release controller on The Beast (`tiaris-release`, implemented in Cyb
 `deploy/manage/beast_release_workflow.py`) creates a candidate tag with `release/coordinated.json` and
 an immutable workstation source pin to `CybexHQ/tiaris`. The normal release workflow still signs,
 builds once, publishes an immutable prerelease and verifies its public closure; under release policy
-fast-v1 VM qualification is on demand (`Tiaris-VM-Qualification: nightly`). These tags skip
+fast-v1 VM qualification is on demand (`Tiaris-VM-Qualification: on-demand`). These tags skip
 automatic stable promotion. `approve-coordinated-release.yml` promotes only explicitly approved
 tag/source/run and artifact identities, reusing the canonical predecessor/public-closure verifier and
 publication lock. `promote-production-release.py --verify-only` checks the same evidence without
@@ -490,11 +490,17 @@ The Nest prepares an update as soon as it arrives, while the running release
 keeps serving: root independently verifies the bounded archive and the live
 SQLite migration inventory, imports and roots its closure, checks it against the
 release and rehearses the database (status `waiting_window`, stage
-`preparing_ahead`). Nothing touches boot state yet. Signed policy then admits
+`preparing_ahead`). An update that does not fit on the disk first makes room
+(cache retention, then garbage collection) and is refused only after that, with
+the reason `insufficient_store_space`. Nothing touches boot state yet. Signed policy then admits
 the switch: **Update now**, the Nest being idle, or the night period the policy
 names (the deadline for a Nest that is never idle). There are no modes: a policy
 signed earlier with mode `window` is read the same way. While it waits the stage
-is `nest_busy`. At the switch
+is `nest_busy`. The switch also waits until the Nest has just reached Tiaris (a
+report Tiaris accepted in this boot, at most 90 seconds ago): stage
+`no_manage_contact`. The candidate must reach Tiaris to stay, so a Nest that is
+cut off would switch, go back and download the release again; it keeps what it
+prepared instead and switches when the link is back. At the switch
 root checks the closure again, seals the next generation and selects it for one
 boot. Holds, active builds, maintenance leases and network transactions defer
 it. The service polls requests every 30 seconds.
@@ -517,7 +523,9 @@ until the Nest has been up for 30 minutes: then the daemon serves nothing.
 
 The known-good EFI default stays in place until repeated fresh local health
 and permanent-identity Tiaris contact succeed. Failure returns to the known-good
-generation and reports a reason. Durable receipts recover power loss without
+generation and reports a reason: `manage_contact_failed` when the candidate was
+healthy by itself three checks in a row and only did not reach Tiaris (it lost
+a link that worked just before the switch), else `local_health_failed`. Durable receipts recover power loss without
 turning an unfinished attempt into success. Retention preserves current plus
 two preceding known-good generations. The old Ubuntu snapshot cutoff and
 root-service immediate-update override are not NixOS policy inputs.

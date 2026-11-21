@@ -10,7 +10,7 @@ import shutil
 import subprocess
 import time
 
-from appliance_state import (CONTROL, STATUS, INBOX, STATE, PROFILE, UID, canonical,
+from appliance_state import (CONTROL, STATUS, INBOX, STATE, PROFILE, UID, GID, canonical,
     current, directory, emit_status, generation_for, load, maintenance_lock, read,
     remove, run, save, set_default, sync_dir)
 
@@ -385,15 +385,68 @@ def retire_generations(rows):
     print('Retired generations that cannot run on the candidate schema: ' + ', '.join(sorted(retired)), flush=True)
 
 
-def free_space(verified):
-    usage = shutil.disk_usage('/nix/store')
-    # Root verification accounted staging and imported paths on their actual
-    # filesystems. Staging is allocated now; reserve only still-missing NARs.
-    needed = verified['missing_nar_bytes'] + 23 * 1024 ** 3
-    if usage.free < needed:
-        raise ValueError('insufficient_store_space')
+class BootPartitionFull(ValueError):
+    """The EFI partition has no room for another kernel and initrd."""
+
+
+def boot_space():
+    # Nothing to free here first: at every switch NixOS's boot loader
+    # installer removes the kernels and initrds that no kept generation
+    # names, before it copies new ones (system.nix keeps four generations).
     if shutil.disk_usage('/boot').free < 256 * 1024 ** 2:
-        raise ValueError('insufficient_esp_space')
+        raise BootPartitionFull('insufficient_esp_space')
+
+
+VERIFY = ('/usr/bin/tiaris-nest', 'verify-appliance-update')
+GIB = 1024 ** 3
+
+
+def collect_garbage():
+    for row in load(KNOWN)['generations']:
+        pin(row['system_toplevel'], 'good-' + row['system_generation'])
+    run('nix-store', '--gc', timeout=3600)
+
+
+def make_room(required):
+    """Free disk space before an update is refused for it, until `required`
+    bytes are free: the Nest drops cache files that nothing needs kept (its
+    own retention, asked for more room), then the store's garbage goes, as
+    in the daily collection. Both are best effort: the verifier looks again."""
+    # The cache and its inventory belong to the Nest service user.
+    retention = ['setpriv', '--reuid', str(UID), '--regid', str(GID), '--clear-groups',
+                 '/usr/bin/tiaris-nest', 'free-cache-space', '--available-bytes', str(required)]
+    for name, free in (('cache retention', lambda: run(*retention, timeout=1800)),
+                       ('garbage collection', collect_garbage)):
+        short = required - shutil.disk_usage('/nix/store').free
+        if short <= 0:
+            return
+        print(f'The update needs {required / GIB:.1f} GiB of free disk space, {short / GIB:.1f} GiB '
+              f'more than there is: making room by {name}.', flush=True)
+        try:
+            free()
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            print(f'Making room by {name} failed: {type(error).__name__}', flush=True)
+
+
+def verified_cache():
+    """The private cache the root verifier extracts from the staged update.
+    Short of disk space the verifier changes nothing and says how many bytes
+    must be free (exit 75). Make room and ask again: once for what is known
+    before the archive is read, once for the store paths it turns out to
+    miss. Told that space was freed, the verifier ends the attempt itself,
+    with the reason `insufficient_store_space`."""
+    for space_freed in (False, False, True):
+        command = [*VERIFY, '--space-freed'] if space_freed else list(VERIFY)
+        result = subprocess.run(command, text=True, capture_output=True, timeout=4 * 3600)
+        if result.returncode != 75:
+            break
+        make_room(int(result.stdout.strip()))
+    if result.returncode:
+        if 'insufficient_store_space' in result.stderr:
+            print('The update is refused: the disk has too little free space for it, '
+                  'also after making room.', flush=True)
+        raise subprocess.CalledProcessError(result.returncode, command, result.stdout, result.stderr)
+    return Path(result.stdout.strip())
 
 
 WINDOW = '/usr/lib/tiaris-nest/tiaris-nest-appliance-update-window'
@@ -474,7 +527,7 @@ def prepare():
         emit_status(identity, 'waiting_window', 'preparing_ahead')
     # Root verifier revalidates signature, exact inbox inode/archive, complete
     # NAR graph, live SQLite and signed policy before yielding private cache.
-    cache = Path(run('/usr/bin/tiaris-nest', 'verify-appliance-update', timeout=4 * 3600))
+    cache = verified_cache()
     attempt = safe_attempt(cache.parent.name)
     if cache != STAGING / 'private' / attempt / 'cache':
         raise ValueError('invalid verified update cache path')
@@ -486,7 +539,7 @@ def prepare():
         raise ValueError('invalid verified update receipt')
     receipt = dict(verified)
     try:
-        free_space(verified)
+        boot_space()
         run('nix', '--extra-experimental-features', 'nix-command', 'copy', '--from', 'file://' + str(cache),
             '--option', 'substituters', '', '--option', 'require-sigs', 'true', verified['system_toplevel'], timeout=4 * 3600)
         # Root the closure first so garbage collection cannot swap a
@@ -505,7 +558,8 @@ def prepare():
             (ROOTS / ('pending-' + attempt)).unlink(missing_ok=True)
             raise
     except Exception as error:
-        reason = 'rollback_database_incompatible' if isinstance(error, DatabaseIncompatible) else 'closure_import_failed'
+        reason = ('rollback_database_incompatible' if isinstance(error, DatabaseIncompatible)
+                  else 'insufficient_esp_space' if isinstance(error, BootPartitionFull) else 'closure_import_failed')
         emit_status(receipt, 'failed', 'verification_failed', reason, current()['system_generation'])
         cleanup(receipt)
         raise
@@ -603,7 +657,11 @@ def drop_prepared(owner=0):
 
 def stage():
     """Prepare as soon as an update arrives, wait until the signed policy lets
-    it start (Update now, the Nest being idle, or the night), then switch."""
+    it start (Update now, the Nest being idle, or the night) and the Nest has
+    just reached Tiaris, then switch. The candidate must reach Tiaris again
+    before it stays (`commit`), so a Nest that is cut off keeps what it
+    prepared and waits (`no_manage_contact`) instead of switching, failing
+    that check and going back."""
     if not REQUEST.exists():
         return
     with maintenance_lock():
@@ -614,19 +672,22 @@ def stage():
             drop_prepared()
             prepared = prepare()
         attempt = prepared['attempt_id']
-        if started(attempt):
-            waiting = None
-        else:
-            # The journal says why the Nest starts its own update, and once
-            # per release and stage why it does not yet.
-            waiting, why = waiting_for()
-            release = prepared.get('target_release') or 'the requested release'
-            if waiting is None:
-                print(f'Starting the update to {release}, because {why or "the update policy allows it"}.', flush=True)
-            elif last_report(attempt).get('stage') != waiting:
-                print(f'Not starting the update to {release} yet, because {why or waiting}.', flush=True)
+        # An activation that a restart interrupted goes on without asking the
+        # policy again; it also switches only once the Nest reaches Tiaris.
+        resumed = started(attempt)
+        waiting, why = (None, 'it had started before the Nest restarted') if resumed else waiting_for()
+        if waiting is None and not contact_fresh():
+            waiting, why = 'no_manage_contact', 'the Nest has not reached Tiaris in the last 90 seconds'
+        # The journal says why the Nest starts its own update, and once per
+        # release and stage why it does not yet.
+        release = prepared.get('target_release') or 'the requested release'
+        if waiting is None:
+            print(f'Starting the update to {release}, because {why or "the update policy allows it"}.', flush=True)
+        elif last_report(attempt).get('stage') != waiting:
+            print(f'Not starting the update to {release} yet, because {why or waiting}.', flush=True)
         if waiting:
-            emit_status(prepared, 'waiting_window', waiting)
+            # Reports only move forward: a resumed activation stays started.
+            emit_status(prepared, 'preparing' if resumed else 'waiting_window', waiting)
             return
         activate(prepared)
 
@@ -646,27 +707,62 @@ def effective_manage_origin(stored):
     return result.stdout.strip() or None
 
 
-def contact_ready(receipt):
-    value = load(STATE / 'agent/manage-contact.json', owner=UID, maximum=16384)
-    identity = load(STATE / 'agent/manage-state.json', owner=UID)
-    plan = load(CONTROL / 'provisioning-state.json')
-    timestamp = datetime.datetime.fromisoformat(value['reported_at'].replace('Z', '+00:00'))
-    age = (datetime.datetime.now(datetime.timezone.utc) - timestamp).total_seconds()
-    return (value['schema'] == 'tiaris.nest.manage-contact.v1'
-        and value['boot_id'] == Path('/proc/sys/kernel/random/boot_id').read_text().strip()
-        and value['device_id'] == identity['device_id']
-        and value['public_key_fingerprint'] == identity['public_key_fingerprint']
-        and value['manage_origin'] == effective_manage_origin(plan['manage_origin'])
-        and 0 <= age <= 90)
+def contact_fresh():
+    """Whether this Nest, as itself, reached its Tiaris in this boot at most
+    90 seconds ago. The daemon records every report Tiaris accepted, about
+    every 30 seconds. Anything unreadable is no contact."""
+    try:
+        value = load(STATE / 'agent/manage-contact.json', owner=UID, maximum=16384)
+        identity = load(STATE / 'agent/manage-state.json', owner=UID)
+        plan = load(CONTROL / 'provisioning-state.json')
+        timestamp = datetime.datetime.fromisoformat(value['reported_at'].replace('Z', '+00:00'))
+        age = (datetime.datetime.now(datetime.timezone.utc) - timestamp).total_seconds()
+        return (value['schema'] == 'tiaris.nest.manage-contact.v1'
+            and value['boot_id'] == Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+            and value['device_id'] == identity['device_id']
+            and value['public_key_fingerprint'] == identity['public_key_fingerprint']
+            and value['manage_origin'] == effective_manage_origin(plan['manage_origin'])
+            and 0 <= age <= 90)
+    except Exception:
+        return False
 
 
-def health_ready(receipt):
-    for unit in ('tiaris-nest', 'tiaris-nest-first-boot', 'tiaris-nest-firewall', 'nginx', 'tftpd-hpa', 'nix-daemon', 'sshd'):
-        if subprocess.run(['systemctl', 'is-active', '--quiet', unit], timeout=5).returncode:
-            return False
-    run('curl', '--fail', '--silent', '--show-error', '--noproxy', '*', '--max-time', '10',
-        'http://127.0.0.1:8080/healthz?tiaris_fresh=1', timeout=12)
-    return contact_ready(receipt)
+def local_health_ready():
+    """Whether the Nest's own services run and it serves computers."""
+    try:
+        for unit in ('tiaris-nest', 'tiaris-nest-first-boot', 'tiaris-nest-firewall', 'nginx', 'tftpd-hpa', 'nix-daemon', 'sshd'):
+            if subprocess.run(['systemctl', 'is-active', '--quiet', unit], timeout=5).returncode:
+                return False
+        run('curl', '--fail', '--silent', '--show-error', '--noproxy', '*', '--max-time', '10',
+            'http://127.0.0.1:8080/healthz?tiaris_fresh=1', timeout=12)
+    except Exception:
+        return False
+    return True
+
+
+class ManageContactFailed(RuntimeError):
+    """The candidate is healthy by itself but did not reach Tiaris."""
+
+
+def await_health():
+    """The candidate stays once three checks in a row, within 210 seconds,
+    found it healthy by itself and in fresh contact with Tiaris. When its own
+    health held three times in a row, only the contact was missing: the Nest
+    reached Tiaris just before the switch (`stage`), so the candidate lost a
+    working link."""
+    deadline = time.monotonic() + 210
+    healthy = reached = 0
+    only_contact_missing = False
+    while time.monotonic() < deadline:
+        healthy = healthy + 1 if local_health_ready() else 0
+        reached = reached + 1 if healthy and contact_fresh() else 0
+        if reached >= 3:
+            return
+        only_contact_missing = only_contact_missing or healthy >= 3
+        time.sleep(5)
+    if only_contact_missing:
+        raise ManageContactFailed('candidate did not reach Tiaris before the health deadline')
+    raise RuntimeError('candidate health deadline expired')
 
 
 def retain(receipt, installed):
@@ -705,18 +801,7 @@ def commit():
                 raise ValueError('booted migration inventory differs')
             verify_observed_versions(receipt['release']['required_system_versions'])
             verify_boot_entry(receipt['candidate_loader_entry'], receipt['system_toplevel'])
-            deadline, successes = time.monotonic() + 210, 0
-            while time.monotonic() < deadline:
-                try:
-                    ready = health_ready(receipt)
-                except Exception:
-                    ready = False
-                successes = successes + 1 if ready else 0
-                if successes >= 3:
-                    break
-                time.sleep(5)
-            else:
-                raise RuntimeError('candidate health deadline expired')
+            await_health()
             save(COMMIT, {'schema': 'tiaris.nest.system-commit-intent.v3', 'pending_sha256': hashlib.sha256(read(PENDING)).hexdigest(), 'attempt_id': receipt['attempt_id']})
             set_default(receipt['candidate_loader_entry'])
             installed = {'schema': 'tiaris.nest.installed-appliance.v3', 'release': receipt['release'],
@@ -733,13 +818,14 @@ def commit():
             except Exception as error:
                 # Success is already durable; pruning is separate maintenance.
                 print('Committed generation needs retained-generation cleanup: ' + type(error).__name__, flush=True)
-        except Exception:
+        except Exception as failure:
             if terminal_matches(receipt):
                 raise # durable success must never be rewritten as rollback
+            reason = 'manage_contact_failed' if isinstance(failure, ManageContactFailed) else 'local_health_failed'
             save(ROLLBACK, {'schema': 'tiaris.nest.system-rollback-intent.v3',
-                'pending_sha256': hashlib.sha256(read(PENDING)).hexdigest(), 'reason': 'local_health_failed', 'attempt_id': receipt['attempt_id']})
+                'pending_sha256': hashlib.sha256(read(PENDING)).hexdigest(), 'reason': reason, 'attempt_id': receipt['attempt_id']})
             restore_source(receipt)
-            emit_status(receipt, 'health_checking', 'rollback_pending', 'local_health_failed')
+            emit_status(receipt, 'health_checking', 'rollback_pending', reason)
             os.sync()
             run('systemctl', '--no-block', 'reboot')
             raise
@@ -749,6 +835,4 @@ def gc():
     with maintenance_lock():
         if PENDING.exists() or PREPARE.exists():
             return
-        for row in load(KNOWN)['generations']:
-            pin(row['system_toplevel'], 'good-' + row['system_generation'])
-        run('nix-store', '--gc', timeout=3600)
+        collect_garbage()

@@ -1,10 +1,12 @@
 """Safety boundaries and durable recovery, without modifying the host runtime."""
 import base64
+import contextlib
 import copy
 import datetime
 import hashlib
 from importlib.machinery import SourceFileLoader
 import importlib.util
+import itertools
 import json
 import os
 from pathlib import Path
@@ -37,6 +39,54 @@ network = script('tiaris-nest-netplan-activate')
 firewall = script('tiaris-nest-firewall')
 first_boot = script('tiaris-nest-first-boot')
 source_copy = script('source-copy.py')
+pxe = script('tiaris-nest-pxe')
+
+
+
+class PxeDocument(unittest.TestCase):
+    NOW = 1_800_000_000
+
+    def document(self, **changes):
+        wrapper = {'received_at': self.NOW, 'bootloader_filename': 'snponly.efi',
+                   'desired': {'schema': pxe.SCHEMA, 'server_device_id': 'nest-1', 'complete': True}}
+        wrapper.update(changes)
+        return wrapper
+
+    def test_without_tiaris_the_last_document_keeps_serving_as_stale(self):
+        self.assertEqual(pxe.validate_desired(self.document(), self.NOW)[1:], ('snponly.efi', False))
+        desired, _, stale = pxe.validate_desired(self.document(), self.NOW + 7 * 24 * 3600)
+        self.assertTrue(stale)
+        self.assertEqual(desired['server_device_id'], 'nest-1')
+
+    def test_an_incomplete_withdrawn_or_malformed_document_is_refused(self):
+        for document, reason in (
+                (self.document(desired={'schema': pxe.SCHEMA, 'server_device_id': 'nest-1', 'complete': False}), 'inventory_incomplete'),
+                (self.document(desired=None), 'inventory_unavailable'),
+                (self.document(received_at='yesterday'), 'inventory_unavailable'),
+                (self.document(bootloader_filename='../x.efi'), 'inventory_unavailable'),
+                (self.document(desired={'schema': pxe.SCHEMA, 'server_device_id': 'a/b', 'complete': True}), 'invalid_identity')):
+            with self.assertRaisesRegex(pxe.Unavailable, reason):
+                pxe.validate_desired(document, self.NOW)
+
+
+class StartCheckReason(unittest.TestCase):
+    def test_a_failed_check_names_its_reason_on_the_screen_until_the_checks_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'console-status.json'
+            with patch.object(first_boot, 'directory'), \
+                    patch.object(first_boot, 'write', lambda target, body, **_: Path(target).write_bytes(body)):
+                first_boot.show_failure('The Nest settings are not valid.', path=path)
+            status = json.loads(path.read_text())
+            self.assertEqual((status['schema'], status['state']), ('tiaris.nest-console-status.v1', 'attention'))
+            self.assertEqual(status['attention']['code'], 'start_check_failed')
+            self.assertTrue(status['attention']['detail'].startswith('The Nest settings are not valid.'))
+            self.assertLessEqual(len(status['attention']['detail']), 240)
+            first_boot.clear_failure(path)
+            self.assertFalse(path.exists())
+            # The Nest service's own status is never removed.
+            path.write_text(json.dumps({'state': 'healthy'}))
+            first_boot.clear_failure(path)
+            self.assertTrue(path.exists())
 
 
 class ReadBoundary(unittest.TestCase):
@@ -212,7 +262,7 @@ class PrepareThenSwitch(unittest.TestCase):
         (self.roots / ('pending-' + self.attempt)).unlink()
         self.assertIsNone(self.found())
 
-    def run_stage(self, prepared, waiting, started=False):
+    def run_stage(self, prepared, waiting, started=False, contact=True):
         calls = []
         with patch.object(update, 'REQUEST', self.directory / 'request.json'), \
                 patch.object(update, 'maintenance_lock', return_value=nullcontext()), \
@@ -224,6 +274,7 @@ class PrepareThenSwitch(unittest.TestCase):
                 patch.object(update, 'drop_prepared', side_effect=lambda: calls.append('drop')), \
                 patch.object(update, 'prepare', side_effect=lambda: calls.append('prepare') or self.prepared), \
                 patch.object(update, 'waiting_for', side_effect=lambda: calls.append('gate') or (waiting, 'why')), \
+                patch.object(update, 'contact_fresh', return_value=contact), \
                 patch.object(update, 'last_report', return_value={}), \
                 patch.object(update, 'started', return_value=started), \
                 patch.object(update, 'activate', side_effect=lambda receipt: calls.append('activate')), \
@@ -237,6 +288,15 @@ class PrepareThenSwitch(unittest.TestCase):
         self.assertEqual(self.run_stage(self.prepared, None), ['gate', 'activate'])
         # After a crash during activation the report never goes back to waiting.
         self.assertEqual(self.run_stage(self.prepared, 'nest_busy', started=True), ['activate'])
+
+    def test_a_nest_that_cannot_reach_tiaris_keeps_what_it_prepared_and_waits(self):
+        # The candidate would have to reach Tiaris to stay: switching now
+        # ends in a rollback, and the next try downloads everything again.
+        self.assertEqual(self.run_stage(self.prepared, None, contact=False),
+                         ['gate', ('waiting_window', 'no_manage_contact')])
+        # Also an activation that a power cut interrupted; its report stays started.
+        self.assertEqual(self.run_stage(self.prepared, None, started=True, contact=False),
+                         [('preparing', 'no_manage_contact')])
 
     def test_a_replaced_request_leaves_nothing_prepared_behind(self):
         staging, control = self.directory / 'staging', self.directory / 'control'
@@ -272,6 +332,55 @@ class PrepareThenSwitch(unittest.TestCase):
         stage = source[source.index('def stage():'):source.index('BOOTSTRAP = ')]
         self.assertLess(stage.index('prepare()'), stage.index('waiting_for()'))
         self.assertLess(stage.index('waiting_for()'), stage.index('activate(prepared)'))
+
+
+class RoomForAnUpdate(unittest.TestCase):
+    """An update is refused for disk space only after the Nest made room."""
+    def test_cache_retention_is_asked_first_and_garbage_goes_only_when_still_short(self):
+        for retention_frees, expected in ((60, ['retention']), (10, ['retention', 'gc']), (None, ['retention', 'gc'])):
+            with self.subTest(retention_frees=retention_frees):
+                free, steps = [40], []
+                def retention(*command, **kwargs):
+                    # As the service user, for exactly the bytes the verifier named.
+                    self.assertEqual(command[:5], ('setpriv', '--reuid', '985', '--regid', '985'))
+                    self.assertEqual(command[-3:], ('free-cache-space', '--available-bytes', '100'))
+                    steps.append('retention')
+                    if retention_frees is None:
+                        raise subprocess.CalledProcessError(1, command)
+                    free[0] += retention_frees
+                with patch.object(update.shutil, 'disk_usage', side_effect=lambda path: SimpleNamespace(free=free[0])), \
+                        patch.object(update, 'run', side_effect=retention), \
+                        patch.object(update, 'collect_garbage', side_effect=lambda: steps.append('gc')):
+                    update.make_room(100)
+                self.assertEqual(steps, expected)
+        with patch.object(update.shutil, 'disk_usage', return_value=SimpleNamespace(free=100)), \
+                patch.object(update, 'run') as retention, patch.object(update, 'collect_garbage') as collect:
+            update.make_room(100)
+        retention.assert_not_called()
+        collect.assert_not_called()
+
+    def verify(self, *results):
+        commands, room = [], []
+        results = iter(results)
+        def verifier(command, **kwargs):
+            commands.append(command[2:])
+            code, output = next(results)
+            return SimpleNamespace(returncode=code, stdout=output, stderr='Error: insufficient_store_space' if code == 1 else '')
+        with patch.object(update.subprocess, 'run', side_effect=verifier), \
+                patch.object(update, 'make_room', side_effect=room.append):
+            try:
+                return update.verified_cache(), commands, room
+            except subprocess.CalledProcessError:
+                return None, commands, room
+
+    def test_the_verifier_refuses_for_disk_space_only_after_room_was_made(self):
+        # Enough room: nothing is freed.
+        self.assertEqual(self.verify((0, '/private/cache\n')), (Path('/private/cache'), [[]], []))
+        # Short of space: make the room the verifier names, then it passes.
+        self.assertEqual(self.verify((75, '100\n'), (0, '/private/cache\n')), (Path('/private/cache'), [[], []], [100]))
+        # Still short after making room twice: the last run may end the attempt.
+        self.assertEqual(self.verify((75, '100\n'), (75, '300\n'), (1, '')),
+                         (None, [[], [], ['--space-freed']], [100, 300]))
 
 
 class NetworkPolicy(unittest.TestCase):
@@ -652,7 +761,7 @@ class ReleaseOnlyClosure(unittest.TestCase):
 
     def test_import_checks_the_closure_before_running_it(self):
         source = (RUNTIME / 'generation_update.py').read_text()
-        stage = source[source.index('def prepare():'):source.index('def contact_ready(')]
+        stage = source[source.index('def prepare():'):source.index('def contact_fresh(')]
         imported = stage.index("'copy', '--from'")
         rooted = stage.index("pin(verified['system_toplevel'], 'pending-' + attempt)")
         checked = stage.index("verify_store_closure(cache, verified['system_toplevel'])")
@@ -685,6 +794,47 @@ class ReleaseOnlyClosure(unittest.TestCase):
                 update.nar_hash_bytes(invalid)
 
 
+class CandidateHealth(unittest.TestCase):
+    """What the candidate proves before it stays, and what a rollback says."""
+    RELEASE = {'source_revision': 'r', 'nixpkgs_revision': 'n', 'manage_source_revision': 'm', 'release_id': '0.2.1',
+               'base_os': 'nixos', 'base_os_version': '26.05', 'required_system_versions': {}}
+
+    def outcome(self, healthy, reached):
+        """The last status `commit` reports for a candidate whose own health
+        and whose contact with Tiaris answer the checks in this order."""
+        receipt = {**self.RELEASE, 'release': self.RELEASE, 'attempt_id': '11111111-1111-4111-8111-111111111111',
+                   'system_toplevel': '/candidate', 'candidate_generation': '2',
+                   'candidate_loader_entry': 'nixos-generation-2.conf', 'system_closure_sha256': 'c' * 64,
+                   'sqlite_migrations_sha256': hashlib.sha256(b'inventory').hexdigest()}
+        seconds = itertools.count(0, 5)
+        clock = SimpleNamespace(monotonic=lambda: next(seconds), sleep=lambda seconds: None)
+        healthy, reached = itertools.cycle(healthy), itertools.cycle(reached)
+        with tempfile.NamedTemporaryFile() as pending, contextlib.ExitStack() as stack:
+            for name, value in (('PENDING', Path(pending.name)), ('time', clock), ('maintenance_lock', nullcontext),
+                                ('load', lambda path, **kw: receipt), ('read', lambda path, **kw: b'inventory'),
+                                ('current', lambda: {'system_toplevel': '/candidate', 'system_generation': '2'}),
+                                ('local_health_ready', lambda: next(healthy)), ('contact_fresh', lambda: next(reached)),
+                                ('terminal_matches', lambda receipt: False), ('retain', lambda receipt, installed: [])):
+                stack.enter_context(patch.object(update, name, value))
+            for name in ('verify_observed_versions', 'verify_boot_entry', 'save', 'set_default', 'cleanup',
+                         'clear_transaction', 'prune_obsolete', 'restore_source', 'run'):
+                stack.enter_context(patch.object(update, name))
+            stack.enter_context(patch.object(update.os, 'sync'))
+            emit = stack.enter_context(patch.object(update, 'emit_status'))
+            try:
+                update.commit()
+            except RuntimeError:
+                pass
+            return emit.call_args.args[1:]
+
+    def test_a_candidate_that_only_lost_tiaris_goes_back_with_its_own_reason(self):
+        self.assertEqual(self.outcome([True], [True]), ('succeeded', 'committed'))
+        self.assertEqual(self.outcome([True], [False]), ('health_checking', 'rollback_pending', 'manage_contact_failed'))
+        # Two healthy checks in a row are not three: its own health is the reason.
+        self.assertEqual(self.outcome([True, True, False], [False]),
+                         ('health_checking', 'rollback_pending', 'local_health_failed'))
+
+
 class CandidateContactOrigin(unittest.TestCase):
     """The candidate accepts Management contact at its own origin for legacy state."""
 
@@ -709,7 +859,7 @@ class CandidateContactOrigin(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, \
                 patch.object(update, 'BOOTSTRAP', self.bootstrap(directory)), \
                 patch.object(update, 'load', lambda path, **_: copy.deepcopy(files[Path(path).name])):
-            return update.contact_ready({})
+            return update.contact_fresh()
 
     def test_legacy_recorded_origin_accepts_contact_at_the_build_origin(self):
         self.assertTrue(self.ready('https://manage.cybex.net', 'https://manage.tiaris.com'))

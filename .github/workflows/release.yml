@@ -624,8 +624,8 @@ jobs:
 
 
   # Release policy fast-v1: production releases need no warm or cold VM
-  # qualification. The VM jobs run on demand from nest-vm-qualification.yml
-  # (for the owner's nightly) and never gate publication or promotion.
+  # qualification. The VM jobs run only when someone starts
+  # nest-vm-qualification.yml and never gate publication or promotion.
   release_publish:
     name: Attest and stage immutable candidate
     if: startsWith(github.ref, 'refs/tags/v')
@@ -848,7 +848,7 @@ jobs:
             "$owner_run_marker" \
             "$owner_artifact_marker" \
             "$owner_digest_marker" \
-            "Tiaris-VM-Qualification: nightly" \
+            "Tiaris-VM-Qualification: on-demand" \
             "Tiaris-Public-Closure: required")"
           existing="$RUNNER_TEMP/tiaris-nest-existing-release.json"
           existing_pages="$RUNNER_TEMP/tiaris-nest-existing-releases.json"
@@ -924,7 +924,7 @@ jobs:
             "Tiaris-Release-Workflow: $owner_run" \
             "Tiaris-Candidate-Artifact-ID: $TIARIS_NEST_RELEASE_ARTIFACT_ID" \
             "Tiaris-Candidate-Artifact-SHA256: $TIARIS_NEST_RELEASE_ARTIFACT_DIGEST" \
-            "Tiaris-VM-Qualification: nightly" \
+            "Tiaris-VM-Qualification: on-demand" \
             "Tiaris-Public-Closure: required")"
           gh release create "$GITHUB_REF_NAME" \
             --draft --prerelease --latest=false --verify-tag --target "$GITHUB_SHA" \

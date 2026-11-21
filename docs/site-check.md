@@ -29,8 +29,8 @@ inventory, at most every 30 seconds:
 
 - a boot probe: one DHCPDISCOVER like a UEFI computer's, from a fixed locally
   administered address derived from the Nest's identity, answered by the
-  school's DHCP, this Nest, another Nest of the organization, or another boot
-  server;
+  school's DHCP, this Nest, or another boot server (a site has one Nest, so a
+  second Nest counts as one);
 - a dropped-answer monitor over dnsmasq's `log-dhcp` lines: firmware repeats
   one DISCOVER only while no boot answer reached it, so one transaction the
   Nest answered three times within two minutes did not get through. That is

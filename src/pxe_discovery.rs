@@ -1,5 +1,10 @@
 //! Narrow handoff between signed Management configuration and the privileged
 //! appliance PXE supervisor. The main service never gains network privileges.
+//!
+//! A site has one Nest, so the supervisor answers every UEFI computer and needs
+//! only this Nest's identity, whether Tiaris sent its document whole, and the
+//! boot file this Nest serves. Tiaris still sends the other Nests and the
+//! computers (`peers`, `clients`) for Nests up to 0.2.177; they are ignored.
 use crate::AppState;
 use anyhow::{Result, bail};
 use axum::{Json, extract::State};
@@ -17,43 +22,40 @@ pub const CAPABILITY: &str = "pxe_proxy_v1";
 const STATUS_PATH: &str = "/run/tiaris-nest-pxe/status.json";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct Desired {
     pub schema: String,
     pub server_device_id: String,
     pub complete: bool,
-    pub peers: Vec<Peer>,
-    pub clients: Vec<Client>,
-}
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct Peer {
-    pub server_device_id: String,
-    pub address: String,
-    pub mac: String,
-    pub bootloader_filename: String,
-    pub proxy_capable: bool,
-}
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct Client {
-    pub mac: String,
-    pub server_device_id: Option<String>,
 }
 
-pub fn persist(state: &AppState, desired: Option<&Desired>) -> Result<()> {
+/// Written after every sync with Tiaris. Without Tiaris the supervisor keeps
+/// serving with the last one and reports it as stale (`received_at`).
+pub fn persist(
+    state: &AppState,
+    desired: Option<&Desired>,
+    bootloader_filename: &str,
+) -> Result<()> {
     if !crate::appliance::is_managed_appliance() {
         return Ok(());
     }
-    persist_at(&state.config.manage.state_path, desired)
+    persist_at(
+        &state.config.manage.state_path,
+        desired,
+        bootloader_filename,
+    )
 }
 
-fn persist_at(state_path: &Path, desired: Option<&Desired>) -> Result<()> {
+fn persist_at(
+    state_path: &Path,
+    desired: Option<&Desired>,
+    bootloader_filename: &str,
+) -> Result<()> {
     let parent = state_path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("PXE state directory missing"))?;
     let path = parent.join("pxe-discovery.json");
-    let value = json!({"received_at":Utc::now().timestamp(), "desired":desired});
+    let value = json!({"received_at":Utc::now().timestamp(), "desired":desired,
+        "bootloader_filename":bootloader_filename});
     let bytes = serde_json::to_vec(&value)?;
     if bytes.len() > 2 * 1024 * 1024 {
         bail!("PXE discovery inventory exceeds bound");
@@ -140,19 +142,18 @@ mod tests {
             schema: "tiaris.nest.pxe-discovery.v1".into(),
             server_device_id: "qualification".into(),
             complete: true,
-            peers: Vec::new(),
-            clients: Vec::new(),
         };
-        persist_at(&state, Some(&desired)).unwrap();
+        persist_at(&state, Some(&desired), "snponly.efi").unwrap();
         let path = directory.join("pxe-discovery.json");
         let value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(value["desired"]["server_device_id"], "qualification");
+        assert_eq!(value["bootloader_filename"], "snponly.efi");
         assert!(value["received_at"].as_i64().unwrap() <= Utc::now().timestamp());
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        persist_at(&state, None).unwrap();
+        persist_at(&state, None, "snponly.efi").unwrap();
         let value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert!(value["desired"].is_null());
         assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);

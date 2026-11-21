@@ -422,7 +422,7 @@ class NixosQualificationTests(unittest.TestCase):
     def test_rollback_requires_automatic_source_boot_and_reason(self):
         candidate, previous, evidence, source = self.transition()
         evidence.update(schema='tiaris.nest.nixos-appliance-rollback-qualification.v1',
-            automatic_rollback=True, fallback_reboot_observed=True, rollback_reason='local_health_failed',
+            automatic_rollback=True, fallback_reboot_observed=True, rollback_reason='manage_contact_failed',
             fault='owned_candidate_manage_transport_gate_until_automatic_fallback',
             gate_prearmed_before_admission=True, gate_arming='candidate_dhcp_bootstrap',
             candidate_reset_at='2026-09-25T00:00:01+00:00', gate_activated_at='2026-09-25T00:00:05+00:00',

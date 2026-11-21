@@ -115,17 +115,32 @@ single-link regular files, 0640 root:Nest or 0600 root for secrets. Signed plan,
 identity transition, config, CA/principal, CIDRs, network decisions and update
 receipts persist across every generation. Do not place secrets in store paths.
 
-Keep at least **21 GiB** for exact workstation-install preparation, plus 2 GiB
-operational headroom. Installation/update space checks also include all missing
-store paths and simultaneous staging files. Current, pending and two preceding
-good generations, active job roots and protected artifacts cannot be reclaimed to
-make an update fit. Daily GC uses the job/update exclusion barrier.
+ROOT has one free-space floor: room for one largest build
+(`build.max_artifact_size_bytes`, 20 GiB) plus 1 GiB headroom, **21 GiB**
+(`free_space_floor` in `src/disk.rs`; there is no other reserve). Cache
+retention keeps it free, a build needs it to start, and an installation or
+update must leave it after its missing store paths and simultaneous staging
+files. An update that does not fit makes room before it is refused: the root
+updater asks cache retention for the bytes the verifier names
+(`tiaris-nest free-cache-space`, run as the service user), then collects
+garbage as the daily GC does (`generation_update.make_room`). Only then the
+root verifier ends the attempt, with the reason `insufficient_store_space`.
+Current, pending and two preceding good generations, active job roots and
+protected artifacts cannot be reclaimed to make an update fit. Daily GC uses
+the job/update exclusion barrier.
+
+The EFI partition needs no such cleanup: at every switch NixOS's boot loader
+installer first removes the kernels and initrds that none of the four kept
+generations names (`configurationLimit = 4`), so it holds at most four pairs
+of about 54 MiB. An update that still finds less than 256 MiB free there ends
+with the reason `insufficient_esp_space`.
 
 Bulk downloaded/private update staging and database rollback copies live under
 `/var/cache/tiaris-nest/appliance-updates/` on ROOT. Only protected verified and
-transaction receipts live on STATE. When staging/store share a filesystem,
-admission charges new staging + missing NAR bytes + 23 GiB once. A distinct
-staging filesystem reserves 2 GiB; the store still preserves 23 GiB. Pending
+transaction receipts live on STATE. The download only has to fit (its size plus
+1 GiB); root admits the update. When staging/store share a filesystem,
+admission charges new staging + missing NAR bytes + the floor once. A distinct
+staging filesystem reserves 2 GiB; the store still preserves the floor. Pending
 and preparation/commit/rollback receipts fence queued builds after reboot until
 root recovery finishes.
 

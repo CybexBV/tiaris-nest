@@ -2,7 +2,10 @@ pub mod boot;
 pub mod files;
 pub mod usb_installer;
 
-use std::net::{IpAddr, SocketAddr};
+use std::{
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 
 use axum::{
     Router,
@@ -14,6 +17,7 @@ use axum::{
     routing::get,
 };
 use serde::Deserialize;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower_http::trace::TraceLayer;
 
 use crate::{AppState, netboot};
@@ -29,6 +33,7 @@ const CONTENT_SECURITY_POLICY: &str = concat!(
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route(LIVENESS_PATH, get(live))
         .route("/healthz/pxe", get(crate::pxe_discovery::candidate))
         .route("/boot", get(boot::boot_root))
         .route("/boot.ipxe", get(boot::boot_root))
@@ -72,6 +77,38 @@ fn request_trace_path(uri: &Uri) -> &str {
     } else {
         uri.path()
     }
+}
+
+/// Answered by the server alone: no state, lock, database or other service.
+/// The systemd watchdog asks it (`server_answers`).
+const LIVENESS_PATH: &str = "/healthz/live";
+const LIVENESS_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn live() -> &'static str {
+    "ok\n"
+}
+
+/// Whether the HTTP server at `target` answers its liveness request in time.
+pub async fn server_answers(target: SocketAddr) -> bool {
+    server_answers_within(target, LIVENESS_TIMEOUT).await
+}
+
+async fn server_answers_within(target: SocketAddr, timeout: Duration) -> bool {
+    let request = async {
+        let mut stream = tokio::net::TcpStream::connect(target).await?;
+        stream
+            .write_all(
+                format!(
+                    "GET {LIVENESS_PATH} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await?;
+        let mut head = [0_u8; 12];
+        stream.read_exact(&mut head).await?;
+        std::io::Result::Ok(head.starts_with(b"HTTP/1.1 200"))
+    };
+    matches!(tokio::time::timeout(timeout, request).await, Ok(Ok(true)))
 }
 
 #[derive(Deserialize)]
@@ -174,6 +211,7 @@ mod tests {
         net::SocketAddr,
         path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
+        time::Duration,
     };
 
     use axum::{
@@ -192,6 +230,24 @@ mod tests {
         CONTENT_SECURITY_POLICY, REQUEST_BODY_LIMIT_BYTES, apply_security_headers,
         is_direct_loopback_request, request_trace_path, router,
     };
+
+    #[tokio::test]
+    async fn liveness_needs_an_answer_from_the_server_itself() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let answering = listener.local_addr().unwrap();
+        let app = Router::new().route(super::LIVENESS_PATH, axum::routing::get(super::live));
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        assert!(super::server_answers_within(answering, Duration::from_secs(5)).await);
+
+        // A hung server accepts the connection and never answers.
+        let hung = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let silent = hung.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _held = hung.accept().await;
+            std::future::pending::<()>().await
+        });
+        assert!(!super::server_answers_within(silent, Duration::from_millis(300)).await);
+    }
 
     #[test]
     fn request_body_limit_is_explicit_and_bounded() {

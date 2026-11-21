@@ -203,13 +203,13 @@ class PublicationRecoveryTests(unittest.TestCase):
         for absent in ('release_qualify', 'qualification/tiaris-nest-', 'tiaris-nest-qualified-',
                        'tiaris-nest-nixos-', 'Tiaris-Cold-Qualification'):
             self.assertFalse(absent in publish, absent)
-        self.assertEqual(publish.count('"Tiaris-VM-Qualification: nightly"'), 2)
+        self.assertEqual(publish.count('"Tiaris-VM-Qualification: on-demand"'), 2)
         with patch.dict(os.environ, self.environment):
             names = {path.name for path in publication.asset_paths({'TIARIS_NEST_RELEASE_VERSION': '0.2.2'})}
         self.assertEqual(names, set(ASSETS))
 
     def test_metadata_mismatch_refuses_immutable_reuse_without_mutation(self):
-        legacy = BODY.replace('Tiaris-VM-Qualification: nightly\nTiaris-Public-Closure: required',
+        legacy = BODY.replace('Tiaris-VM-Qualification: on-demand\nTiaris-Public-Closure: required',
                               'Tiaris-Cold-Qualification: required')
         for field, value in [('body', legacy), ('body', BODY.replace('/42', '/43')),
                 ('body', BODY.replace('ID: 100', 'ID: 101')),
