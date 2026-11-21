@@ -146,7 +146,10 @@
       machine.succeed("curl --fail --silent 'http://127.0.0.1:8080/healthz?tiaris_fresh=1'")
       # A week without Tiaris: the document only ages. The proxy keeps
       # answering computers and the Nest stays ready, reported as stale.
-      machine.succeed("jq -c '.received_at -= 7 * 24 * 3600' /var/lib/tiaris-nest/state/agent/pxe-discovery.json > /tmp/pxe-discovery.json")
+      # The aged file is the one Nest 0.2.177 wrote (no boot file beside the
+      # document, the Nest's own row in `peers`): what a Nest finds that
+      # updated from 0.2.177 and has not reached Tiaris since.
+      machine.succeed("jq -c '.received_at -= 7 * 24 * 3600 | del(.bootloader_filename) | .desired.peers = [{server_device_id: .desired.server_device_id, address: \"192.0.2.4\", mac: \"02:00:00:00:00:01\", bootloader_filename: \"snponly.efi\", proxy_capable: true}] | .desired.clients = []' /var/lib/tiaris-nest/state/agent/pxe-discovery.json > /tmp/pxe-discovery.json")
       machine.succeed("install -m0600 -o tiaris-nest -g tiaris-nest /tmp/pxe-discovery.json /var/lib/tiaris-nest/state/agent/pxe-discovery.json")
       machine.wait_until_succeeds("jq -e '.status == \"active\" and .reason == \"inventory_stale\" and .eligible' /run/tiaris-nest-pxe/status.json", timeout=60)
       machine.succeed("ss -lunp | grep -F ':67 '")
