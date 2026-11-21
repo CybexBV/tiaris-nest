@@ -97,8 +97,9 @@ class Run:
         self.admitted_at = None
         self.bootstrap_offset = 2
         self.calls = []
-        self.schedule = {'revision': 0, 'supported': True, 'run_now_attempt_id': None,
-            'schedule': {'timezone': 'UTC', 'weekdays': [1], 'start': '00:00', 'duration_minutes': 240}}
+        # Manage signs the policy by itself when it is read: revision 1, the night.
+        self.schedule = {'revision': 1, 'supported': True, 'run_now_attempt_id': None,
+            'schedule': {'timezone': 'UTC', 'weekdays': [0, 1, 2, 3, 4, 5, 6], 'start': '02:00', 'duration_minutes': 120}}
         self.nics = []
         self.nic_times = []
         self.gate = Mock(spec=G.Gate)
@@ -160,9 +161,13 @@ class Run:
     def api(self, path, body=None):
         self.calls.append((path, body))
         if path.endswith('/update-schedule'):
-            if body:
-                assert body['expected_revision'] == self.schedule['revision']
-                self.schedule = {**self.schedule, 'revision': self.schedule['revision'] + 1, 'schedule': body['schedule']}
+            # Manage's route answers GET only; nobody saves a policy.
+            assert body is None
+            return deepcopy(self.schedule)
+        if path.endswith('/update-now'):
+            assert set(body) == {'attempt_id', 'expected_revision'}
+            assert body['expected_revision'] == self.schedule['revision'] and body['attempt_id'] == ATTEMPT
+            self.schedule = {**self.schedule, 'revision': self.schedule['revision'] + 1, 'run_now_attempt_id': ATTEMPT}
             return deepcopy(self.schedule)
         if body:
             self.request = body
@@ -386,26 +391,31 @@ class TransitionTests(unittest.TestCase):
         # Acceptance deliberately imports predecessor on demand as well.
         self.enterContext(patch.dict(sys.modules, IMPORTS))
 
-    def test_transition_signs_initial_window_before_admitting_update(self):
+    def test_transition_reads_the_signed_policy_and_starts_the_admitted_update_now(self):
         run = Run()
         with tempfile.TemporaryDirectory() as temporary:
             run.execute(Path(temporary) / 'result.json')
+        self.assertTrue(any(path.endswith('/update-schedule') and body is None for path, body in run.calls))
         writes = [(path, body) for path, body in run.calls if body]
-        self.assertTrue(writes[0][0].endswith('/update-schedule'))
-        self.assertEqual(writes[0][1], {'expected_revision': 0, 'schedule': run.schedule['schedule']})
-        self.assertTrue(writes[1][0].endswith('/qualification-updates'))
+        self.assertTrue(writes[0][0].endswith('/qualification-updates'))
+        self.assertTrue(writes[1][0].endswith('/update-now'))
+        self.assertEqual(writes[1][1], {'attempt_id': ATTEMPT, 'expected_revision': 1})
+        self.assertEqual(len(writes), 2)
 
-    def test_initialization_preserves_existing_policy_and_rejects_unsupported_or_changed_receipt(self):
-        api = Mock(return_value={'revision': 4, 'supported': True})
-        T.initialize_schedule(api, '/node')
+    def test_policy_must_be_signed_by_manage_and_update_now_must_bind_the_attempt(self):
+        api = Mock(return_value={'revision': 4, 'supported': True, 'run_now_attempt_id': None})
+        self.assertEqual(T.signed_policy_revision(api, '/node'), 4)
         api.assert_called_once_with('/node/update-schedule')
-        with self.assertRaises(ValueError):
-            T.initialize_schedule(Mock(return_value={'supported': False}), '/node')
-        initial = Run().schedule
-        for changed in ({'revision': 2}, {'schedule': {}}, {'run_now_attempt_id': ATTEMPT}):
-            api = Mock(side_effect=[initial, {**initial, 'revision': 1, **changed}])
+        for refused in ({'supported': False, 'revision': 4}, {'supported': True, 'revision': 0},
+                        {'supported': True}, {'supported': True, 'revision': 4, 'run_now_attempt_id': ATTEMPT}):
             with self.assertRaises(ValueError):
-                T.initialize_schedule(api, '/node')
+                T.signed_policy_revision(Mock(return_value=refused), '/node')
+        api = Mock(return_value={'revision': 5, 'run_now_attempt_id': ATTEMPT})
+        T.update_now(api, '/node', ATTEMPT, 4)
+        api.assert_called_once_with('/node/update-now', {'attempt_id': ATTEMPT, 'expected_revision': 4})
+        for changed in ({'revision': 4, 'run_now_attempt_id': ATTEMPT}, {'revision': 5, 'run_now_attempt_id': None}):
+            with self.assertRaises(ValueError):
+                T.update_now(Mock(return_value=changed), '/node', ATTEMPT, 4)
 
     def test_dhcp_identity_preserves_unset_desired_url(self):
         value = node(manifest('0.2.2', 'a'), '1', datetime.datetime.now(T.UTC))

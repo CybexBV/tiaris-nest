@@ -265,12 +265,16 @@ Upgrade and rollback qualification use the retained verified guest artifact list
 on port18082, bound to the exact selected candidate manifest. They do not start
 an additional download listener outside the isolated fixture network policy.
 
-Before upgrade and rollback admission, the harness saves the fixture's initial
-maintenance window through the authenticated schedule API with revision zero.
-This creates the signed policy required by the NixOS updater; the install plan's
-unsigned schedule projection alone does not authorize updates. Existing signed
-policies are preserved. Qualification still requires the guest to verify policy,
-perform its own reboot, and report the exact transition and healthy identity.
+Manage derives each Nest's update policy itself (update when idle, in the night
+at the latest) and signs it when the policy is read; nobody saves one and the
+schedule route answers GET only. Before upgrade and rollback admission the
+harness reads that route and requires a signed revision: the NixOS updater
+rejects an unsigned policy. After admission it starts the attempt with the
+Console's "Update now" (`update-now` with the attempt and that revision), so
+the run does not wait ten idle minutes or for the night. Qualification still
+requires the guest to verify policy, perform its own reboot, and report the
+exact transition and healthy identity. The approval of a claimed setup carries
+no update window either: Manage refuses unknown fields there.
 
 Rollback qualification installs an exact-owner transport gate at the appliance's
 QMP candidate reset, within ten seconds of that event. The gate uses the retained
