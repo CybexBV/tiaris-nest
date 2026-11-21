@@ -1175,7 +1175,7 @@ mod tests {
         assert!(admit_update_space(false, 12 * GIB, 25 * GIB, 9 * GIB, 4 * GIB, floor).is_ok());
         assert!(admit_update_space(false, 64 * GIB, 24 * GIB, 9 * GIB, 4 * GIB, floor).is_err());
         assert!(admit_update_space(false, 10 * GIB, 64 * GIB, 9 * GIB, 4 * GIB, floor).is_err());
-        assert!(admit_update_space(true, u64::MAX, u64::MAX, u64::MAX, 0).is_err());
+        assert!(admit_update_space(true, u64::MAX, u64::MAX, u64::MAX, 0, floor).is_err());
     }
 
     #[test]
