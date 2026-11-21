@@ -98,7 +98,7 @@ class RecoveryTests(unittest.TestCase):
         # ancestry; once promoted it is, without any VM qualification marker.
         pending = item(3, "v0.2.80", prerelease=True, body="\n".join([
             "Tiaris-Release-Workflow: https://github.com/CybexHQ/james/actions/runs/1",
-            "Tiaris-VM-Qualification: nightly", "Tiaris-Public-Closure: required"]))
+            "Tiaris-VM-Qualification: on-demand", "Tiaris-Public-Closure: required"]))
         self.assertEqual(P.latest([older, waived, pending], "v0.2.81"), waived)
         promoted = pending | {"prerelease": False, "body": pending["body"].replace(
             "Tiaris-Public-Closure: required", "Tiaris-Public-Closure: passed")}

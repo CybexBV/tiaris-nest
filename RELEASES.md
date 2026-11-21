@@ -233,7 +233,8 @@ publication and promotion; v0.2.73 took 89 min end to end, v0.2.78 failed after
 
 Warm and cold VM qualification are **not** on the release path. A release is
 published and promoted without VM proof by policy, and says so: its notes carry
-`Tiaris-VM-Qualification: nightly`. Publication adds `Tiaris-Public-Closure: required`;
+`Tiaris-VM-Qualification: on-demand` (releases staged before 21 November 2026 say
+`nightly`; promotion accepts both, and nothing ever ran it on a schedule). Publication adds `Tiaris-Public-Closure: required`;
 promotion replaces only that line with `Tiaris-Public-Closure: passed` and the exact
 public-closure artifact ID and SHA-256. No release claims VM evidence it does not
 have; published assets no longer include VM qualification receipts.
@@ -256,8 +257,8 @@ its exact `release.yml` push run and its build-once candidate receipt; both VM j
 download the published bytes and verify them against that receipt before booting.
 Warm qualification resolves the release's published predecessor, so it applies to
 the newest release (an older tag fails closed once a later release is published).
-Its result is evidence for the owner's nightly only; it never publishes, promotes or
-edits a release. The nightly schedule itself is outside this repository.
+It runs only when someone starts it; nothing schedules it. Its result is evidence
+only; it never publishes, promotes or edits a release.
 
 Signatures, attestation, immutability, published-byte verification, production-origin
 admission, predecessor lineage rechecks and the protected environments are unchanged.

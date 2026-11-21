@@ -244,7 +244,7 @@ class AcceptanceTests(unittest.TestCase):
 
     POLICY_BODY = '\n'.join(['Tiaris-Release-Workflow: https://github.com/CybexHQ/james/actions/runs/42',
         'Tiaris-Candidate-Artifact-ID: 66', 'Tiaris-Candidate-Artifact-SHA256: ' + 'f' * 64,
-        'Tiaris-VM-Qualification: nightly', 'Tiaris-Public-Closure: required'])
+        'Tiaris-VM-Qualification: on-demand', 'Tiaris-Public-Closure: required'])
 
     def promote(self, *, verify_only=False, body=None, jobs=None, closure=None, manifest=None,
                 prerelease=True, predecessor=None, expect_edit=True, api_changes=None):
@@ -319,13 +319,19 @@ class AcceptanceTests(unittest.TestCase):
         mutation.assert_called_once()
         self.assertEqual(promoted['assets'], staged['assets'])
         notes = promoted['body'].splitlines()
-        self.assertIn('Tiaris-VM-Qualification: nightly', notes)
+        self.assertIn('Tiaris-VM-Qualification: on-demand', notes)
         self.assertIn('Tiaris-Public-Closure: passed', notes)
         self.assertIn('Tiaris-Public-Closure-Artifact-ID: 77', notes)
         self.assertIn('Tiaris-Public-Closure-Artifact-SHA256: sha256:' + digest, notes)
         self.assertNotIn('Tiaris-Public-Closure: required', notes)
         # Policy releases never claim VM evidence that was not checked.
         self.assertFalse(any(line.startswith('Tiaris-Cold-') for line in notes))
+
+    def test_promotion_accepts_a_release_staged_with_the_old_nightly_words(self):
+        nightly = self.POLICY_BODY.replace('on-demand', 'nightly')
+        _, promoted, mutation, _ = self.promote(body=nightly)
+        mutation.assert_called_once()
+        self.assertIn('Tiaris-VM-Qualification: nightly', promoted['body'].splitlines())
 
     def test_promotion_accepts_both_production_origins(self):
         for origin in ('https://manage.tiaris.com', 'https://manage.cybex.net'):
@@ -411,7 +417,8 @@ class AcceptanceTests(unittest.TestCase):
     def test_promotion_requires_the_explicit_policy_and_pending_markers(self):
         lines = self.POLICY_BODY.splitlines()
         legacy = '\n'.join(lines[:3] + ['Tiaris-Cold-Qualification: required'])
-        for body in (legacy, '\n'.join(lines[:3] + lines[4:])):
+        both = '\n'.join(lines[:4] + ['Tiaris-VM-Qualification: nightly'] + lines[4:])
+        for body in (legacy, '\n'.join(lines[:3] + lines[4:]), both):
             with self.subTest(body=body), self.assertRaisesRegex(ValueError, 'release policy'):
                 self.promote(body=body, expect_edit=False)
         with self.assertRaisesRegex(ValueError, 'pending public-closure marker'):

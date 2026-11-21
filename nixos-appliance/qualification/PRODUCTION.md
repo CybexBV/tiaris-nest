@@ -11,7 +11,7 @@ artifacts, stages an immutable prerelease and verifies its published closure.
 Under release policy fast-v1 (2026-11-02) the warm and cold qualification described
 here are not release gates: they run on demand from
 `.github/workflows/nest-vm-qualification.yml` against an exact published release,
-and releases record `Tiaris-VM-Qualification: nightly`. See `RELEASES.md`.
+and releases record `Tiaris-VM-Qualification: on-demand`. See `RELEASES.md`.
 Coordinated releases require a separate exact-candidate promotion action.
 `release/coordinated.json` uses `tiaris.coordinated-release.v2` and
 `appliance_family: nixos`; it has no Ubuntu snapshot input.

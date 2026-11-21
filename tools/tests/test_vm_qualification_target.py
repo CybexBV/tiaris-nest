@@ -25,7 +25,7 @@ def fixture():
                'target_commitish': SOURCE,
                'body': '\n'.join(['Tiaris-Release-Workflow: https://github.com/CybexHQ/james/actions/runs/42',
                                   'Tiaris-Candidate-Artifact-ID: 66', 'Tiaris-Candidate-Artifact-SHA256: ' + 'f' * 64,
-                                  'Tiaris-VM-Qualification: nightly', 'Tiaris-Public-Closure: passed']),
+                                  'Tiaris-VM-Qualification: on-demand', 'Tiaris-Public-Closure: passed']),
                'assets': [{'name': name} for name in (
                    'tiaris-nest-release.json', 'tiaris-nest-release-compatibility.json', BUNDLE,
                    'tiaris-nest-build-predecessor.json')]}

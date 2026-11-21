@@ -2,10 +2,10 @@
 #
 # Release policy fast-v1 (2026-11-02): production releases are built, signed,
 # attested, published and promoted without warm or cold VM qualification; their
-# notes say `Tiaris-VM-Qualification: nightly`. This workflow keeps the complete
+# notes say `Tiaris-VM-Qualification: on-demand`. This workflow keeps the complete
 # warm (fresh install, real update, automatic rollback) and cold (published
 # download, public closure, workstation lifecycle) harness runnable against an
-# exact immutable release so the owner's nightly can call it. Its result is
+# exact immutable release; it runs only when someone starts it. Its result is
 # evidence only: it never publishes, promotes or changes a release.
 #
 # Run it AT the release tag. The protected `production-release-qualification`
