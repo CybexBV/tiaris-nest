@@ -579,12 +579,12 @@ def activate(prepared):
     try:
         emit_status(receipt, 'preparing', 'activating')
         verify_store_closure(cache, receipt['system_toplevel'])
-        if shutil.disk_usage('/boot').free < 256 * 1024 ** 2:
-            raise ValueError('insufficient_esp_space')
+        boot_space()
         retire_generations(prepared['retire_generations'])
-    except Exception:
+    except Exception as error:
         (ROOTS / ('pending-' + attempt)).unlink(missing_ok=True)
-        emit_status(receipt, 'failed', 'verification_failed', 'closure_import_failed', current()['system_generation'])
+        reason = 'insufficient_esp_space' if isinstance(error, BootPartitionFull) else 'closure_import_failed'
+        emit_status(receipt, 'failed', 'verification_failed', reason, current()['system_generation'])
         cleanup(receipt)
         raise
     try:
