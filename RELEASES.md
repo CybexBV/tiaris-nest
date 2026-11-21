@@ -218,7 +218,9 @@ The required path (`release.yml`) is:
 The workflow has one self-hosted runner, so separate jobs can only run one after
 another. The gates therefore run inside the build job, from a clean checkout of the
 exact tag (`release/beast/release-gates.sh`), and every attempt joins them before it
-signs anything. Inside the build container the workstation runtime, the Nest system
+signs anything. Its `expiry` gate (the audit exceptions' review dates) needs
+nothing but `date`: the Tiaris release controller runs it in its clone before it tags,
+so an exception past its review date costs no version number. Inside the build container the workstation runtime, the Nest system
 closure and the setup media build side by side; Nix's store locks build the Tiaris
 agent and kiosk they share once. The runtime archive uses `zstd -3`: its squashfs is
 already zstd-compressed, so a higher level saved under 1% and cost minutes.

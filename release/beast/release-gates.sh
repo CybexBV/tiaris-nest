@@ -12,7 +12,12 @@
 #   release-gates.sh join DIR    wait for every gate, show its log, fail unless all passed
 #   release-gates.sh stop DIR    end gates still running and remove DIR
 #   release-gates.sh GATE        run one gate in the current checkout:
-#                                contracts, rust, nix, bash-syntax or shellcheck
+#                                contracts, rust, nix, bash-syntax, shellcheck or expiry
+#
+# The expiry gate needs nothing but date: the Tiaris release controller runs it
+# in its clone before it tags (deploy/manage/beast_release_workflow.py), so an
+# exception past its review date costs no Nest version number. The rust gate
+# runs it again.
 set -Eeuo pipefail
 
 GATES=(contracts rust nix)
@@ -47,6 +52,18 @@ gate_contracts() {
   python3 -B -m unittest discover -s tools/tests -v
 }
 
+gate_expiry() {
+  # RUSTSEC-2026-0459: bundled SQLite before 3.54 can expose stale memory
+  # when a process opens a crafted database plus -wal file. The Nest opens
+  # only its own root-owned database, and no released sqlx accepts the
+  # patched libsqlite3-sys (>= 0.39). Accepted 2026-11-09; review by
+  # 2027-02-01 (the shared CI adapter applies the same expiry).
+  if [ "$(date -u +%F)" \> 2027-02-01 ]; then
+    echo "The RUSTSEC-2026-0459 audit exception expired; review it" >&2
+    exit 1
+  fi
+}
+
 gate_rust() {
   local tree
   cargo fmt --all --check
@@ -59,15 +76,7 @@ gate_rust() {
   { cargo tree -i sqlx-mysql 2>&1 || true; } | tee "$tree"
   grep -q "nothing to print" "$tree"
   rm -f -- "$tree"
-  # RUSTSEC-2026-0459: bundled SQLite before 3.54 can expose stale memory
-  # when a process opens a crafted database plus -wal file. The Nest opens
-  # only its own root-owned database, and no released sqlx accepts the
-  # patched libsqlite3-sys (>= 0.39). Accepted 2026-11-09; review by
-  # 2027-02-01 (the shared CI adapter applies the same expiry).
-  if [ "$(date -u +%F)" \> 2027-02-01 ]; then
-    echo "The RUSTSEC-2026-0459 audit exception expired; review it" >&2
-    exit 1
-  fi
+  gate_expiry
   cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0459
 }
 
@@ -163,12 +172,12 @@ case "${1:-}" in
     [ "$#" -eq 2 ] || { echo "usage: $0 start|join|stop DIR" >&2; exit 2; }
     "$1" "$2"
     ;;
-  contracts | rust | nix | bash-syntax | shellcheck)
+  contracts | rust | nix | bash-syntax | shellcheck | expiry)
     [ "$#" -eq 1 ] || { echo "usage: $0 GATE" >&2; exit 2; }
     "gate_${1//-/_}"
     ;;
   *)
-    echo "usage: $0 start|join|stop DIR, or $0 contracts|rust|nix|bash-syntax|shellcheck" >&2
+    echo "usage: $0 start|join|stop DIR, or $0 contracts|rust|nix|bash-syntax|shellcheck|expiry" >&2
     exit 2
     ;;
 esac
