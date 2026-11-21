@@ -44,7 +44,8 @@ pub struct Desired {
 /// (`received_at`). An incomplete document never replaces a complete one:
 /// Tiaris could not vouch for the whole of it this time, which is no reason
 /// to stop starting computers. A complete one that lacks this Nest's own row
-/// keeps the row the file has. Only `None` withdraws.
+/// keeps the row the file has, with the boot file the Nest serves now. Only
+/// `None` withdraws.
 pub fn persist(
     state: &AppState,
     desired: Option<&Desired>,
@@ -85,7 +86,11 @@ fn persist_at(
         let own = |row: &&Value| row["server_device_id"] == desired.server_device_id.as_str();
         if !desired.peers.iter().any(|row| own(&row)) {
             let kept = before["peers"].as_array().into_iter().flatten().filter(own);
-            desired.peers.extend(kept.cloned());
+            desired.peers.extend(kept.cloned().map(|mut row| {
+                // With the boot file this Nest serves now, not then.
+                row["bootloader_filename"] = bootloader_filename.into();
+                row
+            }));
         }
     }
     let value = json!({"received_at":Utc::now().timestamp(), "desired":desired,
@@ -104,6 +109,9 @@ fn persist_at(
         file.write_all(&bytes)?;
         file.sync_all()?;
         fs::rename(&temporary, &path)?;
+        // The rename itself must survive a power cut: a withdrawal that came
+        // back as the older document would answer network starts again.
+        fs::File::open(parent)?.sync_all()?;
         Ok(())
     })();
     if result.is_err() {
@@ -236,19 +244,19 @@ mod tests {
         .unwrap();
         assert_eq!(written(&directory)["desired"], before["desired"]);
         // Tiaris leaves the row out until the Nest reports again. 0.2.177
-        // does not answer without it, so the row the file has stays.
+        // does not answer without it, so the row the file has stays, with
+        // the boot file the Nest serves now.
         let mut without_row = sent;
         without_row.peers.clear();
+        let mut kept = before["desired"]["peers"].clone();
+        kept[0]["bootloader_filename"] = "snponly.efi".into();
         persist_at(
             &directory.join("manage-state.json"),
             Some(&without_row),
-            "ipxe.efi",
+            "snponly.efi",
         )
         .unwrap();
-        assert_eq!(
-            written(&directory)["desired"]["peers"],
-            before["desired"]["peers"]
-        );
+        assert_eq!(written(&directory)["desired"]["peers"], kept);
         fs::remove_dir_all(directory).unwrap();
     }
 
