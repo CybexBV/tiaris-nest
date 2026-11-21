@@ -501,7 +501,9 @@ report Tiaris accepted in this boot, at most 90 seconds ago): stage
 `no_manage_contact`. The candidate must reach Tiaris to stay, so a Nest that is
 cut off would switch, go back and download the release again; it keeps what it
 prepared instead and switches when the link is back. At the switch
-root checks the closure again, seals the next generation and selects it for one
+root checks the closure again, arms the next generation, looks once more
+whether the Nest still reaches Tiaris (if not, it undoes the arming and waits
+with what it prepared), seals the generation and selects it for one
 boot. Holds, active builds, maintenance leases and network transactions defer
 it. The service polls requests every 30 seconds.
 

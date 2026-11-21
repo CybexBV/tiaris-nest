@@ -3,8 +3,14 @@
 //!
 //! A site has one Nest, so the supervisor answers every UEFI computer and needs
 //! only this Nest's identity, whether Tiaris sent its document whole, and the
-//! boot file this Nest serves. For Nests up to 0.2.177 Tiaris still sends
-//! `peers` (only this Nest's own row) and an empty `clients`; they are ignored.
+//! boot file this Nest serves.
+//!
+//! The file is read by two generations. The supervisor of Nest 0.2.177 needs
+//! `peers` (with this Nest's own row) and `clients` in it, and this release's
+//! supervisor reads a file that 0.2.177 wrote (the boot file from the own
+//! row). So an update serves at once with the file it finds, and a rollback
+//! to 0.2.177 finds a file it can read. Drop both lists once no Nest can go
+//! back to 0.2.177.
 use crate::AppState;
 use anyhow::{Result, bail};
 use axum::{Json, extract::State};
@@ -26,10 +32,18 @@ pub struct Desired {
     pub schema: String,
     pub server_device_id: String,
     pub complete: bool,
+    /// Unused here; written as Tiaris sent them, for a rollback to 0.2.177.
+    #[serde(default)]
+    pub peers: Vec<Value>,
+    #[serde(default)]
+    pub clients: Vec<Value>,
 }
 
-/// Written after every sync with Tiaris. Without Tiaris the supervisor keeps
-/// serving with the last one and reports it as stale (`received_at`).
+/// Written after a sync with Tiaris. Without Tiaris the supervisor keeps
+/// serving with the last complete document and reports it as stale
+/// (`received_at`). An incomplete document never replaces a complete one:
+/// Tiaris could not vouch for the whole of it this time, which is no reason
+/// to stop starting computers. Only `None` withdraws.
 pub fn persist(
     state: &AppState,
     desired: Option<&Desired>,
@@ -54,6 +68,9 @@ fn persist_at(
         .parent()
         .ok_or_else(|| anyhow::anyhow!("PXE state directory missing"))?;
     let path = parent.join("pxe-discovery.json");
+    if desired.is_some_and(|desired| !desired.complete) && holds_complete_document(&path) {
+        return Ok(());
+    }
     let value = json!({"received_at":Utc::now().timestamp(), "desired":desired,
         "bootloader_filename":bootloader_filename});
     let bytes = serde_json::to_vec(&value)?;
@@ -76,6 +93,19 @@ fn persist_at(
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+/// Tiaris removed or replaced this Nest: it stops answering network starts.
+/// A retired Nest gets no document any more, so nothing else would stop it.
+pub fn withdraw(state: &AppState) -> Result<()> {
+    persist(state, None, "")
+}
+
+fn holds_complete_document(path: &Path) -> bool {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .is_some_and(|value| value["desired"]["complete"] == true)
 }
 
 pub fn status() -> Value {
@@ -132,31 +162,86 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    #[test]
-    fn inventory_is_atomic_private_and_revoked_when_removed_from_manage() {
+    /// `pxe-discovery.json` as Nest 0.2.177 wrote it (its supervisor reads
+    /// `peers` and `clients`). The supervisor's tests read the same file.
+    const NEST_0_2_177: &str = include_str!("../protocol/fixtures/pxe-discovery-nest-0.2.177.json");
+
+    fn directory() -> std::path::PathBuf {
         let directory =
             std::env::temp_dir().join(format!("pxe-inventory-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&directory).unwrap();
-        let state = directory.join("manage-state.json");
-        let desired = Desired {
+        directory
+    }
+
+    fn written(directory: &Path) -> Value {
+        serde_json::from_slice(&fs::read(directory.join("pxe-discovery.json")).unwrap()).unwrap()
+    }
+
+    fn document(complete: bool) -> Desired {
+        Desired {
             schema: "tiaris.nest.pxe-discovery.v1".into(),
             server_device_id: "qualification".into(),
-            complete: true,
-        };
-        persist_at(&state, Some(&desired), "snponly.efi").unwrap();
-        let path = directory.join("pxe-discovery.json");
-        let value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            complete,
+            peers: vec![],
+            clients: vec![],
+        }
+    }
+
+    #[test]
+    fn inventory_is_atomic_private_and_revoked_when_removed_from_manage() {
+        let directory = directory();
+        let state = directory.join("manage-state.json");
+        persist_at(&state, Some(&document(true)), "snponly.efi").unwrap();
+        let value = written(&directory);
         assert_eq!(value["desired"]["server_device_id"], "qualification");
         assert_eq!(value["bootloader_filename"], "snponly.efi");
         assert!(value["received_at"].as_i64().unwrap() <= Utc::now().timestamp());
         assert_eq!(
-            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            fs::metadata(directory.join("pxe-discovery.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
             0o600
         );
-        persist_at(&state, None, "snponly.efi").unwrap();
-        let value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert!(value["desired"].is_null());
+        persist_at(&state, None, "").unwrap();
+        assert!(written(&directory)["desired"].is_null());
         assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn nest_0_2_177_reads_the_file_after_a_rollback() {
+        // Under `desired` the file is what 0.2.177 wrote for the same
+        // document from Tiaris: every field, both lists, nothing else. Its
+        // supervisor ignores the boot file beside it.
+        let before: Value = serde_json::from_str(NEST_0_2_177).unwrap();
+        let sent: Desired = serde_json::from_value(before["desired"].clone()).unwrap();
+        let directory = directory();
+        persist_at(
+            &directory.join("manage-state.json"),
+            Some(&sent),
+            "ipxe.efi",
+        )
+        .unwrap();
+        assert_eq!(written(&directory)["desired"], before["desired"]);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn an_incomplete_document_never_replaces_a_complete_one() {
+        let directory = directory();
+        let state = directory.join("manage-state.json");
+        let path = directory.join("pxe-discovery.json");
+        // The file an update from 0.2.177 finds is a complete one too.
+        fs::write(&path, NEST_0_2_177).unwrap();
+        persist_at(&state, Some(&document(false)), "snponly.efi").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), NEST_0_2_177);
+        // A withdrawal stops it; after that there is nothing to keep.
+        persist_at(&state, None, "").unwrap();
+        assert!(written(&directory)["desired"].is_null());
+        persist_at(&state, Some(&document(false)), "snponly.efi").unwrap();
+        assert_eq!(written(&directory)["desired"]["complete"], false);
         fs::remove_dir_all(directory).unwrap();
     }
 

@@ -142,7 +142,7 @@ pub fn record_retirement(retirement: Option<Retirement>) {
     }
 }
 
-fn current_retirement() -> Option<Retirement> {
+pub(crate) fn current_retirement() -> Option<Retirement> {
     match RETIREMENT.load(Ordering::Relaxed) {
         1 => Some(Retirement::Replaced),
         2 => Some(Retirement::Removed),

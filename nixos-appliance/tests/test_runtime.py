@@ -58,6 +58,15 @@ class PxeDocument(unittest.TestCase):
         self.assertTrue(stale)
         self.assertEqual(desired['server_device_id'], 'nest-1')
 
+    def test_a_file_nest_0_2_177_wrote_serves_with_the_boot_file_of_its_own_row(self):
+        # What an update from 0.2.177 finds, often before it reaches Tiaris.
+        before = json.loads((RUNTIME.parents[1] / 'protocol/fixtures/pxe-discovery-nest-0.2.177.json').read_text())
+        self.assertEqual(pxe.validate_desired(before, self.NOW + 7 * 24 * 3600)[1:], ('ipxe.efi', True))
+        # 0.2.177 did not answer without its own row either.
+        before['desired']['peers'] = []
+        with self.assertRaisesRegex(pxe.Unavailable, 'awaiting_appliance_report'):
+            pxe.validate_desired(before, self.NOW)
+
     def test_an_incomplete_withdrawn_or_malformed_document_is_refused(self):
         for document, reason in (
                 (self.document(desired={'schema': pxe.SCHEMA, 'server_device_id': 'nest-1', 'complete': False}), 'inventory_incomplete'),
@@ -351,8 +360,14 @@ class RoomForAnUpdate(unittest.TestCase):
                 with patch.object(update.shutil, 'disk_usage', side_effect=lambda path: SimpleNamespace(free=free[0])), \
                         patch.object(update, 'run', side_effect=retention), \
                         patch.object(update, 'collect_garbage', side_effect=lambda: steps.append('gc')):
-                    update.make_room(100)
+                    self.assertEqual(update.make_room(100), 'gc' in expected)
                 self.assertEqual(steps, expected)
+        # The attempt collected the store's garbage before: not again.
+        with patch.object(update.shutil, 'disk_usage', return_value=SimpleNamespace(free=40)), \
+                patch.object(update, 'run') as retention, patch.object(update, 'collect_garbage') as collect:
+            self.assertFalse(update.make_room(100, collect=False))
+        retention.assert_called_once()
+        collect.assert_not_called()
         with patch.object(update.shutil, 'disk_usage', return_value=SimpleNamespace(free=100)), \
                 patch.object(update, 'run') as retention, patch.object(update, 'collect_garbage') as collect:
             update.make_room(100)
@@ -366,8 +381,12 @@ class RoomForAnUpdate(unittest.TestCase):
             commands.append(command[2:])
             code, output = next(results)
             return SimpleNamespace(returncode=code, stdout=output, stderr='Error: insufficient_store_space' if code == 1 else '')
+        # Short of space, cache retention is never enough here: garbage goes.
+        def make_room(required, collect):
+            room.append((required, collect))
+            return collect
         with patch.object(update.subprocess, 'run', side_effect=verifier), \
-                patch.object(update, 'make_room', side_effect=room.append):
+                patch.object(update, 'make_room', side_effect=make_room):
             try:
                 return update.verified_cache(), commands, room
             except subprocess.CalledProcessError:
@@ -377,10 +396,12 @@ class RoomForAnUpdate(unittest.TestCase):
         # Enough room: nothing is freed.
         self.assertEqual(self.verify((0, '/private/cache\n')), (Path('/private/cache'), [[]], []))
         # Short of space: make the room the verifier names, then it passes.
-        self.assertEqual(self.verify((75, '100\n'), (0, '/private/cache\n')), (Path('/private/cache'), [[], []], [100]))
+        self.assertEqual(self.verify((75, '100\n'), (0, '/private/cache\n')),
+                         (Path('/private/cache'), [[], []], [(100, True)]))
         # Still short after making room twice: the last run may end the attempt.
+        # The store's garbage went the first time and is not collected again.
         self.assertEqual(self.verify((75, '100\n'), (75, '300\n'), (1, '')),
-                         (None, [[], [], ['--space-freed']], [100, 300]))
+                         (None, [[], [], ['--space-freed']], [(100, True), (300, False)]))
 
 
     def test_a_boot_partition_that_filled_up_before_the_switch_is_named(self):
@@ -807,6 +828,49 @@ class ReleaseOnlyClosure(unittest.TestCase):
                 update.nar_hash_bytes(invalid)
 
 
+class ContactBeforeTheRestart(unittest.TestCase):
+    """Arming the candidate takes a while; the Nest restarts into it only
+    while it still reaches Tiaris."""
+    ATTEMPT = '11111111-1111-4111-8111-111111111111'
+
+    def arm(self, contact):
+        prepared = {'attempt_id': self.ATTEMPT, 'cache_path': '/cache', 'system_toplevel': '/candidate',
+                    'retire_generations': []}
+        calls = []
+        def record(name, result=None):
+            return lambda *args, **kwargs: calls.append((name, *args[1:2], *sorted(kwargs.items()))) or result
+        source = {'system_generation': '1', 'system_toplevel': '/source', 'loader_entry': 'nixos-generation-1.conf'}
+        with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as stack:
+            pending = Path(directory) / 'pending.json'
+            for name, value in (('PENDING', pending), ('PREPARE', Path(directory) / 'prepare.json'),
+                                ('ROOTS', Path(directory)), ('current', lambda: source), ('load', lambda path, **kw: {}),
+                                ('generation_for', lambda toplevel: '2'), ('contact_fresh', lambda: contact),
+                                ('firmware_entry', lambda name: 'nixos-generation-2.conf' if name.endswith('OneShot') else source['loader_entry']),
+                                ('save', lambda path, value: path.write_text('{}')),
+                                ('remove', lambda path: calls.append(('remove', path.name))),
+                                ('restore_source', record('restore_source')), ('prune_candidate', record('prune_candidate')),
+                                ('emit_status', lambda receipt, *status: calls.append(status)),
+                                ('run', lambda *command, **kw: calls.append(command[:2]) if command[0] == 'systemctl' else None)):
+                stack.enter_context(patch.object(update, name, value))
+            for name in ('verify_store_closure', 'boot_space', 'retire_generations', 'set_default', 'verify_boot_entry'):
+                stack.enter_context(patch.object(update, name))
+            stack.enter_context(patch.object(update.os, 'sync'))
+            update.activate(prepared)
+            return calls, pending.exists()
+
+    def test_a_link_that_died_while_arming_waits_with_what_it_prepared(self):
+        calls, sealed = self.arm(contact=True)
+        self.assertTrue(sealed)
+        self.assertEqual(calls, [('preparing', 'activating'), ('rebooting', 'reboot_pending'), ('systemctl', '--no-block')])
+        # Nothing is sealed and nothing restarts: the arming is undone, the
+        # prepared closure keeps its root and the report says what it waits for.
+        calls, sealed = self.arm(contact=False)
+        self.assertFalse(sealed)
+        self.assertEqual(calls, [('preparing', 'activating'), ('restore_source',),
+                                 ('prune_candidate', ('keep_prepared', True)), ('remove', 'prepare.json'),
+                                 ('preparing', 'no_manage_contact')])
+
+
 class CandidateHealth(unittest.TestCase):
     """What the candidate proves before it stays, and what a rollback says."""
     RELEASE = {'source_revision': 'r', 'nixpkgs_revision': 'n', 'manage_source_revision': 'm', 'release_id': '0.2.1',
@@ -845,6 +909,9 @@ class CandidateHealth(unittest.TestCase):
         self.assertEqual(self.outcome([True], [False]), ('health_checking', 'rollback_pending', 'manage_contact_failed'))
         # Two healthy checks in a row are not three: its own health is the reason.
         self.assertEqual(self.outcome([True, True, False], [False]),
+                         ('health_checking', 'rollback_pending', 'local_health_failed'))
+        # Healthy at first, broken at the deadline: the last checks decide.
+        self.assertEqual(self.outcome([True] * 3 + [False] * 60, [False]),
                          ('health_checking', 'rollback_pending', 'local_health_failed'))
 
 

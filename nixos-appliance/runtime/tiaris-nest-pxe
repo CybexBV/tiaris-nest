@@ -4,7 +4,9 @@
 Only a complete document Tiaris signed arms discovery. A site has one Nest: it
 answers every UEFI computer that starts from the network. Without Tiaris the
 Nest keeps serving with the last complete document and reports it as stale;
-only a newer document from Tiaris changes or withdraws it.
+only a newer complete document changes it and only a withdrawal (Tiaris
+removed or replaced this Nest) stops it. The Nest service never replaces a
+complete document with an incomplete one.
 """
 from __future__ import annotations
 import hashlib
@@ -143,9 +145,18 @@ def validate_desired(wrapper, now):
     desired = wrapper.get('desired')
     require(isinstance(desired, dict) and desired.get('schema') == SCHEMA, 'inventory_unavailable')
     require(desired.get('complete') is True, 'inventory_incomplete')
-    identity(desired.get('server_device_id'))
-    require(wrapper.get('bootloader_filename') in ('snponly.efi', 'ipxe.efi'), 'inventory_unavailable')
-    return desired, wrapper['bootloader_filename'], not 0 <= now - received <= MAX_AGE
+    own = identity(desired.get('server_device_id'))
+    filename = wrapper.get('bootloader_filename')
+    if filename is None:
+        # A Nest up to 0.2.177 wrote this file: it kept the boot file only in
+        # its own row of `peers`. A Nest that updates from one serves at once
+        # with it, also before it reaches Tiaris.
+        peers = desired.get('peers')
+        rows = [peer for peer in peers if isinstance(peer, dict) and peer.get('server_device_id') == own] if isinstance(peers, list) else []
+        require(rows, 'awaiting_appliance_report')
+        filename = rows[0].get('bootloader_filename')
+    require(filename in ('snponly.efi', 'ipxe.efi'), 'inventory_unavailable')
+    return desired, filename, not 0 <= now - received <= MAX_AGE
 
 def http_json(ip, source):
     connection = http.client.HTTPConnection(ip, 80, timeout=2, source_address=(source, 0))

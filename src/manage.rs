@@ -877,11 +877,20 @@ async fn sync_boot_foundation(state: &AppState, managed: &mut ManagedState) -> R
                     retain_sync_failure(&mut first_failure, "boot desired configuration", error)
                 }
             },
-            Err(error) => retain_sync_failure(
-                &mut first_failure,
-                "boot desired configuration fetch",
-                error,
-            ),
+            Err(error) => {
+                // A retired Nest is refused, so no document can withdraw its
+                // network starts: the refusal itself does.
+                if crate::console_status::current_retirement().is_some() {
+                    if let Err(error) = crate::pxe_discovery::withdraw(state) {
+                        warn!(error = %safe_error(&error), "could not withdraw PXE discovery of a retired Nest");
+                    }
+                }
+                retain_sync_failure(
+                    &mut first_failure,
+                    "boot desired configuration fetch",
+                    error,
+                )
+            }
         }
     }
     match report_boot_state(state, managed).await {
