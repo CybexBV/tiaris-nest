@@ -509,9 +509,9 @@ async fn run(state: AppState) {
     // After an update of this Nest, the ready commits of the previous build
     // stay, what it held back is forgotten, and the channel is looked at
     // again now rather than at the daily check: the update may be what it
-    // waited for.
+    // waited for. (The ready commits of Nest 0.2.173 and older were taken
+    // over before this task started: `take_over_commits_of_older_nests`.)
     let data_dir = &state.config.paths.data_dir;
-    adopt_ready_commits_of_older_nests(data_dir).await;
     let forgot = forget_verdicts_of_other_builds(data_dir).await;
     if forgot || !this_build_has_a_verdict(data_dir).await {
         // The network may come up after the Nest: try for some minutes.
@@ -676,28 +676,58 @@ async fn check(state: &AppState) -> Result<()> {
 /// compile is not asked again (the next channel commit is).
 fn needs_evaluation(existing: Option<&DetectedRow>, now: DateTime<Utc>) -> bool {
     existing.is_none_or(|row| {
-        matches!(
-            row.reason.as_deref(),
-            Some(
-                REASON_EVALUATION_FAILED | REASON_PROVENANCE_UNVERIFIED | REASON_INSUFFICIENT_DISK
-            )
-        ) && parse_timestamp(Some(&row.detected_at))
-            .is_none_or(|detected| now - detected >= RETRY_INTERVAL)
+        check_did_not_finish(row)
+            && parse_timestamp(Some(&row.detected_at))
+                .is_none_or(|detected| now - detected >= RETRY_INTERVAL)
     })
+}
+
+/// The record says the check could not be done (evaluation, provenance or
+/// disk space), not what the commit needs: it is tried again.
+fn check_did_not_finish(row: &DetectedRow) -> bool {
+    matches!(
+        row.reason.as_deref(),
+        Some(REASON_EVALUATION_FAILED | REASON_PROVENANCE_UNVERIFIED | REASON_INSUFFICIENT_DISK)
+    )
+}
+
+/// Proof that the ready commits of older Nests were taken over
+/// (`take_over_commits_of_older_nests`). The build worker and the reporter
+/// to Manage cannot start without it, so neither looks at the detected
+/// commits before the takeover is done: a queued job of a Blueprint released
+/// on such a commit would be refused (`target_not_allowed`), and the first
+/// report would leave the commit out.
+#[derive(Clone, Copy, Debug)]
+pub struct OlderNestsCommitsTakenOver(());
+
+/// Take over the ready commits of older Nests, once, when the Nest starts
+/// and before anything reads the detected commits. A small local copy.
+pub async fn take_over_commits_of_older_nests(config: &AppConfig) -> OlderNestsCommitsTakenOver {
+    adopt_ready_commits_of_older_nests(&config.paths.data_dir).await;
+    OlderNestsCommitsTakenOver(())
 }
 
 /// Take over the ready commits Nest 0.2.173 and older recorded
 /// (`older_nests_detected_dir`), so the Blueprints released on them keep
-/// building. A commit this Nest has a record of keeps it. What the older
-/// Nest held back is not taken over, and its records are left as they are.
+/// building. A verdict of this Nest stands, with one exception: a record of
+/// a check that did not finish (`check_did_not_finish`) gives way. The older
+/// Nest ran the same checks later and they passed (it can run after this
+/// one: see `older_nests_detected_dir`), and once the channel has moved on
+/// this Nest never checks the commit again. What the older Nest held back is
+/// not taken over, and its records are left as they are.
 async fn adopt_ready_commits_of_older_nests(data_dir: &Path) {
     let older = older_nests_detected_dir(data_dir);
     let dir = detected_dir(data_dir);
     let _guard = crate::state_files::lock(&dir).await;
     for name in crate::state_files::list(&older, ".json", 4 * MAX_DETECTED_RECORDS) {
         let commit = name.trim_end_matches(".json");
-        if !valid_commit(commit) || matches!(detected_row(data_dir, commit).await, Ok(Some(_))) {
+        if !valid_commit(commit) {
             continue;
+        }
+        match detected_row(data_dir, commit).await {
+            Ok(None) => {}
+            Ok(Some(own)) if check_did_not_finish(&own) => {}
+            Ok(Some(_)) | Err(_) => continue,
         }
         let ready = crate::state_files::read::<DetectedRow>(
             &older,

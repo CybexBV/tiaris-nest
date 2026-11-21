@@ -165,14 +165,18 @@ async fn run_server(
     let listener = TcpListener::bind(listen_addr)
         .await
         .with_context(|| format!("failed to bind {listen_addr}"))?;
-    tiaris_nest::build::spawn(state.clone());
+    // The build worker and the reporter read the detected commits: the ready
+    // ones of an older Nest are taken over first.
+    let taken_over =
+        tiaris_nest::software_updates::take_over_commits_of_older_nests(&state.config).await;
+    tiaris_nest::build::spawn(state.clone(), taken_over);
     // Publish the shipped workstation cache seeds without waiting for a build
     // job; failures are logged and retried in the background.
     tiaris_nest::cache::seeds::spawn(state.clone());
     tiaris_nest::software_updates::spawn(state.clone());
     tiaris_nest::netboot::spawn_maintenance(state.clone());
     if state.config.manage.enabled {
-        tiaris_nest::manage::spawn(state.clone());
+        tiaris_nest::manage::spawn(state.clone(), taken_over);
         tiaris_nest::software_cache_upload::spawn(state.clone());
         tiaris_nest::site_check::spawn(state.clone());
     }
