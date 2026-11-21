@@ -67,6 +67,26 @@ class PxeDocument(unittest.TestCase):
                 pxe.validate_desired(document, self.NOW)
 
 
+class StartCheckReason(unittest.TestCase):
+    def test_a_failed_check_names_its_reason_on_the_screen_until_the_checks_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'console-status.json'
+            with patch.object(first_boot, 'directory'), \
+                    patch.object(first_boot, 'write', lambda target, body, **_: Path(target).write_bytes(body)):
+                first_boot.show_failure('The Nest settings are not valid.', path=path)
+            status = json.loads(path.read_text())
+            self.assertEqual((status['schema'], status['state']), ('tiaris.nest-console-status.v1', 'attention'))
+            self.assertEqual(status['attention']['code'], 'start_check_failed')
+            self.assertTrue(status['attention']['detail'].startswith('The Nest settings are not valid.'))
+            self.assertLessEqual(len(status['attention']['detail']), 240)
+            first_boot.clear_failure(path)
+            self.assertFalse(path.exists())
+            # The Nest service's own status is never removed.
+            path.write_text(json.dumps({'state': 'healthy'}))
+            first_boot.clear_failure(path)
+            self.assertTrue(path.exists())
+
+
 class ReadBoundary(unittest.TestCase):
     def test_rejects_links_writable_files_and_oversize(self):
         with tempfile.TemporaryDirectory() as directory:
