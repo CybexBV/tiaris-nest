@@ -1,10 +1,12 @@
 """Safety boundaries and durable recovery, without modifying the host runtime."""
 import base64
+import contextlib
 import copy
 import datetime
 import hashlib
 from importlib.machinery import SourceFileLoader
 import importlib.util
+import itertools
 import json
 import os
 from pathlib import Path
@@ -212,7 +214,7 @@ class PrepareThenSwitch(unittest.TestCase):
         (self.roots / ('pending-' + self.attempt)).unlink()
         self.assertIsNone(self.found())
 
-    def run_stage(self, prepared, waiting, started=False):
+    def run_stage(self, prepared, waiting, started=False, contact=True):
         calls = []
         with patch.object(update, 'REQUEST', self.directory / 'request.json'), \
                 patch.object(update, 'maintenance_lock', return_value=nullcontext()), \
@@ -224,6 +226,7 @@ class PrepareThenSwitch(unittest.TestCase):
                 patch.object(update, 'drop_prepared', side_effect=lambda: calls.append('drop')), \
                 patch.object(update, 'prepare', side_effect=lambda: calls.append('prepare') or self.prepared), \
                 patch.object(update, 'waiting_for', side_effect=lambda: calls.append('gate') or (waiting, 'why')), \
+                patch.object(update, 'contact_fresh', return_value=contact), \
                 patch.object(update, 'last_report', return_value={}), \
                 patch.object(update, 'started', return_value=started), \
                 patch.object(update, 'activate', side_effect=lambda receipt: calls.append('activate')), \
@@ -237,6 +240,15 @@ class PrepareThenSwitch(unittest.TestCase):
         self.assertEqual(self.run_stage(self.prepared, None), ['gate', 'activate'])
         # After a crash during activation the report never goes back to waiting.
         self.assertEqual(self.run_stage(self.prepared, 'nest_busy', started=True), ['activate'])
+
+    def test_a_nest_that_cannot_reach_tiaris_keeps_what_it_prepared_and_waits(self):
+        # The candidate would have to reach Tiaris to stay: switching now
+        # ends in a rollback, and the next try downloads everything again.
+        self.assertEqual(self.run_stage(self.prepared, None, contact=False),
+                         ['gate', ('waiting_window', 'no_manage_contact')])
+        # Also an activation that a power cut interrupted; its report stays started.
+        self.assertEqual(self.run_stage(self.prepared, None, started=True, contact=False),
+                         [('preparing', 'no_manage_contact')])
 
     def test_a_replaced_request_leaves_nothing_prepared_behind(self):
         staging, control = self.directory / 'staging', self.directory / 'control'
@@ -652,7 +664,7 @@ class ReleaseOnlyClosure(unittest.TestCase):
 
     def test_import_checks_the_closure_before_running_it(self):
         source = (RUNTIME / 'generation_update.py').read_text()
-        stage = source[source.index('def prepare():'):source.index('def contact_ready(')]
+        stage = source[source.index('def prepare():'):source.index('def contact_fresh(')]
         imported = stage.index("'copy', '--from'")
         rooted = stage.index("pin(verified['system_toplevel'], 'pending-' + attempt)")
         checked = stage.index("verify_store_closure(cache, verified['system_toplevel'])")
@@ -685,6 +697,47 @@ class ReleaseOnlyClosure(unittest.TestCase):
                 update.nar_hash_bytes(invalid)
 
 
+class CandidateHealth(unittest.TestCase):
+    """What the candidate proves before it stays, and what a rollback says."""
+    RELEASE = {'source_revision': 'r', 'nixpkgs_revision': 'n', 'manage_source_revision': 'm', 'release_id': '0.2.1',
+               'base_os': 'nixos', 'base_os_version': '26.05', 'required_system_versions': {}}
+
+    def outcome(self, healthy, reached):
+        """The last status `commit` reports for a candidate whose own health
+        and whose contact with Tiaris answer the checks in this order."""
+        receipt = {**self.RELEASE, 'release': self.RELEASE, 'attempt_id': '11111111-1111-4111-8111-111111111111',
+                   'system_toplevel': '/candidate', 'candidate_generation': '2',
+                   'candidate_loader_entry': 'nixos-generation-2.conf', 'system_closure_sha256': 'c' * 64,
+                   'sqlite_migrations_sha256': hashlib.sha256(b'inventory').hexdigest()}
+        seconds = itertools.count(0, 5)
+        clock = SimpleNamespace(monotonic=lambda: next(seconds), sleep=lambda seconds: None)
+        healthy, reached = itertools.cycle(healthy), itertools.cycle(reached)
+        with tempfile.NamedTemporaryFile() as pending, contextlib.ExitStack() as stack:
+            for name, value in (('PENDING', Path(pending.name)), ('time', clock), ('maintenance_lock', nullcontext),
+                                ('load', lambda path, **kw: receipt), ('read', lambda path, **kw: b'inventory'),
+                                ('current', lambda: {'system_toplevel': '/candidate', 'system_generation': '2'}),
+                                ('local_health_ready', lambda: next(healthy)), ('contact_fresh', lambda: next(reached)),
+                                ('terminal_matches', lambda receipt: False), ('retain', lambda receipt, installed: [])):
+                stack.enter_context(patch.object(update, name, value))
+            for name in ('verify_observed_versions', 'verify_boot_entry', 'save', 'set_default', 'cleanup',
+                         'clear_transaction', 'prune_obsolete', 'restore_source', 'run'):
+                stack.enter_context(patch.object(update, name))
+            stack.enter_context(patch.object(update.os, 'sync'))
+            emit = stack.enter_context(patch.object(update, 'emit_status'))
+            try:
+                update.commit()
+            except RuntimeError:
+                pass
+            return emit.call_args.args[1:]
+
+    def test_a_candidate_that_only_lost_tiaris_goes_back_with_its_own_reason(self):
+        self.assertEqual(self.outcome([True], [True]), ('succeeded', 'committed'))
+        self.assertEqual(self.outcome([True], [False]), ('health_checking', 'rollback_pending', 'manage_contact_failed'))
+        # Two healthy checks in a row are not three: its own health is the reason.
+        self.assertEqual(self.outcome([True, True, False], [False]),
+                         ('health_checking', 'rollback_pending', 'local_health_failed'))
+
+
 class CandidateContactOrigin(unittest.TestCase):
     """The candidate accepts Management contact at its own origin for legacy state."""
 
@@ -709,7 +762,7 @@ class CandidateContactOrigin(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, \
                 patch.object(update, 'BOOTSTRAP', self.bootstrap(directory)), \
                 patch.object(update, 'load', lambda path, **_: copy.deepcopy(files[Path(path).name])):
-            return update.contact_ready({})
+            return update.contact_fresh()
 
     def test_legacy_recorded_origin_accepts_contact_at_the_build_origin(self):
         self.assertTrue(self.ready('https://manage.cybex.net', 'https://manage.tiaris.com'))
