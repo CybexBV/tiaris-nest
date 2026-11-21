@@ -141,6 +141,13 @@
       machine.fail("curl --fail --silent 'http://127.0.0.1:8080/healthz?tiaris_fresh=1'")
       machine.succeed("chmod 0644 /var/cache/tiaris-nest/tftp/autoexec.ipxe")
       machine.succeed("curl --fail --silent 'http://127.0.0.1:8080/healthz?tiaris_fresh=1'")
+      # A week without Tiaris: the document only ages. The proxy keeps
+      # answering computers and the Nest stays ready, reported as stale.
+      machine.succeed("jq -c '.received_at -= 7 * 24 * 3600' /var/lib/tiaris-nest/state/agent/pxe-discovery.json > /tmp/pxe-discovery.json")
+      machine.succeed("install -m0600 -o tiaris-nest -g tiaris-nest /tmp/pxe-discovery.json /var/lib/tiaris-nest/state/agent/pxe-discovery.json")
+      machine.wait_until_succeeds("jq -e '.status == \"active\" and .reason == \"inventory_stale\" and .eligible' /run/tiaris-nest-pxe/status.json", timeout=60)
+      machine.succeed("ss -lunp | grep -F ':67 '")
+      machine.succeed("curl --fail --silent 'http://127.0.0.1:8080/healthz?tiaris_fresh=1'")
       machine.succeed("systemctl stop tiaris-nest-pxe")
       machine.fail("curl --fail --silent 'http://127.0.0.1:8080/healthz?tiaris_fresh=1'")
     '';
