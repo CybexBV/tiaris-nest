@@ -279,21 +279,6 @@ exactly its own items; a missing or altered document fails that grant.
   pending|uploading|uploaded|failed|expired, paths_total, paths_uploaded,
   items_failed, bytes_uploaded, error?, updated_at}`.
 
-## Wake-on-LAN
-
-Nest advertises `wake_on_lan_v1` and accepts bounded, signed wake requests
-from Tiaris. Each request is tied to an existing workstation placement and a
-normalized MAC address. Nest sends the standard magic packet three times on
-UDP ports 9 and 7, stores a durable `sent` or `failed` receipt in SQLite, and
-replays that receipt until Tiaris acknowledges it. Repeated configuration
-syncs therefore never create an unbounded wake storm.
-
-Wake-on-LAN is best effort. A failed or expired wake request does not fail or
-cancel the authoritative Blueprint operation: the workstation remains safely
-queued and converges when it next checks in. Nest reports only bounded error
-codes and never treats a wake receipt as proof that a workstation actually
-started.
-
 ## What a network boot starts
 
 A computer that is not installed gets the installer every time it starts
@@ -413,6 +398,14 @@ Nest no longer sends the workstation root filesystem by multicast (November
 2026); computers download it over HTTP. Older runtimes still ask for a
 multicast offer, get a 404 and download over HTTP at once. Its SQLite tables
 stay, unused: a Nest update refuses any database migration.
+
+## Retired Wake-on-LAN
+
+Nest no longer wakes switched-off computers (21 November 2026): Tiaris stopped
+asking, because nothing switched wake-on-LAN on in the computers' network cards
+and production never used it. Nest ignores a `wake_on_lan` list from an older
+Tiaris and no longer reports `wake_on_lan_v1`. The `wake_on_lan_receipts`
+table stays, unused, for the same reason as the multicast tables.
 
 ## NixOS appliance
 

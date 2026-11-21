@@ -56,7 +56,6 @@ const CAPABILITY_CACHE_REPLICA_V1: &str = "cache_replica_v1";
 const CAPABILITY_WORKSTATION_NETBOOT_TRANSPORT_V1: &str = "workstation_netboot_transport_v1";
 const CAPABILITY_WORKSTATION_NETBOOT_V1: &str = "workstation_netboot_v1";
 const CAPABILITY_NEST_BOOT_GRANT_V1: &str = "nest_boot_grant_v1";
-const CAPABILITY_WAKE_ON_LAN_V1: &str = crate::wake_on_lan::CAPABILITY;
 const CAPABILITY_APPLIANCE_UPDATE_V1: &str = crate::appliance::APPLIANCE_UPDATE_CAPABILITY;
 const CAPABILITY_APPLIANCE_UPDATE_QUALIFICATION_TRANSPORT_V1: &str =
     crate::appliance::APPLIANCE_UPDATE_QUALIFICATION_TRANSPORT_CAPABILITY;
@@ -225,8 +224,6 @@ struct AgentNestConfigResponse {
     #[serde(default)]
     workstation_netboot: Option<Value>,
     #[serde(default)]
-    wake_on_lan: Vec<crate::wake_on_lan::ManagedWakeRequest>,
-    #[serde(default)]
     software_cache: Option<Value>,
     /// Manage accepts `software_cache_upload_v1` in reports; until it says
     /// so, Nest does not advertise it (an older Manage rejects the report).
@@ -258,8 +255,6 @@ struct NestReportResponse {
     status: String,
     #[serde(default)]
     workstation_netboot: Option<WorkstationNetbootReportReceipt>,
-    #[serde(default)]
-    wake_on_lan: Vec<String>,
     #[serde(default)]
     warnings: NestReportWarnings,
 }
@@ -552,7 +547,6 @@ struct NestAgentReportRequest {
     disk: Option<crate::disk::DiskStats>,
     host: Option<crate::host::HostStats>,
     workstation_netboot: Option<crate::netboot::WorkstationNetbootReport>,
-    wake_on_lan: Vec<crate::wake_on_lan::WakeReport>,
     appliance: Option<crate::appliance::ApplianceReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     appliance_report_error: Option<&'static str>,
@@ -1229,9 +1223,6 @@ async fn apply_nest_desired(
     desired: AgentNestConfigResponse,
     first_failure: &mut Option<anyhow::Error>,
 ) {
-    if let Err(error) = crate::wake_on_lan::apply_requests(&state.db, &desired.wake_on_lan).await {
-        retain_sync_failure(first_failure, "Wake-on-LAN desired state", error.into());
-    }
     // Its own lane: unusable access only costs this Nest the software cache.
     let software_cache = desired
         .software_cache
@@ -1589,13 +1580,6 @@ async fn report_nest_state(
             None
         }
     };
-    let wake_on_lan = match crate::wake_on_lan::report(&state.db).await {
-        Ok(report) => report,
-        Err(error) => {
-            warn!(error = %error, "Wake-on-LAN report generation failed");
-            Vec::new()
-        }
-    };
     let (appliance, appliance_report_error) = match crate::appliance::report(state).await {
         Ok(report) => (report, None),
         Err(error) => {
@@ -1694,7 +1678,6 @@ async fn report_nest_state(
         disk: crate::disk::stats(&state.config.cache.root_dir).ok(),
         host: crate::host::sample().await,
         workstation_netboot,
-        wake_on_lan,
         appliance,
         appliance_report_error,
         software_cache_uploads,
@@ -1730,9 +1713,6 @@ async fn report_nest_state(
     )?;
     crate::console_status::record_retirement(None);
     crate::console_status::notify_changed();
-    if let Err(error) = crate::wake_on_lan::acknowledge(&state.db, &response.wake_on_lan).await {
-        debug!(error = %error, "Wake-on-LAN receipts remain queued for acknowledgement");
-    }
     Ok(NestReportReceipt)
 }
 
@@ -2894,7 +2874,6 @@ fn nest_capabilities_for_mode(peer_supports_scheduling: bool, nixos: bool) -> Ve
         CAPABILITY_WORKSTATION_NETBOOT_V1,
         CAPABILITY_WORKSTATION_NETBOOT_TRANSPORT_V1,
         CAPABILITY_NEST_BOOT_GRANT_V1,
-        CAPABILITY_WAKE_ON_LAN_V1,
     ];
     capabilities.push(crate::pxe_discovery::CAPABILITY);
     if nixos {
@@ -5259,7 +5238,6 @@ mod tests {
                 "workstation_netboot_v1",
                 "workstation_netboot_transport_v1",
                 "nest_boot_grant_v1",
-                "wake_on_lan_v1",
                 "pxe_proxy_v1"
             ]
         );
@@ -6699,7 +6677,6 @@ mod tests {
             disk: None,
             host: None,
             workstation_netboot: None,
-            wake_on_lan: vec![],
             appliance: None,
             appliance_report_error: None,
             software_cache_uploads: None,
