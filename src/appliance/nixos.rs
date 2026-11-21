@@ -28,6 +28,9 @@ pub const MIGRATIONS_PATH: &str = "/usr/share/tiaris-nest/sqlite-migrations.json
 // cache; only requests and durable privileged transaction receipts use STATE.
 const UPDATE_CACHE_ROOT: &str = "/var/cache/tiaris-nest/appliance-updates";
 const UPDATE_BUNDLE_ROOT: &str = "/var/cache/tiaris-nest/appliance-updates/inbox";
+/// Beside the updater request, for root (`generation_update.make_download_room`).
+const UPDATE_ROOM_REQUEST_PATH: &str =
+    "/var/lib/tiaris-nest/state/inbox/appliance-update-room.json";
 const UPDATE_PRIVATE_ROOT: &str = "/var/cache/tiaris-nest/appliance-updates/private";
 const DATABASE_BACKUP_RESERVE: u64 = 1024 * 1024 * 1024;
 static QUEUE: Mutex<(bool, Option<super::ManagedApplianceUpdate<NixosRelease>>)> =
@@ -185,11 +188,25 @@ async fn store(update: super::ManagedApplianceUpdate<NixosRelease>) -> Result<()
     // The download only has to fit. Whether the update itself fits is root's
     // decision (`verify_update`): root can free space first, and its refusal
     // reaches Tiaris with a reason. Retention restores the floor meanwhile.
-    crate::disk::ensure_headroom(
+    if let Err(error) = crate::disk::ensure_headroom(
         Path::new(UPDATE_BUNDLE_ROOT),
         update.release.system_closure.size_bytes,
         "Nest update download",
-    )?;
+    ) {
+        // Root never sees an update whose archive did not land, so it is
+        // asked for room: it frees space as it does for an update that does
+        // not fit. Tiaris hands the update again; then the download fits, or
+        // root has ended the attempt with `insufficient_store_space`. A
+        // staged older update goes first and makes its own room.
+        if prior.is_none() {
+            super::write_atomic_json(
+                Path::new(UPDATE_ROOM_REQUEST_PATH),
+                &room_request(&update),
+                0o600,
+            )?;
+        }
+        return Err(error);
+    }
     download(
         &update.release,
         transport,
@@ -213,6 +230,21 @@ async fn store(update: super::ManagedApplianceUpdate<NixosRelease>) -> Result<()
         let _ = fs::remove_file(&path);
     }
     replaced
+}
+
+/// What root needs to make room for a download and to report the attempt:
+/// its identity and how much must be free.
+fn room_request(update: &super::ManagedApplianceUpdate<NixosRelease>) -> Value {
+    json!({
+        "schema": "tiaris.nest.appliance-update-room.v1",
+        "attempt_id": update.attempt_id,
+        "release": update.release,
+        "required_available_bytes": update
+            .release
+            .system_closure
+            .size_bytes
+            .saturating_add(crate::disk::DISK_HEADROOM_BYTES),
+    })
 }
 
 /// Puts a newer release in place of a staged update the root updater has
@@ -1028,6 +1060,37 @@ mod tests {
     };
 
     const GIB: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn a_room_request_names_the_attempt_and_what_must_be_free() {
+        let release = closure_fixture(b"closure");
+        let update = crate::appliance::ManagedApplianceUpdate {
+            attempt_id: Uuid::from_u128(7),
+            requested_at: Utc::now(),
+            release: release.clone(),
+            qualification_package_transport_url: None,
+        };
+        // What root reads from it (`generation_update.make_download_room`).
+        let request = room_request(&update);
+        assert_eq!(request["attempt_id"], update.attempt_id.to_string());
+        assert_eq!(request["release"]["release_id"], release.release_id);
+        assert_eq!(
+            request["release"]["source_revision"],
+            release.source_revision
+        );
+        assert_eq!(
+            request["release"]["system_toplevel"],
+            release.system_toplevel
+        );
+        assert_eq!(
+            request["release"]["system_closure"]["sha256"],
+            release.system_closure.sha256
+        );
+        assert_eq!(
+            request["required_available_bytes"],
+            release.system_closure.size_bytes + crate::disk::DISK_HEADROOM_BYTES
+        );
+    }
 
     fn closure_fixture(body: &[u8]) -> NixosRelease {
         NixosRelease {

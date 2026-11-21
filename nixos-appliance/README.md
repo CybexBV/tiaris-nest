@@ -125,6 +125,11 @@ updater asks cache retention for the bytes the verifier names
 (`tiaris-nest free-cache-space`, run as the service user), then collects
 garbage as the daily GC does, once per attempt (`generation_update.make_room`). Only then the
 root verifier ends the attempt, with the reason `insufficient_store_space`.
+A disk too full even for the download gets the same: the Nest service stages
+an update only once its archive is there, so it asks root for room instead
+(`inbox/appliance-update-room.json`, `generation_update.make_download_room`).
+Tiaris hands the update again; the download then fits, or root has ended the
+attempt with the same reason.
 Current, pending and two preceding good generations, active job roots and
 protected artifacts cannot be reclaimed to make an update fit. Daily GC uses
 the job/update exclusion barrier.

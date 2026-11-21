@@ -21,6 +21,7 @@ ROLLBACK = CONTROL / 'system-rollback-intent.json'
 INSTALLED = CONTROL / 'appliance-release.json'
 KNOWN = CONTROL / 'known-good-system.json'
 REQUEST = INBOX / 'appliance-update-request.json'
+ROOM = INBOX / 'appliance-update-room.json'
 ROOTS = Path('/nix/var/nix/gcroots/tiaris-appliance')
 STAGING = Path('/var/cache/tiaris-nest/appliance-updates')
 
@@ -438,6 +439,34 @@ def make_room(required, collect=True):
     return collected
 
 
+def make_download_room():
+    """The Nest service asks for room when the disk is too full even for an
+    update's download. It stages the update only once the archive is there,
+    so `prepare` never sees that one. Free space as for an update that does
+    not fit: the service's next try finds room, or the attempt ends here
+    with the reason `insufficient_store_space`, as it would later."""
+    if not ROOM.exists():
+        return
+    with maintenance_lock():
+        try:
+            # A staged update goes first; preparing it makes its own room.
+            if any(path.exists() for path in (REQUEST, PENDING, PREPARE, COMMIT, ROLLBACK)):
+                return
+            request = load(ROOM, owner=UID, maximum=256 * 1024)
+            identity = request_identity(request)
+            required = request['required_available_bytes']
+            if type(required) is not int or not 0 < required <= 1024 * GIB:
+                raise ValueError('invalid room request')
+            make_room(required)
+            if shutil.disk_usage('/nix/store').free < required:
+                print('The update is refused: the disk has too little free space to download it, '
+                      'also after making room.', flush=True)
+                emit_status(identity, 'failed', 'verification_failed', 'insufficient_store_space',
+                            current()['system_generation'])
+        finally:
+            remove(ROOM)
+
+
 def verified_cache():
     """The private cache the root verifier extracts from the staged update.
     Short of disk space the verifier changes nothing and says how many bytes
@@ -702,6 +731,7 @@ def stage():
     before it stays (`commit`), so a Nest that is cut off keeps what it
     prepared and waits (`no_manage_contact`) instead of switching, failing
     that check and going back."""
+    make_download_room()
     if not REQUEST.exists():
         return
     with maintenance_lock():
