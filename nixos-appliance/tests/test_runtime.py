@@ -37,6 +37,34 @@ network = script('tiaris-nest-netplan-activate')
 firewall = script('tiaris-nest-firewall')
 first_boot = script('tiaris-nest-first-boot')
 source_copy = script('source-copy.py')
+pxe = script('tiaris-nest-pxe')
+
+
+
+class PxeDocument(unittest.TestCase):
+    NOW = 1_800_000_000
+
+    def document(self, **changes):
+        wrapper = {'received_at': self.NOW, 'bootloader_filename': 'snponly.efi',
+                   'desired': {'schema': pxe.SCHEMA, 'server_device_id': 'nest-1', 'complete': True}}
+        wrapper.update(changes)
+        return wrapper
+
+    def test_without_tiaris_the_last_document_keeps_serving_as_stale(self):
+        self.assertEqual(pxe.validate_desired(self.document(), self.NOW)[1:], ('snponly.efi', False))
+        desired, _, stale = pxe.validate_desired(self.document(), self.NOW + 7 * 24 * 3600)
+        self.assertTrue(stale)
+        self.assertEqual(desired['server_device_id'], 'nest-1')
+
+    def test_an_incomplete_withdrawn_or_malformed_document_is_refused(self):
+        for document, reason in (
+                (self.document(desired={'schema': pxe.SCHEMA, 'server_device_id': 'nest-1', 'complete': False}), 'inventory_incomplete'),
+                (self.document(desired=None), 'inventory_unavailable'),
+                (self.document(received_at='yesterday'), 'inventory_unavailable'),
+                (self.document(bootloader_filename='../x.efi'), 'inventory_unavailable'),
+                (self.document(desired={'schema': pxe.SCHEMA, 'server_device_id': 'a/b', 'complete': True}), 'invalid_identity')):
+            with self.assertRaisesRegex(pxe.Unavailable, reason):
+                pxe.validate_desired(document, self.NOW)
 
 
 class ReadBoundary(unittest.TestCase):

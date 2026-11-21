@@ -129,9 +129,9 @@
       # NixOS readiness must include fresh, real PXE supervisor evidence. With
       # no authenticated inventory it cannot report ready just because HTTP
       # and TFTP are serving; the local component fixture then supplies one
-      # complete own-peer inventory and runs the actual hardened supervisor.
+      # complete document and runs the actual hardened supervisor.
       machine.fail("curl --fail --silent 'http://127.0.0.1:8080/healthz?tiaris_fresh=1'")
-      machine.succeed("python3 -c 'import json,time; print(json.dumps({\"received_at\":int(time.time()),\"desired\":{\"schema\":\"tiaris.nest.pxe-discovery.v1\",\"server_device_id\":\"qualification\",\"complete\":True,\"peers\":[{\"server_device_id\":\"qualification\",\"address\":\"192.0.2.42\",\"mac\":\"02:00:00:00:00:42\",\"bootloader_filename\":\"snponly.efi\",\"proxy_capable\":True}],\"clients\":[]}}))' > /var/lib/tiaris-nest/state/agent/pxe-discovery.json")
+      machine.succeed("python3 -c 'import json,time; print(json.dumps({\"received_at\":int(time.time()),\"desired\":{\"schema\":\"tiaris.nest.pxe-discovery.v1\",\"server_device_id\":\"qualification\",\"complete\":True},\"bootloader_filename\":\"snponly.efi\"}))' > /var/lib/tiaris-nest/state/agent/pxe-discovery.json")
       machine.succeed("chown tiaris-nest:tiaris-nest /var/lib/tiaris-nest/state/agent/pxe-discovery.json && chmod 0600 /var/lib/tiaris-nest/state/agent/pxe-discovery.json")
       machine.succeed("systemctl restart tiaris-nest-pxe")
       machine.wait_until_succeeds("jq -e '.status == \"active\" and .reason == \"proxy_ready\"' /run/tiaris-nest-pxe/status.json", timeout=90)

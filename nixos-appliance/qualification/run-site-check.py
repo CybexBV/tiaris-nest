@@ -144,9 +144,7 @@ def role_nest(dnsmasq, work):
     pxe.RUN.mkdir(exist_ok=True)
     network = {'interface': 'eth0', 'mac': Path('/sys/class/net/eth0/address').read_text().strip(),
                'address': NEST, 'cidr': '192.0.2.0/24'}
-    target = {'address': NEST, 'bootloader_filename': 'snponly.efi'}
-    desired = {'server_device_id': NEST_ID, 'peers': [], 'clients': []}
-    config = pxe.dnsmasq_config(network, target, {NEST_ID: target}, [])
+    config = pxe.dnsmasq_config(network, 'snponly.efi')
     # In a user namespace dnsmasq keeps its (mapped) root instead of
     # switching users; everything else is the appliance's configuration.
     config = '\n'.join(line for line in config.splitlines() if not line.startswith(('user=', 'group='))) + '\n'
@@ -169,7 +167,7 @@ def role_nest(dnsmasq, work):
                 break
             supervisor.status('active', 'proxy_ready', True)
             supervisor.probed_at = 0.0
-            supervisor.maybe_probe(network, desired, Path(work))
+            supervisor.maybe_probe(network, NEST_ID, Path(work))
             probe = json.loads((pxe.RUN / 'boot-probe.json').read_text())
             print('RESULT ' + json.dumps(probe), flush=True)
     finally:

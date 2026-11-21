@@ -20,7 +20,7 @@ fn pxe(status: &str, reason: &str) -> PxeStatus {
 
 fn probe(value: serde_json::Value) -> BootProbe {
     let mut base = json!({"schema": "tiaris.nest.boot-probe.v1", "checked_at": NOW - 5, "outcome": "ok",
-        "own_answer": true, "dhcp_servers": ["192.0.2.1"], "peer_answers": [], "other_boot_servers": [],
+        "own_answer": true, "dhcp_servers": ["192.0.2.1"], "other_boot_servers": [],
         "dropped_clients": 0, "dropped_last_at": null, "booted_clients": 0, "booted_last_at": null});
     for (key, item) in value.as_object().unwrap() {
         base[key] = item.clone();
