@@ -582,10 +582,19 @@ def prepare():
     return prepared
 
 
+def report_contact_wait(prepared):
+    """An update that had started waits for Tiaris. Its report stays
+    `preparing` (reports only move forward); the stage says what it waits
+    for, and `stage` asks the update policy again before it goes on."""
+    emit_status(prepared, 'preparing', 'no_manage_contact')
+    print('Not restarting into the update yet, because the Nest lost Tiaris while it got ready.', flush=True)
+
+
 def activate(prepared):
     """The short part: recheck the rooted closure, then arm the candidate as
     a one-shot boot and restart into it. The source stays the default. The
-    restart happens only while the Nest still reaches Tiaris (`stage`)."""
+    Nest must still reach Tiaris before anything changes and again before
+    the restart (`stage` looked first)."""
     attempt = safe_attempt(prepared['attempt_id'])
     cache = Path(prepared['cache_path'])
     receipt = {key: value for key, value in prepared.items() if key not in ('retire_generations', 'prepared_at')}
@@ -594,6 +603,11 @@ def activate(prepared):
         emit_status(receipt, 'preparing', 'activating')
         verify_store_closure(cache, receipt['system_toplevel'])
         boot_space()
+        if not contact_fresh():
+            # Nothing is changed yet: without Tiaris the candidate could not
+            # stay, so no generation leaves the boot menu for it.
+            report_contact_wait(prepared)
+            return
         retire_generations(prepared['retire_generations'])
     except Exception as error:
         (ROOTS / ('pending-' + attempt)).unlink(missing_ok=True)
@@ -625,9 +639,11 @@ def activate(prepared):
             restore_source(receipt)
             prune_candidate(receipt, keep_prepared=True)
             remove(PREPARE)
-            emit_status(prepared, 'preparing', 'no_manage_contact')
-            print('Not restarting into the update yet, because the Nest lost Tiaris while it got ready.', flush=True)
+            report_contact_wait(prepared)
             return
+        # The candidate must answer network starts if this release does
+        # (`await_health`); a Nest whose PXE is down still gets its update.
+        receipt['source_pxe_active'] = pxe_active()
         receipt['schema'] = 'tiaris.nest.pending-system-generation.v3'
         receipt['prepared_boot_id'] = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
         receipt['prepared_at'] = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -696,10 +712,13 @@ def stage():
             drop_prepared()
             prepared = prepare()
         attempt = prepared['attempt_id']
-        # An activation that a restart interrupted goes on without asking the
-        # policy again; it also switches only once the Nest reaches Tiaris.
-        resumed = started(attempt)
-        waiting, why = (None, 'it had started before the Nest restarted') if resumed else waiting_for()
+        report = last_report(attempt)
+        began = report.get('status') == 'preparing'
+        # Only an activation that a restart interrupted goes on without asking
+        # the policy again. One that waited for Tiaris asks: the link may come
+        # back in the middle of a school day.
+        interrupted = began and report.get('stage') == 'activating'
+        waiting, why = (None, 'it had started before the Nest restarted') if interrupted else waiting_for()
         if waiting is None and not contact_fresh():
             waiting, why = 'no_manage_contact', 'the Nest has not reached Tiaris in the last 90 seconds'
         # The journal says why the Nest starts its own update, and once per
@@ -707,11 +726,11 @@ def stage():
         release = prepared.get('target_release') or 'the requested release'
         if waiting is None:
             print(f'Starting the update to {release}, because {why or "the update policy allows it"}.', flush=True)
-        elif last_report(attempt).get('stage') != waiting:
+        elif report.get('stage') != waiting:
             print(f'Not starting the update to {release} yet, because {why or waiting}.', flush=True)
         if waiting:
-            # Reports only move forward: a resumed activation stays started.
-            emit_status(prepared, 'preparing' if resumed else 'waiting_window', waiting)
+            # Reports only move forward: an update that began stays started.
+            emit_status(prepared, 'preparing' if began else 'waiting_window', waiting)
             return
         activate(prepared)
 
@@ -751,14 +770,29 @@ def contact_fresh():
         return False
 
 
-def local_health_ready():
-    """Whether the Nest's own services run and it serves computers."""
+PXE_STATUS = Path('/run/tiaris-nest-pxe/status.json')
+
+
+def pxe_active():
+    """Whether the PXE supervisor said, at most 45 seconds ago, that this Nest
+    answers network starts (what the Nest service reads for its health)."""
+    try:
+        status = load(PXE_STATUS, maximum=4096)
+        return (status['schema'] == 'tiaris.nest.pxe-status.v1' and status['status'] == 'active'
+                and 0 <= time.time() - status['checked_at'] <= 45)
+    except Exception:
+        return False
+
+
+def local_health_ready(pxe_required=True):
+    """Whether the Nest's own services run and it serves computers; and
+    answers network starts, when that is asked of it."""
     try:
         for unit in ('tiaris-nest', 'tiaris-nest-first-boot', 'tiaris-nest-firewall', 'nginx', 'tftpd-hpa', 'nix-daemon', 'sshd'):
             if subprocess.run(['systemctl', 'is-active', '--quiet', unit], timeout=5).returncode:
                 return False
         run('curl', '--fail', '--silent', '--show-error', '--noproxy', '*', '--max-time', '10',
-            'http://127.0.0.1:8080/healthz?tiaris_fresh=1', timeout=12)
+            'http://127.0.0.1:8080/healthz?tiaris_fresh=1' + ('' if pxe_required else '&tiaris_without_pxe=1'), timeout=12)
     except Exception:
         return False
     return True
@@ -768,16 +802,19 @@ class ManageContactFailed(RuntimeError):
     """The candidate is healthy by itself but did not reach Tiaris."""
 
 
-def await_health():
+def await_health(pxe_required=True):
     """The candidate stays once three checks in a row, within 210 seconds,
-    found it healthy by itself and in fresh contact with Tiaris. When its own
-    health held in the last three checks, only the contact was missing: the
-    Nest reached Tiaris just before the switch (`activate`), so the candidate
-    lost a working link."""
+    found it healthy by itself and in fresh contact with Tiaris. It must
+    answer network starts only if the release before it did (`pxe_required`):
+    an update must not take PXE away, and a Nest whose PXE is down must
+    still get the update that may repair it. When its own health held in the
+    last three checks, only the contact was missing: the Nest reached Tiaris
+    just before the switch (`activate`), so the candidate lost a working
+    link."""
     deadline = time.monotonic() + 210
     healthy = reached = 0
     while time.monotonic() < deadline:
-        healthy = healthy + 1 if local_health_ready() else 0
+        healthy = healthy + 1 if local_health_ready(pxe_required) else 0
         reached = reached + 1 if healthy and contact_fresh() else 0
         if reached >= 3:
             return
@@ -823,7 +860,9 @@ def commit():
                 raise ValueError('booted migration inventory differs')
             verify_observed_versions(receipt['release']['required_system_versions'])
             verify_boot_entry(receipt['candidate_loader_entry'], receipt['system_toplevel'])
-            await_health()
+            # A receipt sealed by a release up to 0.2.177 does not say whether
+            # PXE was active: it is required, as it was.
+            await_health(receipt.get('source_pxe_active') is not False)
             save(COMMIT, {'schema': 'tiaris.nest.system-commit-intent.v3', 'pending_sha256': hashlib.sha256(read(PENDING)).hexdigest(), 'attempt_id': receipt['attempt_id']})
             set_default(receipt['candidate_loader_entry'])
             installed = {'schema': 'tiaris.nest.installed-appliance.v3', 'release': receipt['release'],

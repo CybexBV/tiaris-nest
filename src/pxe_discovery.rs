@@ -43,7 +43,8 @@ pub struct Desired {
 /// serving with the last complete document and reports it as stale
 /// (`received_at`). An incomplete document never replaces a complete one:
 /// Tiaris could not vouch for the whole of it this time, which is no reason
-/// to stop starting computers. Only `None` withdraws.
+/// to stop starting computers. A complete one that lacks this Nest's own row
+/// keeps the row the file has. Only `None` withdraws.
 pub fn persist(
     state: &AppState,
     desired: Option<&Desired>,
@@ -68,8 +69,24 @@ fn persist_at(
         .parent()
         .ok_or_else(|| anyhow::anyhow!("PXE state directory missing"))?;
     let path = parent.join("pxe-discovery.json");
-    if desired.is_some_and(|desired| !desired.complete) && holds_complete_document(&path) {
-        return Ok(());
+    let before = fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .map(|mut value| value["desired"].take())
+        .unwrap_or_default();
+    let mut desired = desired.cloned();
+    if let Some(desired) = &mut desired {
+        if !desired.complete && before["complete"] == true {
+            return Ok(());
+        }
+        // Tiaris leaves this Nest's row out until the Nest reports again (a
+        // new incarnation). The row the file has stays, or a rollback to
+        // 0.2.177 would wait for that report before it answers.
+        let own = |row: &&Value| row["server_device_id"] == desired.server_device_id.as_str();
+        if !desired.peers.iter().any(|row| own(&row)) {
+            let kept = before["peers"].as_array().into_iter().flatten().filter(own);
+            desired.peers.extend(kept.cloned());
+        }
     }
     let value = json!({"received_at":Utc::now().timestamp(), "desired":desired,
         "bootloader_filename":bootloader_filename});
@@ -99,13 +116,6 @@ fn persist_at(
 /// A retired Nest gets no document any more, so nothing else would stop it.
 pub fn withdraw(state: &AppState) -> Result<()> {
     persist(state, None, "")
-}
-
-fn holds_complete_document(path: &Path) -> bool {
-    fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .is_some_and(|value| value["desired"]["complete"] == true)
 }
 
 pub fn status() -> Value {
@@ -225,6 +235,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(written(&directory)["desired"], before["desired"]);
+        // Tiaris leaves the row out until the Nest reports again. 0.2.177
+        // does not answer without it, so the row the file has stays.
+        let mut without_row = sent;
+        without_row.peers.clear();
+        persist_at(
+            &directory.join("manage-state.json"),
+            Some(&without_row),
+            "ipxe.efi",
+        )
+        .unwrap();
+        assert_eq!(
+            written(&directory)["desired"]["peers"],
+            before["desired"]["peers"]
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
