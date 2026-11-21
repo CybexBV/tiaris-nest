@@ -501,10 +501,16 @@ report Tiaris accepted in this boot, at most 90 seconds ago): stage
 `no_manage_contact`. The candidate must reach Tiaris to stay, so a Nest that is
 cut off would switch, go back and download the release again; it keeps what it
 prepared instead and switches when the link is back. At the switch
-root checks the closure again, arms the next generation, looks once more
-whether the Nest still reaches Tiaris (if not, it undoes the arming and waits
-with what it prepared), seals the generation and selects it for one
-boot. Holds, active builds, maintenance leases and network transactions defer
+root checks the closure again and looks whether the Nest still reaches Tiaris
+before anything changes, arms the next generation, looks once more (if not,
+it undoes the arming), seals the generation and selects it for one boot. An
+update that waits for Tiaris after it started keeps the status `preparing`
+(reports only move forward) with the stage `no_manage_contact`, and asks the
+policy again when the link is back: only a switch that a restart interrupted
+goes on without asking. The candidate must answer network starts (PXE
+active) only if the release before it did, which the seal records
+(`source_pxe_active`): an update never takes PXE away, and a Nest whose PXE
+is down still gets its update. Holds, active builds, maintenance leases and network transactions defer
 it. The service polls requests every 30 seconds.
 
 When Manage hands a newer release while an update waits, the daemon swaps the

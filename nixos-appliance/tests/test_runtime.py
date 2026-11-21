@@ -271,7 +271,12 @@ class PrepareThenSwitch(unittest.TestCase):
         (self.roots / ('pending-' + self.attempt)).unlink()
         self.assertIsNone(self.found())
 
-    def run_stage(self, prepared, waiting, started=False, contact=True):
+    # The last report of an update that began: its switch was interrupted, or
+    # it waited (for Tiaris, then for the Nest to be idle).
+    INTERRUPTED = {'status': 'preparing', 'stage': 'activating'}
+    WAITED = {'status': 'preparing', 'stage': 'no_manage_contact'}
+
+    def run_stage(self, prepared, waiting, report=None, contact=True):
         calls = []
         with patch.object(update, 'REQUEST', self.directory / 'request.json'), \
                 patch.object(update, 'maintenance_lock', return_value=nullcontext()), \
@@ -284,8 +289,7 @@ class PrepareThenSwitch(unittest.TestCase):
                 patch.object(update, 'prepare', side_effect=lambda: calls.append('prepare') or self.prepared), \
                 patch.object(update, 'waiting_for', side_effect=lambda: calls.append('gate') or (waiting, 'why')), \
                 patch.object(update, 'contact_fresh', return_value=contact), \
-                patch.object(update, 'last_report', return_value={}), \
-                patch.object(update, 'started', return_value=started), \
+                patch.object(update, 'last_report', return_value=report or {}), \
                 patch.object(update, 'activate', side_effect=lambda receipt: calls.append('activate')), \
                 patch.object(update, 'emit_status', side_effect=lambda receipt, status, stage, *a: calls.append((status, stage))):
             (self.directory / 'request.json').write_text('{}')
@@ -295,8 +299,17 @@ class PrepareThenSwitch(unittest.TestCase):
     def test_prepares_before_waiting_and_switches_only_when_allowed(self):
         self.assertEqual(self.run_stage(None, 'nest_busy'), ['drop', 'prepare', 'gate', ('waiting_window', 'nest_busy')])
         self.assertEqual(self.run_stage(self.prepared, None), ['gate', 'activate'])
-        # After a crash during activation the report never goes back to waiting.
-        self.assertEqual(self.run_stage(self.prepared, 'nest_busy', started=True), ['activate'])
+        # A switch that a restart interrupted goes on without asking again.
+        self.assertEqual(self.run_stage(self.prepared, 'nest_busy', report=self.INTERRUPTED), ['activate'])
+
+    def test_an_update_that_waited_for_tiaris_asks_the_policy_again(self):
+        # The link may come back in the middle of a school day. The report
+        # stays started; the stage says what the update waits for now.
+        self.assertEqual(self.run_stage(self.prepared, 'nest_busy', report=self.WAITED),
+                         ['gate', ('preparing', 'nest_busy')])
+        self.assertEqual(self.run_stage(self.prepared, 'nest_busy', report={'status': 'preparing', 'stage': 'nest_busy'}),
+                         ['gate', ('preparing', 'nest_busy')])
+        self.assertEqual(self.run_stage(self.prepared, None, report=self.WAITED), ['gate', 'activate'])
 
     def test_a_nest_that_cannot_reach_tiaris_keeps_what_it_prepared_and_waits(self):
         # The candidate would have to reach Tiaris to stay: switching now
@@ -304,7 +317,7 @@ class PrepareThenSwitch(unittest.TestCase):
         self.assertEqual(self.run_stage(self.prepared, None, contact=False),
                          ['gate', ('waiting_window', 'no_manage_contact')])
         # Also an activation that a power cut interrupted; its report stays started.
-        self.assertEqual(self.run_stage(self.prepared, None, started=True, contact=False),
+        self.assertEqual(self.run_stage(self.prepared, None, report=self.INTERRUPTED, contact=False),
                          [('preparing', 'no_manage_contact')])
 
     def test_a_replaced_request_leaves_nothing_prepared_behind(self):
@@ -833,7 +846,10 @@ class ContactBeforeTheRestart(unittest.TestCase):
     while it still reaches Tiaris."""
     ATTEMPT = '11111111-1111-4111-8111-111111111111'
 
-    def arm(self, contact):
+    def arm(self, *contact, pxe=True):
+        """What `activate` does when the Nest's looks for Tiaris answer in
+        this order, and the receipt it sealed."""
+        contact = iter(contact)
         prepared = {'attempt_id': self.ATTEMPT, 'cache_path': '/cache', 'system_toplevel': '/candidate',
                     'retire_generations': []}
         calls = []
@@ -844,31 +860,51 @@ class ContactBeforeTheRestart(unittest.TestCase):
             pending = Path(directory) / 'pending.json'
             for name, value in (('PENDING', pending), ('PREPARE', Path(directory) / 'prepare.json'),
                                 ('ROOTS', Path(directory)), ('current', lambda: source), ('load', lambda path, **kw: {}),
-                                ('generation_for', lambda toplevel: '2'), ('contact_fresh', lambda: contact),
+                                ('generation_for', lambda toplevel: '2'), ('contact_fresh', lambda: next(contact)),
+                                ('pxe_active', lambda: pxe), ('retire_generations', record('retire_generations')),
                                 ('firmware_entry', lambda name: 'nixos-generation-2.conf' if name.endswith('OneShot') else source['loader_entry']),
-                                ('save', lambda path, value: path.write_text('{}')),
+                                ('save', lambda path, value: path.write_text(json.dumps(value))),
                                 ('remove', lambda path: calls.append(('remove', path.name))),
                                 ('restore_source', record('restore_source')), ('prune_candidate', record('prune_candidate')),
                                 ('emit_status', lambda receipt, *status: calls.append(status)),
                                 ('run', lambda *command, **kw: calls.append(command[:2]) if command[0] == 'systemctl' else None)):
                 stack.enter_context(patch.object(update, name, value))
-            for name in ('verify_store_closure', 'boot_space', 'retire_generations', 'set_default', 'verify_boot_entry'):
+            for name in ('verify_store_closure', 'boot_space', 'set_default', 'verify_boot_entry'):
                 stack.enter_context(patch.object(update, name))
             stack.enter_context(patch.object(update.os, 'sync'))
             update.activate(prepared)
-            return calls, pending.exists()
+            return calls, json.loads(pending.read_text()) if pending.exists() else None
 
     def test_a_link_that_died_while_arming_waits_with_what_it_prepared(self):
-        calls, sealed = self.arm(contact=True)
-        self.assertTrue(sealed)
-        self.assertEqual(calls, [('preparing', 'activating'), ('rebooting', 'reboot_pending'), ('systemctl', '--no-block')])
-        # Nothing is sealed and nothing restarts: the arming is undone, the
-        # prepared closure keeps its root and the report says what it waits for.
-        calls, sealed = self.arm(contact=False)
-        self.assertFalse(sealed)
-        self.assertEqual(calls, [('preparing', 'activating'), ('restore_source',),
+        calls, sealed = self.arm(True, True)
+        self.assertEqual(calls, [('preparing', 'activating'), ('retire_generations',),
+                                 ('rebooting', 'reboot_pending'), ('systemctl', '--no-block')])
+        self.assertEqual(sealed['schema'], 'tiaris.nest.pending-system-generation.v3')
+        # Gone before anything changed: no generation leaves the boot menu.
+        calls, sealed = self.arm(False)
+        self.assertIsNone(sealed)
+        self.assertEqual(calls, [('preparing', 'activating'), ('preparing', 'no_manage_contact')])
+        # Gone while arming. Nothing is sealed and nothing restarts: the
+        # arming is undone, the prepared closure keeps its root and the
+        # report says what it waits for.
+        calls, sealed = self.arm(True, False)
+        self.assertIsNone(sealed)
+        self.assertEqual(calls, [('preparing', 'activating'), ('retire_generations',), ('restore_source',),
                                  ('prune_candidate', ('keep_prepared', True)), ('remove', 'prepare.json'),
                                  ('preparing', 'no_manage_contact')])
+
+    def test_the_seal_says_whether_this_release_answered_network_starts(self):
+        self.assertIs(self.arm(True, True, pxe=True)[1]['source_pxe_active'], True)
+        self.assertIs(self.arm(True, True, pxe=False)[1]['source_pxe_active'], False)
+        # What the supervisor said, and only when it said so just now.
+        for status, expected in (({'status': 'active', 'checked_at': 1000}, True),
+                                 ({'status': 'unavailable', 'checked_at': 1000}, False),
+                                 ({'status': 'active', 'checked_at': 900}, False), (None, False)):
+            def load(path, **kwargs):
+                return {'schema': 'tiaris.nest.pxe-status.v1', **status}
+            with patch.object(update, 'load', side_effect=load), \
+                    patch.object(update, 'time', SimpleNamespace(time=lambda: 1010)):
+                self.assertIs(update.pxe_active(), expected)
 
 
 class CandidateHealth(unittest.TestCase):
@@ -876,10 +912,12 @@ class CandidateHealth(unittest.TestCase):
     RELEASE = {'source_revision': 'r', 'nixpkgs_revision': 'n', 'manage_source_revision': 'm', 'release_id': '0.2.1',
                'base_os': 'nixos', 'base_os_version': '26.05', 'required_system_versions': {}}
 
-    def outcome(self, healthy, reached):
+    def outcome(self, healthy, reached, asked=None, **sealed):
         """The last status `commit` reports for a candidate whose own health
-        and whose contact with Tiaris answer the checks in this order."""
-        receipt = {**self.RELEASE, 'release': self.RELEASE, 'attempt_id': '11111111-1111-4111-8111-111111111111',
+        and whose contact with Tiaris answer the checks in this order;
+        `asked` collects whether PXE was asked of it."""
+        asked = set() if asked is None else asked
+        receipt = {**self.RELEASE, **sealed, 'release': self.RELEASE, 'attempt_id': '11111111-1111-4111-8111-111111111111',
                    'system_toplevel': '/candidate', 'candidate_generation': '2',
                    'candidate_loader_entry': 'nixos-generation-2.conf', 'system_closure_sha256': 'c' * 64,
                    'sqlite_migrations_sha256': hashlib.sha256(b'inventory').hexdigest()}
@@ -890,7 +928,8 @@ class CandidateHealth(unittest.TestCase):
             for name, value in (('PENDING', Path(pending.name)), ('time', clock), ('maintenance_lock', nullcontext),
                                 ('load', lambda path, **kw: receipt), ('read', lambda path, **kw: b'inventory'),
                                 ('current', lambda: {'system_toplevel': '/candidate', 'system_generation': '2'}),
-                                ('local_health_ready', lambda: next(healthy)), ('contact_fresh', lambda: next(reached)),
+                                ('local_health_ready', lambda pxe_required: (asked.add(pxe_required), next(healthy))[1]),
+                                ('contact_fresh', lambda: next(reached)),
                                 ('terminal_matches', lambda receipt: False), ('retain', lambda receipt, installed: [])):
                 stack.enter_context(patch.object(update, name, value))
             for name in ('verify_observed_versions', 'verify_boot_entry', 'save', 'set_default', 'cleanup',
@@ -913,6 +952,21 @@ class CandidateHealth(unittest.TestCase):
         # Healthy at first, broken at the deadline: the last checks decide.
         self.assertEqual(self.outcome([True] * 3 + [False] * 60, [False]),
                          ('health_checking', 'rollback_pending', 'local_health_failed'))
+
+
+    def test_a_candidate_answers_network_starts_only_if_the_release_before_it_did(self):
+        # An update must not take PXE away; a Nest whose PXE is down must
+        # still get the update. A seal from before this rule asks for PXE.
+        for sealed, required in (({'source_pxe_active': True}, True), ({'source_pxe_active': False}, False), ({}, True)):
+            asked = set()
+            self.assertEqual(self.outcome([True], [True], asked, **sealed), ('succeeded', 'committed'))
+            self.assertEqual(asked, {required})
+        urls = []
+        with patch.object(update.subprocess, 'run', return_value=SimpleNamespace(returncode=0)), \
+                patch.object(update, 'run', side_effect=lambda *command, **kw: urls.append(command[-1])):
+            self.assertTrue(update.local_health_ready(True) and update.local_health_ready(False))
+        self.assertEqual(urls, ['http://127.0.0.1:8080/healthz?tiaris_fresh=1',
+                                'http://127.0.0.1:8080/healthz?tiaris_fresh=1&tiaris_without_pxe=1'])
 
 
 class CandidateContactOrigin(unittest.TestCase):

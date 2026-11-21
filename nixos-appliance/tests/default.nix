@@ -156,6 +156,9 @@
       machine.succeed("curl --fail --silent 'http://127.0.0.1:8080/healthz?tiaris_fresh=1'")
       machine.succeed("systemctl stop tiaris-nest-pxe")
       machine.fail("curl --fail --silent 'http://127.0.0.1:8080/healthz?tiaris_fresh=1'")
+      # What the updater asks of a candidate whose predecessor did not answer
+      # network starts either: the same health, PXE left out.
+      machine.succeed("curl --fail --silent 'http://127.0.0.1:8080/healthz?tiaris_fresh=1&tiaris_without_pxe=1'")
     '';
   }) { inherit (pkgs.stdenv.hostPlatform) system; };
 }

@@ -114,6 +114,10 @@ async fn server_answers_within(target: SocketAddr, timeout: Duration) -> bool {
 #[derive(Deserialize)]
 struct HealthQuery {
     tiaris_fresh: Option<String>,
+    /// Leaves PXE discovery out of the answer. The updater asks this of a
+    /// candidate whose predecessor did not answer network starts either
+    /// (`generation_update.await_health`).
+    tiaris_without_pxe: Option<String>,
 }
 
 async fn healthz(
@@ -129,7 +133,8 @@ async fn healthz(
     } else {
         crate::readiness::probe(&state).await
     };
-    let discovery_ready = !crate::appliance::is_managed_appliance()
+    let discovery_ready = query.tiaris_without_pxe.as_deref() == Some("1")
+        || !crate::appliance::is_managed_appliance()
         || crate::pxe_discovery::status()
             .get("status")
             .and_then(serde_json::Value::as_str)
