@@ -417,6 +417,42 @@ class RoomForAnUpdate(unittest.TestCase):
                          (None, [[], [], ['--space-freed']], [(100, True), (300, False)]))
 
 
+    def download_room(self, free_after, staged=False):
+        """What root does with the service's request for room when making
+        room leaves `free_after` bytes free; whether the request is gone."""
+        release = {'release_id': '0.2.31', 'source_revision': 'r', 'system_toplevel': '/candidate',
+                   'system_closure': {'sha256': 'c' * 64}}
+        ask = {'attempt_id': '11111111-1111-4111-8111-111111111111', 'release': release, 'required_available_bytes': 100}
+        free, made, statuses = [40], [], []
+        def make_room(required):
+            made.append(required)
+            free[0] = free_after
+        with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as stack:
+            room, request = Path(directory) / 'room.json', Path(directory) / 'request.json'
+            room.write_text(json.dumps(ask))
+            if staged:
+                request.write_text('{}')
+            none = Path(directory) / 'none'
+            for name, value in (('ROOM', room), ('REQUEST', request), ('PENDING', none), ('PREPARE', none),
+                                ('COMMIT', none), ('ROLLBACK', none), ('maintenance_lock', nullcontext),
+                                ('load', lambda path, **kw: json.loads(path.read_text())),
+                                ('remove', lambda path: path.unlink(missing_ok=True)), ('make_room', make_room),
+                                ('current', lambda: {'system_generation': '1'}),
+                                ('emit_status', lambda identity, *status: statuses.append((identity['target_release'], *status)))):
+                stack.enter_context(patch.object(update, name, value))
+            stack.enter_context(patch.object(update.shutil, 'disk_usage', side_effect=lambda path: SimpleNamespace(free=free[0])))
+            update.make_download_room()
+            return made, statuses, room.exists()
+
+    def test_a_download_that_does_not_fit_gets_room_or_ends_with_the_reason(self):
+        # The service's next try finds room: nothing to report.
+        self.assertEqual(self.download_room(free_after=100), ([100], [], False))
+        # Still short: the attempt ends with the reason, as it would later.
+        self.assertEqual(self.download_room(free_after=99),
+                         ([100], [('0.2.31', 'failed', 'verification_failed', 'insufficient_store_space', '1')], False))
+        # A staged update goes first; preparing it makes its own room.
+        self.assertEqual(self.download_room(free_after=99, staged=True), ([], [], False))
+
     def test_a_boot_partition_that_filled_up_before_the_switch_is_named(self):
         prepared = {'attempt_id': '11111111-1111-4111-8111-111111111111', 'cache_path': '/cache',
                     'system_toplevel': '/candidate', 'retire_generations': []}
