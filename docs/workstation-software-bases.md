@@ -117,19 +117,31 @@ Manage offers it as a software update.
   (`reference_blueprints_missing`; the plain profiles are still checked), a
   verdict of another Nest build (`rederivation_pending`: a ready commit
   stays ready across Nest updates) and the bound of 256 Tiaris package
-  derivations. A record with one of those reasons is removed at startup.
+  derivations. What another Nest build held back is forgotten at startup.
 - **Where it is kept.** Not in SQLite: NixOS appliances refuse an update
   whose migration inventory differs from the installed release's, so the
   schema stays that of the published releases (`release/sqlite-migrations.sha256`).
-  Each commit is one record `software-updates/detected/<commit>.json` and the
+  Each commit is one record `software-updates/detected-commits/<commit>.json` and the
   check state `software-updates/check-state.json` under the Nest state
   directory (`/var/lib/tiaris-nest/state/agent`), written atomically (0600,
   never through a link, size-bounded, `{schema, version, data}`;
   `src/state_files.rs`). A record that is missing, corrupt, or breaks a rule
   (state, a known reason when blocked, its own commit) is treated as absent:
-  the commit is evaluated again and admits nothing meanwhile. Fields an
-  older Nest wrote (its build profile) are ignored. At most 64 records are
-  kept: every ready commit a Blueprint job uses, then the newest.
+  the commit is evaluated again and admits nothing meanwhile. At most 64
+  records are kept: every ready commit a Blueprint job uses, then the newest.
+- **Next to Nest 0.2.173 and older.** Those keep their records, each with a
+  build profile, in `software-updates/detected`. Such a Nest can run again
+  after a newer one: an update that fails its health check goes back to it,
+  and its generation stays in the boot menu until the third later update. It treats
+  a record without a profile as absent and writes its own verdict over the
+  record of the channel's newest commit. So a newer Nest takes the ready
+  commits from that folder at startup (a commit it has a record of keeps
+  it; the build profile is dropped) and writes nothing there. Each finds its
+  records as it left them. While the older Nest runs, it refuses a Blueprint
+  released on a commit only the newer one found ready (`target_not_allowed`,
+  "Software too old") unless its own, stricter check finds that commit ready
+  while it is still the channel's newest; that ends when the newer Nest
+  starts again.
 - **Admission.** A Blueprint job is admitted at the release pin or at a ready
   detected commit (`target_not_allowed` otherwise). A job without a
   Blueprint is admitted at its target flake's nixpkgs pin, and a

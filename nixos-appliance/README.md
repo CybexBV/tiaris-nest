@@ -341,8 +341,9 @@ require them, so a Nest restarted while the internet or Tiaris is unreachable (a
 power cut: the internet comes back last) still starts all of them. Reaching Tiaris
 is a fact the Nest reports, not a condition to start: `tiaris-nest-network-guard`
 (required by nothing) keeps the approved network when Tiaris answers on it, keeps
-the DHCP fallback when a fixed address does not reach Tiaris and DHCP does, and
-goes back to the approved network when Tiaris answers on neither. The Nest service
+the DHCP fallback when a fixed address does not reach Tiaris and DHCP does, and,
+when Tiaris answers on neither, starts on the one that reached Tiaris last (the
+DHCP fallback while its marker is there, else the approved network). The Nest service
 then needs only an address on its interface (`tiaris-nest-network-runtime`, retried
 each minute). What needs Tiaris waits: network start is answered only with an
 inventory from Tiaris of the last five minutes, and installs, updates and builds

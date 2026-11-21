@@ -211,8 +211,9 @@ in {
     };
     # Chooses the approved network or, for a fixed address that cannot reach
     # Tiaris while DHCP can, the DHCP fallback. Nothing requires it: when
-    # Tiaris does not answer at all the approved network stays and the Nest
-    # service starts and reports the silence (runtime/tiaris-nest-network-guard).
+    # Tiaris does not answer at all the Nest keeps the network that reached
+    # Tiaris last, and its service starts and reports the silence
+    # (runtime/tiaris-nest-network-guard).
     systemd.services.tiaris-nest-network-guard = (rootService "network-guard") // {
       wantedBy = [ "multi-user.target" ]; after = [ "tiaris-nest-first-boot.service" "network-online.target" ]; wants = [ "network-online.target" ];
       before = [ "tiaris-nest-network-runtime.service" "tiaris-nest.service" ];
