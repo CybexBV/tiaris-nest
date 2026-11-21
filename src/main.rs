@@ -5,6 +5,7 @@ use axum::serve as axum_serve;
 use clap::Parser;
 use tiaris_nest::{
     AppState,
+    appliance::nixos::InsufficientSpace,
     config::{Cli, Command},
     db, router,
 };
@@ -37,13 +38,27 @@ async fn main() -> anyhow::Result<()> {
         );
         return Ok(());
     }
-    if matches!(command, Command::VerifyApplianceUpdate) {
+    if let Command::VerifyApplianceUpdate { space_freed } = &command {
         #[cfg(unix)]
         if effective_uid() != 0 {
             anyhow::bail!("appliance package verification must run as root");
         }
-        let packages = tiaris_nest::appliance::nixos::verify_update()?;
-        println!("{}", packages.display());
+        // The floor follows the Nest's configuration. A configuration that
+        // cannot be read must not stop the update that may repair it.
+        let build = tiaris_nest::config::AppConfig::load(&cli.config)
+            .map(|config| config.build)
+            .unwrap_or_default();
+        let floor = tiaris_nest::disk::free_space_floor(&build);
+        match tiaris_nest::appliance::nixos::verify_update(floor, *space_freed) {
+            Ok(packages) => println!("{}", packages.display()),
+            Err(error) => match error.downcast_ref::<InsufficientSpace>() {
+                Some(short) if !*space_freed => {
+                    println!("{}", short.required_available_bytes);
+                    std::process::exit(75);
+                }
+                _ => return Err(error),
+            },
+        }
         return Ok(());
     }
     let config = tiaris_nest::config::AppConfig::load(&cli.config)
@@ -101,8 +116,11 @@ async fn main() -> anyhow::Result<()> {
         Command::VerifyApplianceUpdatePolicy => {
             unreachable!("policy verification exits before config loading")
         }
-        Command::VerifyApplianceUpdate => {
-            unreachable!("appliance update verification exits before config loading")
+        Command::VerifyApplianceUpdate { .. } => {
+            unreachable!("appliance update verification exits before database setup")
+        }
+        Command::FreeCacheSpace { available_bytes } => {
+            tiaris_nest::cache::free_space(&pool, &config, available_bytes).await
         }
     }
 }
@@ -132,7 +150,7 @@ fn managed_command_requires_service_user(
             command,
             Command::PrintConfig
                 | Command::ValidateApplianceConfig
-                | Command::VerifyApplianceUpdate
+                | Command::VerifyApplianceUpdate { .. }
                 | Command::VerifyApplianceUpdatePolicy
                 | Command::VerifyApplianceDatabase { .. }
                 | Command::RehearseApplianceDatabase { .. }

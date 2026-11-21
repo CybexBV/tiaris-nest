@@ -24,7 +24,6 @@ pub const CAPABILITY: &str = "appliance_update_v3";
 pub const REPLACE_CAPABILITY: &str = "appliance_update_replace_v1";
 pub const IDENTITY_PATH: &str = "/usr/share/tiaris-nest/system-identity.json";
 pub const MIGRATIONS_PATH: &str = "/usr/share/tiaris-nest/sqlite-migrations.json";
-const RESERVE: u64 = 23 * 1024 * 1024 * 1024;
 // STATE is deliberately only 16 GiB. Bulk bytes belong to the root-backed
 // cache; only requests and durable privileged transaction receipts use STATE.
 const UPDATE_CACHE_ROOT: &str = "/var/cache/tiaris-nest/appliance-updates";
@@ -183,11 +182,13 @@ async fn store(update: super::ManagedApplianceUpdate<NixosRelease>) -> Result<()
         };
         super::validate_qualification_package_transport_url(transport, &artifact)?;
     }
-    ensure_update_space(
+    // The download only has to fit. Whether the update itself fits is root's
+    // decision (`verify_update`): root can free space first, and its refusal
+    // reaches Tiaris with a reason. Retention restores the floor meanwhile.
+    crate::disk::ensure_headroom(
         Path::new(UPDATE_BUNDLE_ROOT),
-        Path::new("/nix/store"),
         update.release.system_closure.size_bytes,
-        0,
+        "Nest update download",
     )?;
     download(
         &update.release,
@@ -336,13 +337,25 @@ pub async fn download_with_progress(
     }
     result
 }
+/// The update needs more free disk space than there is. `verify_update`
+/// changes nothing for it the first time: the root updater frees space
+/// (`generation_update.make_room`) and asks again.
+#[derive(Debug, thiserror::Error)]
+#[error("insufficient_store_space: the update needs {required_available_bytes} bytes free")]
+pub struct InsufficientSpace {
+    /// What must be free before the verifier starts again from nothing.
+    pub required_available_bytes: u64,
+}
+
+/// Installation: the closure fits and leaves the Nest's free-space floor.
 pub fn ensure_space(path: &Path, temporary_and_missing: u64) -> Result<()> {
+    let floor = crate::disk::free_space_floor(&crate::config::BuildConfig::default());
     let required = temporary_and_missing
-        .checked_add(RESERVE)
+        .checked_add(floor)
         .ok_or_else(|| anyhow!("space admission overflow"))?;
     ensure!(
         crate::disk::stats(path)?.available_bytes >= required,
-        "insufficient space for closure and 21 GiB workstation reserve plus 2 GiB headroom"
+        "insufficient space for the closure and the Nest's free-space floor"
     );
     Ok(())
 }
@@ -356,47 +369,65 @@ fn validate_directory(path: &Path, owner: u32, mode: u32) -> Result<()> {
     Ok(())
 }
 
+/// Whether an update fits: its staging files, the store paths it still
+/// misses, and after them the Nest's free-space floor. Too little room for
+/// the store is [`InsufficientSpace`], with what must be free there.
 fn admit_update_space(
     same_filesystem: bool,
     staging_free: u64,
     store_free: u64,
     temporary: u64,
     missing: u64,
+    floor: u64,
 ) -> Result<()> {
-    let store_required = missing
-        .checked_add(RESERVE)
+    let mut store_required = missing
+        .checked_add(floor)
         .ok_or_else(|| anyhow!("store space overflow"))?;
-    let staging_required = if same_filesystem {
-        temporary
+    if same_filesystem {
+        store_required = temporary
             .checked_add(store_required)
-            .ok_or_else(|| anyhow!("staging space overflow"))?
+            .ok_or_else(|| anyhow!("staging space overflow"))?;
     } else {
-        temporary
+        let staging_required = temporary
             .checked_add(2 * 1024 * 1024 * 1024)
-            .ok_or_else(|| anyhow!("staging space overflow"))?
-    };
-    ensure!(
-        staging_free >= staging_required,
-        "insufficient appliance cache staging space"
-    );
-    ensure!(
-        store_free >= store_required,
-        "insufficient Nix store space and workstation reserve"
-    );
+            .ok_or_else(|| anyhow!("staging space overflow"))?;
+        ensure!(
+            staging_free >= staging_required,
+            "insufficient appliance cache staging space"
+        );
+    }
+    if store_free < store_required {
+        return Err(InsufficientSpace {
+            required_available_bytes: store_required,
+        }
+        .into());
+    }
     Ok(())
 }
 
-fn ensure_update_space(staging: &Path, store: &Path, temporary: u64, missing: u64) -> Result<()> {
+fn ensure_update_space(
+    staging: &Path,
+    store: &Path,
+    temporary: u64,
+    missing: u64,
+    floor: u64,
+) -> Result<()> {
     admit_update_space(
         fs::metadata(staging)?.dev() == fs::metadata(store)?.dev(),
         crate::disk::stats(staging)?.available_bytes,
         crate::disk::stats(store)?.available_bytes,
         temporary,
         missing,
+        floor,
     )
 }
 
-pub fn verify_update() -> Result<PathBuf> {
+/// Root's admission of the staged update. `floor` is the Nest's free-space
+/// floor (`crate::disk::free_space_floor`), which the update must leave.
+/// Short of disk space this changes nothing and returns [`InsufficientSpace`]
+/// so the caller can free space and ask again; once `space_freed` says it
+/// did, too little space ends the attempt with `insufficient_store_space`.
+pub fn verify_update(floor: u64, space_freed: bool) -> Result<PathBuf> {
     ensure!(
         unsafe { libc::geteuid() } == 0,
         "root verification required"
@@ -462,11 +493,20 @@ pub fn verify_update() -> Result<PathBuf> {
             fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
         }
         let result = (|| {
+            let archive_bytes = request.release.system_closure.size_bytes;
+            let expanded = closure::MAX_EXPANDED
+                .checked_add(DATABASE_BACKUP_RESERVE)
+                .ok_or_else(|| anyhow!("staging size overflow"))?;
+            // Before the private copy: everything but the store paths the
+            // update misses, which only the archive's manifest names.
             ensure_update_space(
                 &private,
                 Path::new("/nix/store"),
-                request.release.system_closure.size_bytes,
+                archive_bytes
+                    .checked_add(expanded)
+                    .ok_or_else(|| anyhow!("staging size overflow"))?,
                 0,
+                floor,
             )?;
             let archive = private.join("closure.tar.zst");
             super::pin_untrusted_bundle(
@@ -490,14 +530,17 @@ pub fn verify_update() -> Result<PathBuf> {
                         .ok_or_else(|| anyhow!("missing path size overflow"))?;
                 }
             }
-            ensure_update_space(
-                &private,
-                Path::new("/nix/store"),
-                closure::MAX_EXPANDED
-                    .checked_add(DATABASE_BACKUP_RESERVE)
-                    .ok_or_else(|| anyhow!("staging size overflow"))?,
-                missing,
-            )?;
+            ensure_update_space(&private, Path::new("/nix/store"), expanded, missing, floor)
+                .map_err(|error| match error.downcast::<InsufficientSpace>() {
+                    // A new start copies the archive again.
+                    Ok(short) => InsufficientSpace {
+                        required_available_bytes: short
+                            .required_available_bytes
+                            .saturating_add(archive_bytes),
+                    }
+                    .into(),
+                    Err(error) => error,
+                })?;
             let database_backup = snapshot_database(&private)?;
             let cache = private.join("cache");
             closure::verify_archive(&mut file, &request.release, &key, Some(&cache))?;
@@ -521,6 +564,11 @@ pub fn verify_update() -> Result<PathBuf> {
         result
     })();
     if let Err(error) = &verified_result {
+        let short_of_space = error.downcast_ref::<InsufficientSpace>().is_some();
+        if short_of_space && !space_freed {
+            // Not the end of the attempt: the request and its archive stay.
+            return verified_result;
+        }
         let pending = [
             "pending-system-generation.json",
             "system-prepare-intent.json",
@@ -534,7 +582,9 @@ pub fn verify_update() -> Result<PathBuf> {
                 .exists()
         });
         if !pending {
-            let reason = if error.to_string().contains("rollback_database_incompatible") {
+            let reason = if short_of_space {
+                "insufficient_store_space"
+            } else if error.to_string().contains("rollback_database_incompatible") {
                 "rollback_database_incompatible"
             } else {
                 "appliance_update_verification_failed"
@@ -1104,17 +1154,28 @@ mod tests {
         assert!(super::super::UPDATE_ROOT.starts_with("/var/lib/tiaris-nest/control/"));
         // The installed 16 GiB STATE is absent from bulk admission: ROOT backs
         // both cache and /nix. Existing staging bytes are already in free-space.
-        assert!(admit_update_space(true, 64 * GIB, 64 * GIB, 9 * GIB, 4 * GIB).is_ok());
-        assert!(admit_update_space(true, 36 * GIB, 36 * GIB, 9 * GIB, 4 * GIB).is_ok());
-        assert!(admit_update_space(true, 35 * GIB, 35 * GIB, 9 * GIB, 4 * GIB).is_err());
+        let floor = 21 * GIB;
+        assert!(admit_update_space(true, 64 * GIB, 64 * GIB, 9 * GIB, 4 * GIB, floor).is_ok());
+        assert!(admit_update_space(true, 34 * GIB, 34 * GIB, 9 * GIB, 4 * GIB, floor).is_ok());
+        // One byte short says how much must be free, for the updater to free.
+        let short = admit_update_space(true, 34 * GIB - 1, 34 * GIB - 1, 9 * GIB, 4 * GIB, floor)
+            .unwrap_err();
+        assert_eq!(
+            short
+                .downcast_ref::<InsufficientSpace>()
+                .unwrap()
+                .required_available_bytes,
+            34 * GIB
+        );
     }
 
     #[test]
     fn separate_staging_and_store_are_admitted_independently() {
-        assert!(admit_update_space(false, 12 * GIB, 28 * GIB, 9 * GIB, 4 * GIB).is_ok());
-        assert!(admit_update_space(false, 64 * GIB, 26 * GIB, 9 * GIB, 4 * GIB).is_err());
-        assert!(admit_update_space(false, 10 * GIB, 64 * GIB, 9 * GIB, 4 * GIB).is_err());
-        assert!(admit_update_space(true, u64::MAX, u64::MAX, u64::MAX, 0).is_err());
+        let floor = 21 * GIB;
+        assert!(admit_update_space(false, 12 * GIB, 25 * GIB, 9 * GIB, 4 * GIB, floor).is_ok());
+        assert!(admit_update_space(false, 64 * GIB, 24 * GIB, 9 * GIB, 4 * GIB, floor).is_err());
+        assert!(admit_update_space(false, 10 * GIB, 64 * GIB, 9 * GIB, 4 * GIB, floor).is_err());
+        assert!(admit_update_space(true, u64::MAX, u64::MAX, u64::MAX, 0, floor).is_err());
     }
 
     #[test]
