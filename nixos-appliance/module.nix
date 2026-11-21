@@ -172,8 +172,6 @@ in {
         ln -sfn ${a.package}/bin/tiaris-nest /usr/bin/tiaris-nest
         ln -sfn ${a.package}/bin/tiaris-nest-bootstrap /usr/lib/tiaris-nest/tiaris-nest-bootstrap
         ln -sfn ${pkgs.nix}/bin/nix /usr/bin/nix
-        # The retired multicast sender; Nests installed before its removal keep the link.
-        rm -f /usr/bin/udp-sender
         ln -sfn ${pkgs.iproute2}/bin/ip /usr/sbin/ip
         ln -sfn ${pkgs.dnsmasq}/bin/dnsmasq /usr/sbin/dnsmasq
         for program in ${runtime}/bin/*; do ln -sfn "$program" "/usr/lib/tiaris-nest/$(basename "$program")"; done
