@@ -471,7 +471,7 @@ The Tiaris release controller on The Beast (`tiaris-release`, implemented in Cyb
 `deploy/manage/beast_release_workflow.py`) creates a candidate tag with `release/coordinated.json` and
 an immutable workstation source pin to `CybexHQ/tiaris`. The normal release workflow still signs,
 builds once, publishes an immutable prerelease and verifies its public closure; under release policy
-fast-v1 VM qualification is on demand (`Tiaris-VM-Qualification: nightly`). These tags skip
+fast-v1 VM qualification is on demand (`Tiaris-VM-Qualification: on-demand`). These tags skip
 automatic stable promotion. `approve-coordinated-release.yml` promotes only explicitly approved
 tag/source/run and artifact identities, reusing the canonical predecessor/public-closure verifier and
 publication lock. `promote-production-release.py --verify-only` checks the same evidence without

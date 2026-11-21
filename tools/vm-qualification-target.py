@@ -3,7 +3,7 @@
 
 Release policy fast-v1 publishes and promotes Nest releases without warm or
 cold VM qualification. The VM harness stays available through
-`.github/workflows/nest-vm-qualification.yml` (for the owner's nightly). This
+`.github/workflows/nest-vm-qualification.yml`, run when someone starts it. This
 helper binds that workflow to one immutable release, its exact `release.yml`
 push run and its build-once candidate receipt. It is read-only: it never
 changes a release, and its result grants no publication or promotion.

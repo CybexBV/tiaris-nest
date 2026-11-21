@@ -29,7 +29,7 @@ BODY = '\n'.join([
     'Tiaris-Release-Workflow: https://github.com/CybexHQ/james/actions/runs/42',
     'Tiaris-Candidate-Artifact-ID: 100',
     'Tiaris-Candidate-Artifact-SHA256: ' + 'a' * 64,
-    'Tiaris-VM-Qualification: nightly',
+    'Tiaris-VM-Qualification: on-demand',
     'Tiaris-Public-Closure: required',
 ])
 LEGACY_BODY = '\n'.join(BODY.splitlines()[:3] + ['Tiaris-Cold-Qualification: required'])
