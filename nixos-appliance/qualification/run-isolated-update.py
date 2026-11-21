@@ -20,8 +20,7 @@ from isolated_manage_rpc import request as fixture_request
 
 
 def isolated_transport(state, bind, manifest_digest, filename):
-    transports = fixture_request(state, 'installer_transports', manifest_sha256=manifest_digest)
-    transport = transports['package_transport_url']
+    transport = fixture_request(state, 'package_transport', manifest_sha256=manifest_digest)['package_transport_url']
     if transport != f'http://{bind}:18082/{filename}':
         raise ValueError('Candidate closure transport differs from the owned verified guest listener')
     return transport

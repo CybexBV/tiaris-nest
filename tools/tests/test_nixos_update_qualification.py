@@ -657,7 +657,7 @@ class TransitionTests(unittest.TestCase):
         with patch.object(R, 'fixture_request', return_value={'package_transport_url': url}) as rpc:
             self.assertEqual(R.isolated_transport(Path('/private'), '192.168.123.1', 'a' * 64,
                                                  'candidate.tar.zst'), url)
-            rpc.assert_called_once_with(Path('/private'), 'installer_transports', manifest_sha256='a' * 64)
+            rpc.assert_called_once_with(Path('/private'), 'package_transport', manifest_sha256='a' * 64)
         for wrong in (url.replace('18082', '23456'), url.replace('192.168.123.1', '127.0.0.1'),
                       url.replace('candidate.tar.zst', 'other.tar.zst')):
             with patch.object(R, 'fixture_request', return_value={'package_transport_url': wrong}), \
