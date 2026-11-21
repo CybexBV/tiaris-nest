@@ -249,7 +249,9 @@ struct BuildCapacity {
     swap_bytes: u64,
 }
 
-pub fn spawn(state: AppState) {
+/// Start the build worker. It admits jobs by the detected commits, so it
+/// starts only after the ready commits of older Nests were taken over.
+pub fn spawn(state: AppState, _: crate::software_updates::OlderNestsCommitsTakenOver) {
     if !state.config.build.enabled {
         return;
     }

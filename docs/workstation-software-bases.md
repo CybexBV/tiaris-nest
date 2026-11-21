@@ -135,8 +135,11 @@ Manage offers it as a software update.
   and its generation stays in the boot menu until the third later update. It treats
   a record without a profile as absent and writes its own verdict over the
   record of the channel's newest commit. So a newer Nest takes the ready
-  commits from that folder at startup (a commit it has a record of keeps
-  it; the build profile is dropped) and writes nothing there. Each finds its
+  commits from that folder when it starts, before its build worker and its
+  first report look at them, and writes nothing there (the build profile is
+  dropped). A commit it has a verdict of keeps it; only a record of a check
+  it could not do (evaluation failed, provenance unverified, too little
+  disk space) gives way to the older Nest's ready commit. Each finds its
   records as it left them. While the older Nest runs, it refuses a Blueprint
   released on a commit only the newer one found ready (`target_not_allowed`,
   "Software too old") unless its own, stricter check finds that commit ready

@@ -786,7 +786,9 @@ fn record_sync_cycle(succeeded: bool) {
     }
 }
 
-pub fn spawn(state: AppState) {
+/// Start the reports to Manage. They list the detected commits, so they
+/// start only after the ready commits of older Nests were taken over.
+pub fn spawn(state: AppState, _: crate::software_updates::OlderNestsCommitsTakenOver) {
     tokio::spawn(async move {
         let mut consecutive_failures: u32 = 0;
         loop {

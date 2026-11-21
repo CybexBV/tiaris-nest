@@ -905,6 +905,12 @@ async fn ready_commits_of_an_older_nest_are_taken_over_and_its_records_left_alon
     let stores = stores("older-nest").await;
     let (pool, data) = (&stores.pool, stores.data.as_path());
     let [ready, held, decided, new] = ["1", "2", "3", "4"].map(|digit| digit.repeat(40));
+    // Commits this Nest could not check; the older Nest checked them later.
+    let unchecked = [
+        ("5".repeat(40), REASON_EVALUATION_FAILED),
+        ("6".repeat(40), REASON_PROVENANCE_UNVERIFIED),
+        ("7".repeat(40), REASON_INSUFFICIENT_DISK),
+    ];
     let older = older_nests_detected_dir(data);
     let record = |commit: &str, reason: Value| {
         json!({
@@ -923,7 +929,10 @@ async fn ready_commits_of_an_older_nest_are_taken_over_and_its_records_left_alon
         (&ready, Value::Null),
         (&held, json!("build_script_changed")),
         (&decided, Value::Null),
-    ] {
+    ]
+    .into_iter()
+    .chain(unchecked.iter().map(|(commit, _)| (commit, Value::Null)))
+    {
         crate::state_files::write(
             &older,
             &format!("{commit}.json"),
@@ -943,8 +952,17 @@ async fn ready_commits_of_an_older_nest_are_taken_over_and_its_records_left_alon
         records
     };
     let before = older_records();
-    // This Nest already decided on one of the commits, and records a new one.
-    for (commit, outcome) in [(&decided, blocked_outcome()), (&new, ready_outcome())] {
+    // This Nest already decided on one of the commits, could not check three
+    // others, and records a new one.
+    for (commit, outcome) in [(&decided, blocked_outcome()), (&new, ready_outcome())]
+        .into_iter()
+        .chain(unchecked.iter().map(|(commit, reason)| {
+            (
+                commit,
+                DetectedOutcome::blocked(String::new(), reason, Vec::new()),
+            )
+        }))
+    {
         store_detected(
             pool,
             data,
@@ -961,7 +979,19 @@ async fn ready_commits_of_an_older_nest_are_taken_over_and_its_records_left_alon
 
     assert!(ready_commit(data, &ready).await.unwrap().is_some());
     assert!(detected_row(data, &held).await.unwrap().is_none());
-    assert!(ready_commit(data, &decided).await.unwrap().is_none());
+    // This Nest's verdict stands; a check it could not do gives way to the
+    // older Nest's ready commit (nothing else would check that commit again
+    // once the channel has moved on).
+    assert_eq!(
+        detected_row(data, &decided).await.unwrap().unwrap().reason,
+        Some(REASON_SOURCE_BUILD_REQUIRED.to_string())
+    );
+    for (commit, reason) in &unchecked {
+        assert!(
+            ready_commit(data, commit).await.unwrap().is_some(),
+            "{reason}"
+        );
+    }
     assert_eq!(older_records(), before);
     // Why this Nest keeps its records apart: the older one cannot read them.
     let own: Value = crate::state_files::read(
