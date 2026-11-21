@@ -513,7 +513,7 @@ async fn run(state: AppState) {
     // over before this task started: `take_over_commits_of_older_nests`.)
     let data_dir = &state.config.paths.data_dir;
     let forgot = forget_verdicts_of_other_builds(data_dir).await;
-    if forgot || !this_build_has_a_verdict(data_dir).await {
+    if forgot || updated_nest_has_not_looked(data_dir).await {
         // The network may come up after the Nest: try for some minutes.
         for attempt in 1..=STARTUP_CHECK_ATTEMPTS {
             match check(&state).await {
@@ -749,13 +749,20 @@ async fn adopt_ready_commits_of_older_nests(data_dir: &Path) {
     }
 }
 
-/// Whether this Nest build has recorded a commit. One that has not looks at
-/// the channel when it starts.
-async fn this_build_has_a_verdict(data_dir: &Path) -> bool {
+/// Whether this Nest was updated and its new build has not recorded a commit
+/// yet: another build left records (in this Nest's folder or an older
+/// Nest's) and none is this build's. Such a Nest looks at the channel when
+/// it starts. A newly installed Nest has no records and waits for the daily
+/// check, at night: the evaluation is heavy, and its first hours are the
+/// day the school installs its computers.
+async fn updated_nest_has_not_looked(data_dir: &Path) -> bool {
     let build = nest_build_identity();
-    detected_rows(data_dir)
-        .await
-        .is_ok_and(|rows| rows.iter().any(|row| row.derived_by == build))
+    let rows = detected_rows(data_dir).await.unwrap_or_default();
+    if rows.iter().any(|row| row.derived_by == build) {
+        return false;
+    }
+    !rows.is_empty()
+        || !crate::state_files::list(&older_nests_detected_dir(data_dir), ".json", 1).is_empty()
 }
 
 /// Remove the record of every commit another Nest build held back, whatever
