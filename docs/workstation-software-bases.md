@@ -4,8 +4,9 @@ A workstation software base is one reviewed nixpkgs commit that Nest builds
 Tiaris workstation closures on. The Linux kernel and every app on a
 workstation come from it, so kernel and app updates reach computers as a new
 base: Tiaris Manage prepares each released Blueprint again on the new base and
-the administrator installs it now, in a maintenance window or at next startup
-(see Manage's `docs/software-updates.md`).
+releases it by itself when the organization's automatic updates allow it, or
+when an administrator chooses **Update now**; computers follow the release (see
+Manage's `docs/software-updates.md`).
 
 ## What Nest reports
 
