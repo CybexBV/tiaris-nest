@@ -42,7 +42,6 @@ pub(crate) mod state_files;
 pub(crate) mod subprocess;
 pub mod usb_installer;
 pub(crate) mod verification_io;
-pub mod wake_on_lan;
 
 use std::sync::{Arc, RwLock};
 
