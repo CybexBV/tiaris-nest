@@ -20,8 +20,7 @@ from isolated_manage_rpc import request as fixture_request
 
 
 def isolated_transport(state, bind, manifest_digest, filename):
-    transports = fixture_request(state, 'installer_transports', manifest_sha256=manifest_digest)
-    transport = transports['package_transport_url']
+    transport = fixture_request(state, 'package_transport', manifest_sha256=manifest_digest)['package_transport_url']
     if transport != f'http://{bind}:18082/{filename}':
         raise ValueError('Candidate closure transport differs from the owned verified guest listener')
     return transport
@@ -131,6 +130,10 @@ if __name__ == '__main__':
                 'Appliance report differs from the healthy exact NixOS closure',
                 'Qualification preflight differs from the exact predecessor',
                 'Permanent device incarnation changed during the transition',
+                'Fixture does not support signed maintenance policy',
+                'Fixture Nest has no signed update policy',
+                'Fixture policy unexpectedly contains an immediate update',
+                'Fixture update was not started exactly',
                 'Upgraded current Blueprint failed source-free delivery',
                 'Upgraded Blueprint qualification requires the source-disabled policy',
                 'Upgraded source-free Blueprint delivery timed out',

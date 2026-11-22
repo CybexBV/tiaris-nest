@@ -189,20 +189,31 @@ def write_evidence(output, evidence):
         temporary.unlink(missing_ok=True)
 
 
-def initialize_schedule(api, prefix):
-    """Sign the installed fixture window; the NixOS updater rejects unsigned defaults."""
-    path = prefix + '/update-schedule'
-    current = api(path)
+def signed_policy_revision(api, prefix):
+    """The revision of the update policy Manage signed for this Nest.
+
+    Manage derives the policy (update when idle, in the night at the latest)
+    and signs it when the policy is read; nobody saves one, and the route only
+    answers GET. The NixOS updater rejects an unsigned policy."""
+    current = api(prefix + '/update-schedule')
     if current.get('supported') is not True:
         raise ValueError('Fixture does not support signed maintenance policy')
-    if current['revision'] != 0:
-        return  # Preserve an explicitly configured policy, including closed windows.
+    revision = current.get('revision')
+    if type(revision) is not int or revision < 1:
+        raise ValueError('Fixture Nest has no signed update policy')
     if current.get('run_now_attempt_id') is not None:
-        raise ValueError('Unsigned fixture policy unexpectedly contains an immediate update')
-    saved = api(path, {'expected_revision': 0, 'schedule': current['schedule']})
-    if (saved.get('revision') != 1 or saved.get('schedule') != current['schedule']
-            or saved.get('run_now_attempt_id') is not None):
-        raise ValueError('Fixture maintenance policy was not saved exactly')
+        raise ValueError('Fixture policy unexpectedly contains an immediate update')
+    return revision
+
+
+def update_now(api, prefix, attempt, revision):
+    """Start the admitted attempt at once, as an administrator's "Update now" does.
+
+    Without it the Nest waits until it has been idle for ten minutes, or for
+    the night. The transition itself stays the Nest's own."""
+    saved = api(prefix + '/update-now', {'attempt_id': attempt, 'expected_revision': revision})
+    if saved.get('revision') != revision + 1 or saved.get('run_now_attempt_id') != attempt:
+        raise ValueError('Fixture update was not started exactly')
 
 
 def reset_timestamp(event):
@@ -287,7 +298,7 @@ def run(api, fixture, candidate, candidate_body, previous, previous_body, eviden
         request = {'request_id': str(uuid.uuid4()), 'expires_at': (now() + datetime.timedelta(hours=1)).strftime('%Y-%m-%dT%H:%M:%SZ'),
             'expected': expected, 'candidate': {'release_manifest_json_b64': base64.b64encode(candidate_body).decode(),
             'release_manifest_sha256': hashlib.sha256(candidate_body).hexdigest(), 'package_transport_url': transport_url}}
-        initialize_schedule(api, prefix)
+        policy_revision = signed_policy_revision(api, prefix)
         if gate:
             failure_stage = 'candidate_gate_install'
             stage_started = clock()
@@ -306,6 +317,7 @@ def run(api, fixture, candidate, candidate_body, previous, previous_body, eviden
             gate.assert_inert()
         started = now()
         attempt = verify_admission(api(prefix + '/qualification-updates', request), request, candidate, fixture.device)
+        update_now(api, prefix, attempt, policy_revision)
     except BaseException as error:
         if gate:
             try:

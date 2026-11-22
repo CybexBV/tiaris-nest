@@ -328,6 +328,30 @@ class ProductionTests(unittest.TestCase):
         self.assertEqual(owner.api.call_count, 1)
         owner.client.assert_not_called()
 
+    def test_rpc_serves_the_closure_transport_the_update_runner_requests(self):
+        rpc = load('isolated_manage_rpc')
+        url = 'http://10.249.220.1:18082/candidate.tar.zst'
+        owner = Mock()
+        owner.verify.return_value = {
+            'selected_release': 'candidate',
+            'releases': {'candidate': {'manifest_sha256': 'a' * 64}, 'predecessor': {'manifest_sha256': 'b' * 64}},
+            'artifact_transports': {'releases': {'candidate': {
+                'package_transport_url': url, 'installer_iso_transport_url': 'http://10.249.219.1:18083/iso'}}}}
+        server = object.__new__(rpc.Server)
+        server.owner = owner
+        # The exact request run-isolated-update.py sends; only the closure URL leaves the Owner.
+        update = load('run-isolated-update')
+        with patch.object(update, 'fixture_request',
+                          side_effect=lambda _state, operation, **values: server.dispatch(
+                              {'operation': operation, **values})):
+            self.assertEqual(update.isolated_transport(Path('/private'), '10.249.220.1', 'a' * 64,
+                                                       'candidate.tar.zst'), url)
+        for refused in ({'operation': 'package_transport', 'manifest_sha256': 'b' * 64},
+                        {'operation': 'package_transport', 'manifest_sha256': 'a' * 64, 'kind': 'iso'}):
+            with self.subTest(refused=refused), self.assertRaises(ValueError):
+                server.dispatch(refused)
+        owner.api.assert_not_called()
+
     def test_rpc_claim_goes_only_through_the_retained_owner(self):
         rpc = load('isolated_manage_rpc')
         owner = Mock()

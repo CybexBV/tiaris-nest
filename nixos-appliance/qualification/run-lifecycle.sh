@@ -310,12 +310,13 @@ inventory_sha="$(jq -er '.inventory_sha256' "$session")"
 disk_id="$(jq -er '.inventory.disks[] | select(.eligible == true) | .id' "$session")"
 interface_id="$(jq -er '.inventory.ethernet_interfaces[] | select(.link_up == true) | .id' "$session" | head -n 1)"
 session_suffix="${session_id%%-*}"
+# Manage's ApproveNestProvisioningSessionRequest refuses unknown fields. Nobody
+# chooses an update window: Manage derives the night deadline itself.
 approve_body="$(jq -cn \
   --argjson revision "$revision" --arg inventory "$inventory_sha" \
   --arg disk "$disk_id" --arg interface "$interface_id" --arg cidr "$management_cidr" \
   --arg display_name "Nest release qualification $release_version $session_suffix" \
-  --argjson weekday "$(date -u +%w)" --arg start "$(date -u +%H:%M)" \
-  '{session_revision:$revision,inventory_sha256:$inventory,display_name:$display_name,target_disk_id:$disk,network:{mode:"dhcp",interface_id:$interface,address_cidr:null,gateway:null,dns_servers:[]},maintenance_window:{timezone:"UTC",weekday:$weekday,start:$start,duration_minutes:240},management_cidrs:[$cidr]}')"
+  '{session_revision:$revision,inventory_sha256:$inventory,display_name:$display_name,target_disk_id:$disk,network:{mode:"dhcp",interface_id:$interface,address_cidr:null,gateway:null,dns_servers:[]},management_cidrs:[$cidr]}')"
 printf '%s\n' "$approve_body" > "$work_dir/initial-approval.json"
 api POST "/v1/nest/provisioning-sessions/$session_id/approve" "$approve_body" > "$work_dir/initial-approved.json"
 python3 -B "$repository_root/nixos-appliance/qualification/isolated_manage_rpc.py" \

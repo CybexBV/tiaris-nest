@@ -127,6 +127,16 @@ class Server:
             receipt = self.owner.verify()
             return {'manage_origin': receipt['manage_origin'],
                     'public_manage_origin': receipt.get('public_manage_origin', receipt['manage_origin'])}
+        if operation == 'package_transport' and set(value) == {'operation', 'manifest_sha256'}:
+            # The update runner admits the selected release with the closure copy
+            # the fixture serves the guest. Only that URL leaves the Owner, and
+            # only for the release the fixture's Manage currently selects.
+            receipt = self.owner.verify()
+            selected = receipt['selected_release']
+            if value['manifest_sha256'] != receipt['releases'][selected]['manifest_sha256']:
+                raise ValueError('closure request does not match the selected authenticated release')
+            return {'package_transport_url':
+                    receipt['artifact_transports']['releases'][selected]['package_transport_url']}
         if operation == 'verify_artifacts' and set(value) == {'operation'}:
             # Explicit phase boundary: rehash every staged byte before evidence.
             self.owner.verify(full=True)
