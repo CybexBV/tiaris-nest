@@ -1,6 +1,5 @@
 {
-  "repository": "CybexHQ/development",
-  "revision": "dfb1d0dea99ef2910e45ca824e366c3ada1c508a",
-  "runtime_version": "1.0.89",
-  "informational": "Last pin merged to main, not a release pin. A release pins this file at its vX.Y.Z tag or release/dev-nest-* branch; see RELEASES.md."
+  "repository": "CybexBV/tiaris",
+  "revision": "1e88f7008d85fbb2474581bed5ab9376b343b78d",
+  "runtime_version": "1.0.212"
 }
