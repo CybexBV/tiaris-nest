@@ -120,7 +120,17 @@ mod usb_installer_routes {
         let sent: WorkstationNetbootDescriptor =
             serde_json::from_value(signed["descriptor"].clone()).unwrap();
         assert_eq!(&sent, descriptor);
-        crate::netboot::validate_descriptor(&sent, &state.config.update.trusted_public_key)
+        // The signature alone: the fixture's archive URL is not a public one,
+        // and the stick checks only the signature.
+        let key: [u8; 32] = STANDARD
+            .decode(state.config.update.trusted_public_key.trim())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let signature = Signature::from_slice(&STANDARD.decode(&sent.signature).unwrap()).unwrap();
+        VerifyingKey::from_bytes(&key)
+            .unwrap()
+            .verify(signature_message(&sent).as_bytes(), &signature)
             .expect("the release signature verifies");
         let manifest = signed["manifest"].as_str().unwrap();
         assert_eq!(
