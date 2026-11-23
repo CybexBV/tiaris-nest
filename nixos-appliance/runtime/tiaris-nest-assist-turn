@@ -3,6 +3,7 @@
 import datetime
 import ipaddress
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -93,10 +94,10 @@ no-tls
 no-dtls
 no-tcp-relay
 no-cli
-no-loopback-peers
+allow-loopback-peers=0
 no-multicast-peers
 no-rfc5780
-no-stun-backward-compatibility
+stun-backward-compatibility=0
 no-software-attribute
 fingerprint
 denied-peer-ip=0.0.0.0-0.255.255.255
@@ -154,13 +155,15 @@ def install_keys(keys):
     directory(STATE, 0o750, gid=TURN_ID)
     # coturn reads this table for each new REST authentication. Bound SQLite
     # values keep keys out of turnadmin arguments, command output and the journal.
-    if not DATABASE.exists():
+    initialize = not DATABASE.exists()
+    if initialize:
         write(DATABASE, b'', mode=0o640, group=TURN_ID)
     with sqlite3.connect(DATABASE, timeout=3) as db:
+        if initialize:
+            schema = Path(os.environ['TIARIS_NEST_TURN_DB_SCHEMA'])
+            db.executescript(schema.read_text())
         db.execute('PRAGMA secure_delete = ON')
         db.execute('BEGIN IMMEDIATE')
-        db.execute('CREATE TABLE IF NOT EXISTS turn_secret '
-                   '(realm varchar(127), value varchar(127), PRIMARY KEY (realm, value))')
         current = {value for value, in db.execute('SELECT value FROM turn_secret WHERE realm = ?', (REALM,))}
         wanted = set(keys.values())
         db.executemany('INSERT INTO turn_secret (realm, value) VALUES (?, ?)',

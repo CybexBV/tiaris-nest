@@ -246,6 +246,7 @@ in {
     };
     systemd.services.tiaris-nest-network-runtime = (rootService "network-runtime") // { after = [ "tiaris-nest-first-boot.service" "tiaris-nest-network-guard.service" "network-online.target" ]; wants = [ "network-online.target" ]; before = [ "tiaris-nest.service" ]; serviceConfig = { Type = "oneshot"; ExecStart = command "network-runtime"; TimeoutStartSec = "30s"; }; };
     systemd.services.tiaris-nest-assist-turn = (rootService "assist-turn") // {
+      environment.TIARIS_NEST_TURN_DB_SCHEMA = "${pkgs.coturn}/share/turnserver/schema.sql";
       wantedBy = [ "multi-user.target" ];
       requires = [ "tiaris-nest-first-boot.service" ];
       after = [ "tiaris-nest-first-boot.service" "tiaris-nest-network-runtime.service" ];
