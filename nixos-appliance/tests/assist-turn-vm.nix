@@ -10,13 +10,16 @@ import (nixpkgs + "/nixos/tests/make-test-python.nix") ({ pkgs, ... }: {
     appliance = { lib, ... }:
       let
         bootstrap = pkgs.writeShellScript "turn-fixture-network-bootstrap" ''
-          address=$(${pkgs.iproute2}/bin/ip -j -4 addr show dev eth1 dynamic |
-            ${pkgs.jq}/bin/jq -r '.[].addr_info[].local')
+          address=$(${pkgs.iproute2}/bin/ip -j -4 addr show dev eth1 |
+            ${pkgs.jq}/bin/jq -r 'first(.[].addr_info[] | select(.dynamic == true) | .local) // empty')
           if [[ -z "$address" ]] || grep -Fxq "public_base_url = \"http://$address\"" /etc/tiaris-nest/config.toml; then
             printf 'unchanged\n'
             exit
           fi
-          printf '[server]\npublic_base_url = "http://%s"\n' "$address" > /etc/tiaris-nest/config.toml
+          config=$(mktemp /etc/tiaris-nest/.turn-fixture-config.XXXXXX)
+          printf '[server]\npublic_base_url = "http://%s"\n' "$address" > "$config"
+          chmod 0640 "$config"
+          mv -- "$config" /etc/tiaris-nest/config.toml
           printf 'changed\n'
         '';
         package = pkgs.runCommand "turn-fixture-nest" { version = "0.0.0"; } ''
