@@ -287,26 +287,42 @@ fn flake_metadata_must_name_the_commit_and_its_recorded_nar_hash() {
 }
 
 #[test]
-fn the_daily_check_runs_between_one_and_five_in_the_schedule_time_zone() {
+fn the_channel_is_read_every_six_hours_from_a_night_minute_in_the_schedule_time_zone() {
     let amsterdam: chrono_tz::Tz = "Europe/Amsterdam".parse().unwrap();
     let now = Utc.with_ymd_and_hms(2026, 10, 31, 12, 0, 0).unwrap();
     for offset in [0, 1, 131, 239, 240, 500] {
-        let next = next_daily_check(now, amsterdam, offset);
+        let next = next_check(now, amsterdam, offset);
         let local = next.with_timezone(&amsterdam);
         assert!(next > now);
-        assert!(next - now <= chrono::Duration::hours(24));
+        assert!(next - now <= chrono::Duration::hours(6));
         let minute = local.hour() * 60 + local.minute();
-        assert!((60..300).contains(&minute), "{local}");
+        assert!((60..300).contains(&(minute % 360)), "{local}");
     }
-    // Before the window: today.
+    // Before the night window: today at 01:00, then six hours later.
     let early = Utc.with_ymd_and_hms(2026, 10, 31, 0, 30, 0).unwrap();
-    let next = next_daily_check(early, chrono_tz::UTC, 0);
-    assert_eq!(next, Utc.with_ymd_and_hms(2026, 10, 31, 1, 0, 0).unwrap());
+    let night = next_check(early, chrono_tz::UTC, 0);
+    assert_eq!(night, Utc.with_ymd_and_hms(2026, 10, 31, 1, 0, 0).unwrap());
+    assert_eq!(
+        next_check(night, chrono_tz::UTC, 0),
+        Utc.with_ymd_and_hms(2026, 10, 31, 7, 0, 0).unwrap()
+    );
     // A local time skipped by the spring DST change runs an hour later.
     let new_york: chrono_tz::Tz = "America/New_York".parse().unwrap();
     let before = Utc.with_ymd_and_hms(2027, 3, 14, 5, 0, 0).unwrap();
-    let next = next_daily_check(before, new_york, 60);
+    let next = next_check(before, new_york, 60);
     assert_eq!(next.with_timezone(&new_york).hour(), 3);
+}
+
+#[test]
+fn a_commit_found_by_day_is_evaluated_once_the_nest_is_idle_or_at_night() {
+    let quiet = |minutes| Some(chrono::Duration::minutes(minutes));
+    // 01:00 to 05:00: always, busy or not.
+    assert!(prepare_now(60, None));
+    assert!(prepare_now(299, None));
+    // By day only after ten quiet minutes.
+    assert!(!prepare_now(300, None));
+    assert!(!prepare_now(10 * 60, quiet(9)));
+    assert!(prepare_now(10 * 60, quiet(10)));
 }
 
 #[tokio::test]
@@ -1006,8 +1022,9 @@ async fn ready_commits_of_an_older_nest_are_taken_over_and_its_records_left_alon
 
 #[tokio::test]
 async fn only_an_updated_nest_looks_at_the_channel_when_it_starts() {
-    // A newly installed Nest waits for the nightly check: the evaluation is
-    // heavy and would run while the school installs its first computers.
+    // A newly installed Nest waits for the scheduled check, which evaluates
+    // only when it is idle or at night: the evaluation is heavy and would run
+    // while the school installs its first computers.
     let stores = stores("startup-look").await;
     let (pool, data) = (&stores.pool, stores.data.as_path());
     assert!(!updated_nest_has_not_looked(data).await);
@@ -1021,7 +1038,7 @@ async fn only_an_updated_nest_looks_at_the_channel_when_it_starts() {
     )
     .unwrap();
     assert!(updated_nest_has_not_looked(data).await);
-    // Once this build has recorded a commit it follows the daily check.
+    // Once this build has recorded a commit it follows the scheduled checks.
     store_detected(
         pool,
         data,

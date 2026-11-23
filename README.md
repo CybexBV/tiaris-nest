@@ -37,7 +37,10 @@ install plan also binds the canonical organization UUID and slug; both are
 validated and written to the installed managed configuration so Nest can
 issue organization-scoped workstation boot grants immediately. There is no
 Proxmox/LXC path. Use x86-64 UEFI with Secure Boot turned off, four cores, at
-least 16 GiB RAM and a 160 GiB fixed disk.
+least 16 GiB RAM, a 160 GiB fixed disk and wired Ethernet at 1 Gbit/s or
+faster. Every computer fetches its system from the Nest, so a school that
+installs whole classrooms at once should give the Nest and its switch port
+2.5 Gbit/s (2.5GbE).
 
 **Generic ISO with a claim code.** The release's ISO template as built (its
 8192-byte slot `/TIARIS_PROVISIONING.BIN` all zeros) is a generic Nest ISO
@@ -207,6 +210,11 @@ every workstation in the same hardware cohort. Nest also still advertises
 retained jobs from before the upgrade remain retryable; current Tiaris issues
 only v3 and refuses to prepare installations on a Nest without it
 (`nest_installer_closure_unsupported`). Deploy Nest before Tiaris.
+
+Nest keeps the active, previous and desired workstation runtime bundles,
+those a boot session of the last day names, and of the others only the newest,
+for at most seven days; hourly maintenance removes the rest (each tree is
+about 1.4 GB).
 
 Runtime integrity maintenance rechecks retained bundles every 12 hours and
 renews the active runtime's reported verification time only after a successful
