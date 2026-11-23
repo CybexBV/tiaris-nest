@@ -59,9 +59,9 @@ async fn main() -> Result<()> {
         .output
         .with_extension(format!("{}.closure", Uuid::new_v4()));
     let result = async {
-        nixos::download(&release, &release.system_closure.url, &archive, false).await?;
-        let mut file = File::open(&archive)?;
-        closure::verify_archive(&mut file, &release, &key, None)?;
+        let downloaded =
+            nixos::download(&release, &release.system_closure.url, &archive, false).await?;
+        closure::verify_archive(downloaded, &release, &key, None, |_, _| Ok(()))?;
         let receipt = json!({
             "schema": "tiaris.nest.public-closure-qualification.v1",
             "ok": true,
@@ -83,5 +83,8 @@ async fn main() -> Result<()> {
     }
     .await;
     let _ = fs::remove_file(&archive);
+    if let Ok(partial) = nixos::partial_path(&archive, &release) {
+        let _ = fs::remove_file(partial);
+    }
     result
 }

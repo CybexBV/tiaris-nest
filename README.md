@@ -487,7 +487,9 @@ signing step. The private deploy key is available only inside that protected env
 ### Managed appliance updates
 
 The Nest prepares an update as soon as it arrives, while the running release
-keeps serving: root independently verifies the bounded archive and the live
+keeps serving. A dropped download continues where it stopped (HTTP Range), also
+on a later try of the same release; only bytes of the signed size and hash are
+kept. Root independently verifies the bounded archive and the live
 SQLite migration inventory, imports and roots its closure, checks it against the
 release and rehearses the database (status `waiting_window`, stage
 `preparing_ahead`). An update that does not fit on the disk first makes room

@@ -142,9 +142,12 @@ with the reason `insufficient_esp_space`.
 
 Bulk downloaded/private update staging and database rollback copies live under
 `/var/cache/tiaris-nest/appliance-updates/` on ROOT. Only protected verified and
-transaction receipts live on STATE. The download only has to fit (its size plus
-1 GiB); root admits the update. When staging/store share a filesystem,
-admission charges new staging + missing NAR bytes + the floor once. A distinct
+transaction receipts live on STATE. The download only has to fit (what it still
+misses plus 1 GiB); root admits the update. When staging/store share a
+filesystem, admission charges new staging + missing NAR bytes + the floor once.
+New staging is root's private copy of the archive, then its extracted cache,
+which the archive's NARInfos size exactly, plus at most 1 GiB for the database
+rehearsal copy; the private copy goes once the cache is verified. A distinct
 staging filesystem reserves 2 GiB; the store still preserves the floor. Pending
 and preparation/commit/rollback receipts fence queued builds after reboot until
 root recovery finishes.
@@ -173,11 +176,17 @@ summed NAR payload**, **65536 archive members**, **16 MiB manifest**, **1 MiB pe
 NARInfo**, **128 MiB zstd window** for archive and NARs. GitHub publication also
 requires **less than 2 GiB per asset**, including ISO and closure. The installer
 holds at most the 4 GiB archive plus bounded decoder and runtime buffers in RAM.
-It verifies the whole signature/size/hash/archive and every inner NAR's compressed
-and uncompressed hashes/sizes, trusted NARInfo signature and exact reference graph before
-destructive work, streams validation without unpacking a second RAM copy, and
-extracts/imports onto the target only after authorized partitioning. Installation
-requires sufficient measured available RAM for this budget.
+It hashes the archive once, as it downloads it (a dropped download continues
+with HTTP Range from a partial file named for the signed archive), and verifies
+the signature/size/hash/archive and every inner NAR's compressed and
+uncompressed hashes/sizes, trusted NARInfo signature and exact reference graph
+once, before destructive work, streaming without unpacking a second RAM copy.
+After authorized partitioning it extracts that same open, unchanged archive
+onto the target, copying the NAR payloads it verified, and Nix checks each NAR
+against its signed NARInfo as it imports it. Installation requires sufficient
+measured available RAM for this budget. The updater verifies once too: root
+hashes the daemon's archive while it copies it privately, then one pass
+verifies and extracts (`src/appliance/closure.rs`).
 
 `manifest.json` is canonical recursively key-sorted compact UTF-8 JSON plus LF,
 schema `tiaris.nest.system-closure.v1`. It contains descriptor identity fields,

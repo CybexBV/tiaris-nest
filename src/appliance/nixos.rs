@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, OpenOptions},
+    io::{Read, Seek},
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::Mutex,
@@ -185,12 +186,19 @@ async fn store(update: super::ManagedApplianceUpdate<NixosRelease>) -> Result<()
         };
         super::validate_qualification_package_transport_url(transport, &artifact)?;
     }
-    // The download only has to fit. Whether the update itself fits is root's
-    // decision (`verify_update`): root can free space first, and its refusal
-    // reaches Tiaris with a reason. Retention restores the floor meanwhile.
+    // The download only has to fit, and only what it still misses: an
+    // earlier try may have left part of it. Whether the update itself fits
+    // is root's decision (`verify_update`): root can free space first, and
+    // its refusal reaches Tiaris with a reason. Retention restores the floor
+    // meanwhile.
+    let download_bytes = update
+        .release
+        .system_closure
+        .size_bytes
+        .saturating_sub(partial_bytes(&path, &update.release));
     if let Err(error) = crate::disk::ensure_headroom(
         Path::new(UPDATE_BUNDLE_ROOT),
-        update.release.system_closure.size_bytes,
+        download_bytes,
         "Nest update download",
     ) {
         // Root never sees an update whose archive did not land, so it is
@@ -201,7 +209,7 @@ async fn store(update: super::ManagedApplianceUpdate<NixosRelease>) -> Result<()
         if prior.is_none() {
             super::write_atomic_json(
                 Path::new(UPDATE_ROOM_REQUEST_PATH),
-                &room_request(&update),
+                &room_request(&update, download_bytes),
                 0o600,
             )?;
         }
@@ -234,16 +242,15 @@ async fn store(update: super::ManagedApplianceUpdate<NixosRelease>) -> Result<()
 
 /// What root needs to make room for a download and to report the attempt:
 /// its identity and how much must be free.
-fn room_request(update: &super::ManagedApplianceUpdate<NixosRelease>) -> Value {
+fn room_request(
+    update: &super::ManagedApplianceUpdate<NixosRelease>,
+    download_bytes: u64,
+) -> Value {
     json!({
         "schema": "tiaris.nest.appliance-update-room.v1",
         "attempt_id": update.attempt_id,
         "release": update.release,
-        "required_available_bytes": update
-            .release
-            .system_closure
-            .size_bytes
-            .saturating_add(crate::disk::DISK_HEADROOM_BYTES),
+        "required_available_bytes": download_bytes.saturating_add(crate::disk::DISK_HEADROOM_BYTES),
     })
 }
 
@@ -293,82 +300,305 @@ fn started(status: Option<&Value>, attempt_id: Uuid) -> bool {
     })
 }
 
+/// Drops one download call resumes after; the next call continues the
+/// partial file. Each drop in a row without new bytes waits 5 s longer.
+const RESUMES: u32 = 8;
+const RESUME_PAUSE: Duration = Duration::from_secs(5);
+
+/// Where the signed archive's bytes collect beside `path` until they are
+/// complete. Named for the archive, so only this exact archive's bytes are
+/// ever continued, also by a later attempt of the same release.
+pub fn partial_path(path: &Path, release: &NixosRelease) -> Result<PathBuf> {
+    Ok(path
+        .parent()
+        .ok_or_else(|| anyhow!("closure archive path has no directory"))?
+        .join(format!("{}.part", release.system_closure.sha256)))
+}
+
+/// The bytes of the signed archive already downloaded beside `path`.
+pub fn partial_bytes(path: &Path, release: &NixosRelease) -> u64 {
+    partial_path(path, release)
+        .ok()
+        .and_then(|partial| fs::symlink_metadata(partial).ok())
+        .filter(|metadata| metadata.is_file())
+        .map_or(0, |metadata| {
+            metadata.len().min(release.system_closure.size_bytes)
+        })
+}
+
 pub async fn download(
     release: &NixosRelease,
     transport: &str,
     path: &Path,
     allow_private: bool,
-) -> Result<()> {
+) -> Result<closure::AuthenticatedArchive> {
     download_with_progress(release, transport, path, allow_private, &mut |_, _| {}).await
 }
 
-/// Download the signed closure, reporting `(received, signed_total)` bytes
-/// after each chunk. The callback observes progress only; it cannot affect
-/// the signed size and hash checks.
+/// Download the signed closure to `path` and return it open and
+/// authenticated: this is the archive's one SHA-256 pass. Reports
+/// `(received, signed_total)` bytes after each chunk; the callback observes
+/// progress only and cannot affect the signed size and hash checks.
+///
+/// A dropped transfer resumes with HTTP Range. The bytes collect in a
+/// private partial file beside `path` ([`partial_path`]), continued after a
+/// drop in this call and by a later call: a restart, Tiaris handing the
+/// update again, a retried setup. The hash reads the bytes already there
+/// once, then takes each new chunk. Only bytes of the signed size and hash
+/// become `path`; a partial file that ends otherwise is removed.
 pub async fn download_with_progress(
     release: &NixosRelease,
     transport: &str,
     path: &Path,
     allow_private: bool,
     progress: &mut (dyn FnMut(u64, u64) + Send),
-) -> Result<()> {
+) -> Result<closure::AuthenticatedArchive> {
+    download_resuming(
+        release,
+        transport,
+        path,
+        allow_private,
+        progress,
+        RESUME_PAUSE,
+    )
+    .await
+}
+
+async fn download_resuming(
+    release: &NixosRelease,
+    transport: &str,
+    path: &Path,
+    allow_private: bool,
+    progress: &mut (dyn FnMut(u64, u64) + Send),
+    pause: Duration,
+) -> Result<closure::AuthenticatedArchive> {
+    let total = release.system_closure.size_bytes;
+    let partial = partial_path(path, release)?;
+    discard_other_partials(&partial)?;
+    let (file, mut received, mut hash) = {
+        let partial = partial.clone();
+        tokio::task::spawn_blocking(move || open_partial(&partial, total)).await??
+    };
+    let mut file = tokio::fs::File::from_std(file);
+    progress(received, total);
+    let (mut resumes, mut idle) = (0u32, 0u32);
+    while received < total {
+        let before = received;
+        let error = match fetch(
+            release,
+            transport,
+            allow_private,
+            &mut file,
+            &mut received,
+            &mut hash,
+            progress,
+        )
+        .await
+        {
+            Ok(()) if received == total => break,
+            Ok(()) => anyhow!("closure download ended early"),
+            Err(Transfer::Dropped(error)) => error,
+            Err(Transfer::Refused(error)) => return Err(error),
+        };
+        idle = if received > before { 1 } else { idle + 1 };
+        resumes += 1;
+        if resumes > RESUMES {
+            return Err(error.context("closure download kept dropping; the next try continues it"));
+        }
+        tracing::warn!(error = %error, received, total, "closure download dropped; resuming");
+        tokio::time::sleep(pause * idle).await;
+    }
+    file.sync_all().await?;
+    let file = file.into_std().await;
+    let archive = match closure::AuthenticatedArchive::hashed(file, hash, received, release) {
+        Ok(archive) => archive,
+        Err(error) => {
+            let _ = fs::remove_file(&partial);
+            return Err(error);
+        }
+    };
+    fs::rename(&partial, path)?;
+    super::sync_directory(path.parent().ok_or_else(|| anyhow!("archive path"))?)?;
+    Ok(archive)
+}
+
+/// The partial file, its bytes and their hash. Bytes beyond the signed size
+/// cannot be the archive: the download starts again.
+fn open_partial(partial: &Path, total: u64) -> Result<(fs::File, u64, Sha256)> {
+    let open = || {
+        OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(partial)
+    };
+    let mut file = open()?;
+    let metadata = file.metadata()?;
+    if !(metadata.is_file()
+        && metadata.nlink() == 1
+        && metadata.uid() == unsafe { libc::geteuid() }
+        && metadata.mode() & 0o777 == 0o600)
+    {
+        fs::remove_file(partial)?;
+        file = open()?;
+    }
+    let mut hash = Sha256::new();
+    let mut length = file.metadata()?.len();
+    if length > total {
+        file.set_len(0)?;
+        length = 0;
+    }
+    file.rewind()?;
+    ensure!(
+        std::io::copy(&mut (&file).take(length), &mut hash)? == length,
+        "closure partial download changed while it was read"
+    );
+    Ok((file, length, hash))
+}
+
+/// Partial downloads of other archives in the same private directory, and
+/// the temporary files of the downloader before partial files
+/// (`<name>.tar.<uuid>.tmp`), which a stopped download left behind.
+fn discard_other_partials(partial: &Path) -> Result<()> {
+    let directory = partial
+        .parent()
+        .ok_or_else(|| anyhow!("closure partial download has no directory"))?;
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        if entry.path() == partial {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let other_partial = name.strip_suffix(".part").is_some_and(|hash| {
+            hash.len() == 64 && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        });
+        let old_temporary = name
+            .strip_suffix(".tmp")
+            .and_then(|stem| stem.rsplit_once('.'))
+            .is_some_and(|(stem, id)| stem.ends_with(".tar") && Uuid::parse_str(id).is_ok());
+        if (other_partial || old_temporary) && entry.file_type()?.is_file() {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+enum Transfer {
+    /// The connection or the server failed: the bytes so far stand.
+    Dropped(anyhow::Error),
+    /// The answer is not the archive: give up.
+    Refused(anyhow::Error),
+}
+
+/// One request for the archive's bytes from `received` on, appended to
+/// `file` and `hash` as they come.
+async fn fetch(
+    release: &NixosRelease,
+    transport: &str,
+    allow_private: bool,
+    file: &mut tokio::fs::File,
+    received: &mut u64,
+    hash: &mut Sha256,
+    progress: &mut (dyn FnMut(u64, u64) + Send),
+) -> std::result::Result<(), Transfer> {
+    use reqwest::{StatusCode, header};
+    let refused =
+        |message: &str| Transfer::Refused(anyhow!("invalid closure HTTP response: {message}"));
+    let total = release.system_closure.size_bytes;
+    let offset = *received;
     let mut response = crate::release_transport::get(
         transport,
         allow_private,
         !allow_private,
         Duration::from_secs(4 * 60 * 60),
-        None,
+        Some(offset),
     )
-    .await?;
-    ensure!(
-        response.status() == reqwest::StatusCode::OK
-            && response
-                .content_length()
-                .is_none_or(|n| n == release.system_closure.size_bytes)
-            && response
-                .headers()
-                .get(reqwest::header::CONTENT_ENCODING)
-                .is_none_or(|v| v == "identity"),
-        "invalid closure HTTP response"
-    );
-    let temporary = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
-    let result = async {
-        let raw = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&temporary)?;
-        let mut file = tokio::fs::File::from_std(raw);
-        let mut hash = Sha256::new();
-        let mut size = 0u64;
-        while let Some(chunk) = response.chunk().await? {
-            size = size
-                .checked_add(chunk.len() as u64)
-                .ok_or_else(|| anyhow!("closure size overflow"))?;
-            ensure!(
-                size <= release.system_closure.size_bytes,
-                "closure exceeds signed size"
-            );
-            hash.update(&chunk);
-            file.write_all(&chunk).await?;
-            progress(size, release.system_closure.size_bytes);
+    .await
+    .map_err(Transfer::Dropped)?;
+    let status = response.status();
+    let length = response.content_length();
+    if response
+        .headers()
+        .get(header::CONTENT_ENCODING)
+        .is_some_and(|value| value != "identity")
+    {
+        return Err(refused("encoded body"));
+    }
+    match status {
+        StatusCode::OK if length.is_none_or(|n| n == total) => {
+            if offset > 0 {
+                // The server sent the whole archive instead of the rest.
+                start_over(file, hash, received, progress, total).await?;
+            }
         }
-        ensure!(
-            size == release.system_closure.size_bytes
-                && hex::encode(hash.finalize()) == release.system_closure.sha256,
-            "closure signed size/hash mismatch"
-        );
-        file.sync_all().await?;
-        tokio::fs::rename(&temporary, path).await?;
-        Ok(())
+        StatusCode::PARTIAL_CONTENT if offset > 0 => {
+            let range = format!("bytes {offset}-{}/{total}", total - 1);
+            if response
+                .headers()
+                .get(header::CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok())
+                != Some(range.as_str())
+                || length.is_some_and(|n| n != total - offset)
+            {
+                return Err(refused("range"));
+            }
+        }
+        StatusCode::RANGE_NOT_SATISFIABLE if offset > 0 => {
+            // The server does not know these bytes as the archive's start.
+            start_over(file, hash, received, progress, total).await?;
+            return Err(Transfer::Dropped(anyhow!("closure download range refused")));
+        }
+        status
+            if status.is_server_error()
+                || status == StatusCode::REQUEST_TIMEOUT
+                || status == StatusCode::TOO_MANY_REQUESTS =>
+        {
+            return Err(Transfer::Dropped(anyhow!(
+                "closure download answered {status}"
+            )));
+        }
+        _ => return Err(refused("status or length")),
     }
-    .await;
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| Transfer::Dropped(error.into()))?
+    {
+        let next = received
+            .checked_add(chunk.len() as u64)
+            .filter(|next| *next <= total)
+            .ok_or_else(|| Transfer::Refused(anyhow!("closure exceeds signed size")))?;
+        file.write_all(&chunk)
+            .await
+            .map_err(|error| Transfer::Refused(error.into()))?;
+        hash.update(&chunk);
+        *received = next;
+        progress(next, total);
     }
-    result
+    Ok(())
 }
+
+async fn start_over(
+    file: &mut tokio::fs::File,
+    hash: &mut Sha256,
+    received: &mut u64,
+    progress: &mut (dyn FnMut(u64, u64) + Send),
+    total: u64,
+) -> std::result::Result<(), Transfer> {
+    file.set_len(0)
+        .await
+        .map_err(|error| Transfer::Refused(error.into()))?;
+    *hash = Sha256::new();
+    *received = 0;
+    progress(0, total);
+    Ok(())
+}
+
 /// The update needs more free disk space than there is. `verify_update`
 /// changes nothing for it the first time: the root updater frees space
 /// (`generation_update.make_room`) and asks again.
@@ -379,7 +609,8 @@ pub struct InsufficientSpace {
     pub required_available_bytes: u64,
 }
 
-/// Installation: the closure fits and leaves the Nest's free-space floor.
+/// Installation: the extracted cache and the closure fit and leave the
+/// Nest's free-space floor.
 /// The installer has no configuration to load: it writes the Nest's own
 /// (`provisioning::storage::nest_config`) without a build size, so the
 /// default is the floor the installed Nest keeps.
@@ -393,6 +624,22 @@ pub fn ensure_space(path: &Path, temporary_and_missing: u64) -> Result<()> {
         "insufficient space for the closure and the Nest's free-space floor"
     );
     Ok(())
+}
+
+/// The NAR bytes of the store paths the store does not hold yet.
+/// Conservative accounting never counts protected/shared paths as
+/// reclaimable; a path already there, such as the running predecessor's, is
+/// not charged twice.
+fn missing_nar_bytes(manifest: &closure::ClosureManifest) -> Result<u64> {
+    manifest
+        .store_paths
+        .iter()
+        .filter(|path| !Path::new(&path.path).exists())
+        .try_fold(0u64, |total, path| {
+            total
+                .checked_add(path.nar_size)
+                .ok_or_else(|| anyhow!("missing path size overflow"))
+        })
 }
 
 fn validate_directory(path: &Path, owner: u32, mode: u32) -> Result<()> {
@@ -529,56 +776,45 @@ pub fn verify_update(floor: u64, space_freed: bool) -> Result<PathBuf> {
         }
         let result = (|| {
             let archive_bytes = request.release.system_closure.size_bytes;
-            let expanded = closure::MAX_EXPANDED
-                .checked_add(DATABASE_BACKUP_RESERVE)
-                .ok_or_else(|| anyhow!("staging size overflow"))?;
-            // Before the private copy: everything but the store paths the
-            // update misses, which only the archive's manifest names.
-            ensure_update_space(
-                &private,
-                Path::new("/nix/store"),
-                archive_bytes
-                    .checked_add(expanded)
-                    .ok_or_else(|| anyhow!("staging size overflow"))?,
-                0,
-                floor,
-            )?;
+            let store = Path::new("/nix/store");
+            // The private copy first. What the update needs beyond it, its
+            // extracted cache and the store paths it misses, the archive's
+            // own manifest and NARInfos say: the verification pass admits
+            // it before it writes a payload.
+            ensure_update_space(&private, store, archive_bytes, 0, floor)?;
             let archive = private.join("closure.tar.zst");
-            super::pin_untrusted_bundle(
-                &canonical,
-                &archive,
-                request.release.system_closure.size_bytes,
-                &request.release.system_closure.sha256,
-            )?;
-            let mut file = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(&archive)?;
-            let manifest = closure::verify_archive(&mut file, &request.release, &key, None)?;
-            // Conservative accounting never counts protected/shared paths as reclaimable.
-            // Missing path accounting avoids charging the imported predecessor twice.
-            let mut missing = 0u64;
-            for path in &manifest.store_paths {
-                if !Path::new(&path.path).exists() {
-                    missing = missing
-                        .checked_add(path.nar_size)
-                        .ok_or_else(|| anyhow!("missing path size overflow"))?;
-                }
-            }
-            ensure_update_space(&private, Path::new("/nix/store"), expanded, missing, floor)
-                .map_err(|error| match error.downcast::<InsufficientSpace>() {
-                    // A new start copies the archive again.
-                    Ok(short) => InsufficientSpace {
-                        required_available_bytes: short
-                            .required_available_bytes
-                            .saturating_add(archive_bytes),
-                    }
-                    .into(),
-                    Err(error) => error,
-                })?;
-            let database_backup = snapshot_database(&private)?;
+            let pinned = super::pin_untrusted_bundle(&canonical, &archive, &request.release)?;
             let cache = private.join("cache");
-            closure::verify_archive(&mut file, &request.release, &key, Some(&cache))?;
+            let mut missing = 0u64;
+            let verified = closure::verify_archive(
+                pinned,
+                &request.release,
+                &key,
+                Some(&cache),
+                |manifest, cache_bytes| {
+                    missing = missing_nar_bytes(manifest)?;
+                    let staging = cache_bytes
+                        .checked_add(DATABASE_BACKUP_RESERVE)
+                        .ok_or_else(|| anyhow!("staging size overflow"))?;
+                    ensure_update_space(&private, store, staging, missing, floor).map_err(|error| {
+                        match error.downcast::<InsufficientSpace>() {
+                            // A new start copies the archive again.
+                            Ok(short) => InsufficientSpace {
+                                required_available_bytes: short
+                                    .required_available_bytes
+                                    .saturating_add(archive_bytes),
+                            }
+                            .into(),
+                            Err(error) => error,
+                        }
+                    })
+                },
+            )?;
+            let total_nar_bytes = verified.manifest.total_nar_bytes;
+            // The import reads the extracted cache; the private copy is done.
+            drop(verified);
+            fs::remove_file(&archive)?;
+            let database_backup = snapshot_database(&private)?;
             super::write_atomic_json(
                 &receipt_directory.join("verified-update.json"),
                 &json!({
@@ -586,7 +822,7 @@ pub fn verify_update(floor: u64, space_freed: bool) -> Result<PathBuf> {
                     "descriptor_sha256":hex::encode(Sha256::digest(serde_json::to_vec(&super::canonical_json(serde_json::to_value(&request.release)?))?)),
                     "target_release":request.release.release_id,"source_revision":request.release.source_revision,"system_closure_sha256":request.release.system_closure.sha256,
                     "system_closure_size_bytes":request.release.system_closure.size_bytes,"system_toplevel":request.release.system_toplevel,"sqlite_migrations_sha256":request.release.sqlite_migrations_sha256,
-                    "total_nar_bytes":manifest.total_nar_bytes,"missing_nar_bytes":missing,"cache_path":cache,"database_backup":database_backup,"release":request.release,"source_system_generation":current.system_generation,"source_system_toplevel":current.system_toplevel,
+                    "total_nar_bytes":total_nar_bytes,"missing_nar_bytes":missing,"cache_path":cache,"database_backup":database_backup,"release":request.release,"source_system_generation":current.system_generation,"source_system_toplevel":current.system_toplevel,
                 }),
                 0o600,
             )?;
@@ -1071,7 +1307,8 @@ mod tests {
             qualification_package_transport_url: None,
         };
         // What root reads from it (`generation_update.make_download_room`).
-        let request = room_request(&update);
+        // An earlier try left all but 3 bytes.
+        let request = room_request(&update, 3);
         assert_eq!(request["attempt_id"], update.attempt_id.to_string());
         assert_eq!(request["release"]["release_id"], release.release_id);
         assert_eq!(
@@ -1088,7 +1325,7 @@ mod tests {
         );
         assert_eq!(
             request["required_available_bytes"],
-            release.system_closure.size_bytes + crate::disk::DISK_HEADROOM_BYTES
+            3 + crate::disk::DISK_HEADROOM_BYTES
         );
     }
 
@@ -1164,13 +1401,72 @@ mod tests {
         let error = download(&release, &transport, &path, true)
             .await
             .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("closure signed size/hash mismatch")
-        );
+        assert!(error.to_string().contains("signed size/hash mismatch"));
         server.await.unwrap();
+        // Bytes that are not the archive are not continued either.
         assert!(!path.exists());
+        assert!(!partial_path(&path, &release).unwrap().exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_dropped_closure_download_continues_where_it_stopped() {
+        let root = std::env::temp_dir().join(format!("tiaris-closure-resume-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("attempt.tar.zst");
+        let body = b"0123456789abcdefghij";
+        let release = closure_fixture(body);
+        // An earlier try left the first 4 bytes; another archive's partial
+        // file and the old downloader's temporary file go.
+        fs::write(partial_path(&path, &release).unwrap(), &body[..4]).unwrap();
+        fs::set_permissions(
+            partial_path(&path, &release).unwrap(),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let stale = [
+            root.join(format!("{}.part", "f".repeat(64))),
+            root.join(format!("attempt.tar.{}.tmp", Uuid::new_v4())),
+        ];
+        for file in &stale {
+            fs::write(file, b"stale").unwrap();
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let transport = format!("http://{}/signed", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for response in [
+                // Drops after 6 of the 16 bytes it promised.
+                &b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 4-19/20\r\nContent-Length: 16\r\nConnection: close\r\n\r\n456789"[..],
+                b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 10-19/20\r\nContent-Length: 10\r\nConnection: close\r\n\r\nabcdefghij",
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 4096];
+                let read = stream.read(&mut request).await.unwrap();
+                requests.push(String::from_utf8_lossy(&request[..read]).to_lowercase());
+                stream.write_all(response).await.unwrap();
+            }
+            requests
+        });
+        let mut seen = Vec::new();
+        let archive = download_resuming(
+            &release,
+            &transport,
+            &path,
+            true,
+            &mut |received, _| seen.push(received),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        let requests = server.await.unwrap();
+        assert!(requests[0].contains("range: bytes=4-"));
+        assert!(requests[1].contains("range: bytes=10-"));
+        assert_eq!((seen[0], *seen.last().unwrap()), (4, 20));
+        assert_eq!(fs::read(&path).unwrap(), body);
+        assert!(!partial_path(&path, &release).unwrap().exists());
+        assert!(stale.iter().all(|file| !file.exists()));
+        drop(archive);
         fs::remove_dir_all(root).unwrap();
     }
 

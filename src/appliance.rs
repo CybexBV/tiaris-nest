@@ -82,12 +82,16 @@ pub struct ApplianceReport {
 pub fn is_managed_appliance() -> bool {
     nixos::is_nixos()
 }
+/// Root's private copy of the daemon's untrusted archive, hashed while it is
+/// copied: the archive's one hash pass on the updater's side. Root reads only
+/// this copy afterwards, never the inbox file the daemon can still change.
+/// It is not synced: an interrupted verification starts again from nothing.
 fn pin_untrusted_bundle(
     source: &Path,
     target: &Path,
-    expected_size: u64,
-    expected_sha256: &str,
-) -> Result<()> {
+    release: &release_v3::NixosRelease,
+) -> Result<closure::AuthenticatedArchive> {
+    let expected_size = release.system_closure.size_bytes;
     let mut source = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
@@ -99,12 +103,13 @@ fn pin_untrusted_bundle(
     }
     let mut destination = fs::OpenOptions::new()
         .create_new(true)
+        .read(true)
         .write(true)
         .mode(0o400)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
         .open(target)
         .context("create pinned appliance update bundle")?;
-    let result = (|| -> Result<()> {
+    let result = (|| -> Result<(Sha256, u64)> {
         let mut hasher = Sha256::new();
         let mut copied = 0u64;
         let mut buffer = vec![0u8; 1024 * 1024];
@@ -122,16 +127,12 @@ fn pin_untrusted_bundle(
             hasher.update(&buffer[..read]);
             destination.write_all(&buffer[..read])?;
         }
-        if copied != expected_size || hex::encode(hasher.finalize()) != expected_sha256 {
-            bail!("appliance update bundle changed before it was pinned")
-        }
-        destination.sync_all()?;
-        sync_directory(
-            target
-                .parent()
-                .ok_or_else(|| anyhow!("pinned bundle has no parent"))?,
-        )
-    })();
+        Ok((hasher, copied))
+    })()
+    .and_then(|(hasher, copied)| {
+        closure::AuthenticatedArchive::hashed(destination, hasher, copied, release)
+            .context("appliance update bundle changed before it was pinned")
+    });
     if result.is_err() {
         let _ = fs::remove_file(target);
     }
@@ -562,15 +563,17 @@ mod tests {
         let target = root.join("root-owned.tar.zst");
         let body = b"signed bundle bytes";
         fs::write(&source, body).unwrap();
-        pin_untrusted_bundle(
-            &source,
-            &target,
-            body.len() as u64,
-            &hex::encode(Sha256::digest(body)),
-        )
-        .unwrap();
+        let fixture: Value =
+            serde_json::from_str(include_str!("../protocol/fixtures/nest-appliance-v3.json"))
+                .unwrap();
+        let mut release: release_v3::NixosRelease =
+            serde_json::from_value(fixture["appliance_release"].clone()).unwrap();
+        release.system_closure.size_bytes = body.len() as u64;
+        release.system_closure.sha256 = hex::encode(Sha256::digest(body));
+        let pinned = pin_untrusted_bundle(&source, &target, &release).unwrap();
         fs::write(&source, b"mutated after pin!").unwrap();
         assert_eq!(fs::read(&target).unwrap(), body);
+        drop(pinned);
         assert_eq!(
             fs::metadata(&target).unwrap().permissions().mode() & 0o777,
             0o400

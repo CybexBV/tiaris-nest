@@ -169,11 +169,98 @@ impl Fixture {
         fs::create_dir(&dir)?;
         let path = dir.join("closure.tar.zst");
         fs::write(&path, bytes)?;
-        let mut file = File::open(path)?;
-        let result = verify_archive(&mut file, &self.release, &self.key.verifying_key(), None);
+        let result = self.open(&path, None, |_, _| Ok(()));
         fs::remove_dir_all(dir)?;
-        result
+        result.map(|verified| verified.manifest)
     }
+    fn open(
+        &self,
+        path: &Path,
+        output: Option<&Path>,
+        admit: impl FnOnce(&ClosureManifest, u64) -> Result<()>,
+    ) -> Result<VerifiedArchive> {
+        let archive = AuthenticatedArchive::open(path, &self.release)?;
+        verify_archive(
+            archive,
+            &self.release,
+            &self.key.verifying_key(),
+            output,
+            admit,
+        )
+    }
+}
+fn files(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    let mut found = BTreeMap::new();
+    for directory in [root.to_path_buf(), root.join("nar")] {
+        for entry in fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() {
+                let name = path.strip_prefix(root).unwrap().display().to_string();
+                found.insert(name, fs::read(path).unwrap());
+            }
+        }
+    }
+    found
+}
+#[test]
+fn space_is_admitted_with_the_exact_cache_size_before_a_payload_lands() {
+    let mut f = Fixture::new();
+    let bytes = f.archive(|_| {});
+    let dir = std::env::temp_dir().join(format!("nest-closure-admit-{}", Uuid::new_v4()));
+    fs::create_dir(&dir).unwrap();
+    let path = dir.join("closure.tar.zst");
+    fs::write(&path, &bytes).unwrap();
+    let refused = f.open(&path, Some(&dir.join("refused")), |_, _| {
+        bail!("insufficient_store_space")
+    });
+    assert!(refused.is_err());
+    assert!(
+        files(&dir.join("refused"))
+            .keys()
+            .all(|name| !name.starts_with("nar/"))
+    );
+    let mut admitted = None;
+    let verified = f
+        .open(&path, Some(&dir.join("cache")), |manifest, bytes| {
+            admitted = Some((manifest.store_paths.len(), bytes));
+            Ok(())
+        })
+        .unwrap();
+    let extracted: usize = files(&dir.join("cache")).values().map(Vec::len).sum();
+    assert_eq!(admitted, Some((2, extracted as u64)));
+    assert_eq!(verified.cache_bytes, extracted as u64);
+    fs::remove_dir_all(dir).unwrap();
+}
+#[test]
+fn setup_extracts_what_it_verified_and_refuses_a_changed_archive() {
+    let mut f = Fixture::new();
+    let bytes = f.archive(|_| {});
+    let dir = std::env::temp_dir().join(format!("nest-closure-extract-{}", Uuid::new_v4()));
+    fs::create_dir(&dir).unwrap();
+    let path = dir.join("closure.tar.zst");
+    fs::write(&path, &bytes).unwrap();
+    drop(
+        f.open(&path, Some(&dir.join("verified")), |_, _| Ok(()))
+            .unwrap(),
+    );
+    let mut staged = f.open(&path, None, |_, _| Ok(())).unwrap();
+    let key = f.key.verifying_key();
+    staged
+        .extract(&f.release, &key, &dir.join("extracted"))
+        .unwrap();
+    assert_eq!(files(&dir.join("extracted")), files(&dir.join("verified")));
+    // Not the bytes it verified any more: nothing more is extracted.
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"x")
+        .unwrap();
+    let error = staged
+        .extract(&f.release, &key, &dir.join("after-change"))
+        .unwrap_err();
+    assert!(error.to_string().contains("archive changed"));
+    fs::remove_dir_all(dir).unwrap();
 }
 #[test]
 fn authenticates_entire_signed_closure_and_inner_source_bytes() {
@@ -208,14 +295,9 @@ fn python_packer_archive_verifies_and_extracts_in_rust() {
     let bytes = fs::read(&packed).unwrap();
     fixture.bind(&bytes);
     let extracted = root.join("verified");
-    let verified = verify_archive(
-        &mut File::open(&packed).unwrap(),
-        &fixture.release,
-        &fixture.key.verifying_key(),
-        Some(&extracted),
-    );
+    let verified = fixture.open(&packed, Some(&extracted), |_, _| Ok(()));
     fs::remove_dir_all(root).unwrap();
-    assert_eq!(verified.unwrap().store_paths.len(), 2);
+    assert_eq!(verified.unwrap().manifest.store_paths.len(), 2);
 }
 #[test]
 fn rejects_inner_signature_even_under_authentic_outer_signature() {
