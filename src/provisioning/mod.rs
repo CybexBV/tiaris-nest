@@ -4,6 +4,7 @@
 //! partition contains a random device key. Every later event is signed by
 //! that installed identity.
 
+mod clock;
 mod inventory;
 mod network_runtime;
 mod nixos_install;
@@ -397,6 +398,8 @@ pub async fn prepare(options: PrepareOptions) -> Result<()> {
 
 async fn prepare_with_status(options: &PrepareOptions, status: &SetupStatusReporter) -> Result<()> {
     packages::require_nixos_media()?;
+    // The ISO starts before network time; Tiaris's answers set the clock.
+    clock::follow_manage();
     let trusted_keys = protocol::load_trusted_provisioning_keys(&options.provisioning_keys_path)?;
     // An all-zero slot is the generic ISO: it obtains the same envelope by
     // registering and being claimed, then continues below.

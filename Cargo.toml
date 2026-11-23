@@ -59,4 +59,5 @@ uuid = { version = "1", features = ["v4", "serde"] }
 zstd = "0.14.3"
 
 [dev-dependencies]
+tokio = { version = "1.40", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }

@@ -92,6 +92,28 @@ pub async fn active_build_job_count(pool: &SqlitePool) -> AppResult<i64> {
     Ok(count)
 }
 
+/// Whether one of Manage's `managed_job_ids` is not a build job of this Nest
+/// yet, whatever its state here.
+pub async fn has_unknown_managed_build_job(
+    pool: &SqlitePool,
+    managed_job_ids: &[String],
+) -> AppResult<bool> {
+    if managed_job_ids.is_empty() {
+        return Ok(false);
+    }
+    let unknown: Option<String> = sqlx::query_scalar(
+        "SELECT listed.value FROM json_each(?) listed
+         WHERE NOT EXISTS (
+             SELECT 1 FROM nest_build_jobs job WHERE job.managed_job_id = listed.value
+         )
+         LIMIT 1",
+    )
+    .bind(serde_json::Value::from(managed_job_ids.to_vec()).to_string())
+    .fetch_optional(pool)
+    .await?;
+    Ok(unknown.is_some())
+}
+
 pub async fn connect(config: &AppConfig) -> AppResult<SqlitePool> {
     if let Some(parent) = config.paths.database_path.parent() {
         fs::create_dir_all(parent)?;
@@ -4392,6 +4414,33 @@ mod tests {
         assert_eq!(classify_validation_rejection(&reason), "protected_material");
 
         assert_eq!(classify_validation_rejection("something new"), "rejected");
+    }
+
+    #[tokio::test]
+    async fn queued_work_is_new_only_when_this_nest_never_took_it() {
+        let pool = test_pool().await;
+        upsert_managed_build_job(
+            &pool,
+            "managed-taken-1",
+            "nixos_closure",
+            None,
+            Some("blueprint"),
+            Some("x86_64-linux"),
+            "rev-taken",
+            &"a".repeat(64),
+            None,
+        )
+        .await
+        .unwrap();
+        let taken = ["managed-taken-1".to_string()];
+        assert!(!has_unknown_managed_build_job(&pool, &taken).await.unwrap());
+        assert!(!has_unknown_managed_build_job(&pool, &[]).await.unwrap());
+        let with_new = [taken[0].clone(), "managed-new-1".to_string()];
+        assert!(
+            has_unknown_managed_build_job(&pool, &with_new)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

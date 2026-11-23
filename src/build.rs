@@ -324,6 +324,8 @@ async fn worker_loop(state: AppState, worker_index: usize) {
                     recover_failed_job_execution(&state, job_id, worker_index).await;
                 }
                 cleanup_job_dirs(&state.config, job_id).await;
+                // Manage hears the result now, not at the next sync.
+                crate::manage::request_sync();
             }
             Ok(None) => {
                 drop(_maintenance_lease);

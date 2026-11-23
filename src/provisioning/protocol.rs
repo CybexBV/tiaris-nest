@@ -880,7 +880,12 @@ pub(crate) async fn signed_json<B: Serialize + ?Sized, R: DeserializeOwned>(
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body);
     }
+    let asked = std::time::Instant::now();
     let response = request.send().await.context("send provisioning request")?;
+    super::clock::observe(
+        response.headers().get(reqwest::header::DATE),
+        asked.elapsed(),
+    );
     let status = response.status();
     let retry_after = response
         .headers()

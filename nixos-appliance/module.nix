@@ -263,9 +263,12 @@ in {
     systemd.services.tiaris-nest-network-runtime = (rootService "network-runtime") // { after = [ "tiaris-nest-first-boot.service" "tiaris-nest-network-guard.service" "network-online.target" ]; wants = [ "network-online.target" ]; before = [ "tiaris-nest.service" ]; serviceConfig = { Type = "oneshot"; ExecStart = command "network-runtime"; TimeoutStartSec = "30s"; }; };
     systemd.timers.tiaris-nest-network-runtime = { wantedBy = [ "timers.target" ]; timerConfig = { OnBootSec = "1min"; OnUnitActiveSec = "1min"; }; };
     # Updates are prepared while the Nest serves computers: verification and
-    # import yield CPU and disk to them (generation_update.prepare).
-    systemd.services.tiaris-nest-appliance-update = (rootService "appliance-update") // { after = [ "tiaris-nest.service" ]; serviceConfig = { Type = "oneshot"; ExecStart = command "appliance-update"; TimeoutStartSec = "4h"; Nice = 10; IOSchedulingClass = "best-effort"; IOSchedulingPriority = 7; }; };
-    systemd.timers.tiaris-nest-appliance-update = { wantedBy = [ "timers.target" ]; timerConfig = { OnBootSec = "1min"; OnUnitInactiveSec = "30s"; RandomizedDelaySec = "5s"; }; };
+    # import yield CPU and disk to them (generation_update.prepare). The first
+    # look comes soon after a start, once the commit of a new generation is
+    # done and the daemon has reported: an update that waited for a restart
+    # goes on then, not a minute later.
+    systemd.services.tiaris-nest-appliance-update = (rootService "appliance-update") // { after = [ "tiaris-nest.service" "tiaris-nest-generation-commit.service" ]; serviceConfig = { Type = "oneshot"; ExecStart = command "appliance-update"; TimeoutStartSec = "4h"; Nice = 10; IOSchedulingClass = "best-effort"; IOSchedulingPriority = 7; }; };
+    systemd.timers.tiaris-nest-appliance-update = { wantedBy = [ "timers.target" ]; timerConfig = { OnBootSec = "15s"; OnUnitInactiveSec = "30s"; RandomizedDelaySec = "5s"; }; };
     systemd.services.tiaris-nest-generation-commit = (rootService "generation-commit") // {
       wantedBy = [ "multi-user.target" ]; after = [ "tiaris-nest.service" "nginx.service" "tftpd-hpa.service" ]; wants = [ "tiaris-nest.service" ];
       unitConfig = { ConditionPathExists = "/var/lib/tiaris-nest/control/pending-system-generation.json"; FailureAction = "reboot"; JobTimeoutSec = "5min"; JobTimeoutAction = "reboot"; };

@@ -49,8 +49,9 @@ let
       && daemon.ProtectSystem == "strict" && daemon.CapabilityBoundingSet == "";
     setupKeepsBootstrapLogsOffConsole = bootstrap.StandardOutput == "journal"
       && bootstrap.StandardError == "journal";
-    setupBoundsTimeWait = setup.systemd.services.systemd-time-wait-sync.serviceConfig.TimeoutStartSec == "60s";
-    setupHasTimeWaitUnit = builtins.elem "systemd-time-wait-sync.service" setup.systemd.additionalUpstreamSystemUnits;
+    # Install journey, 2026-11-21: the bootstrap waited 30 s for network time.
+    setupStartsWithoutTimeWait = !(builtins.elem "systemd-time-wait-sync.service"
+      setup.systemd.services.tiaris-nest-bootstrap.after);
     setupMenuInstallsTiarisNest = menuLabel == "Install Tiaris Nest";
     setupUsesManageGrubTheme = setup.isoImage.grubTheme == appliance.grubTheme;
   };

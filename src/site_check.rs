@@ -62,7 +62,10 @@ const REQUEST_FILE: &str = "site-check-request.json";
 const REQUEST_SCHEMA: &str = "tiaris.nest.site-check-request.v1";
 const BOOT_PROBE_PATH: &str = "/run/tiaris-nest-pxe/boot-probe.json";
 const PXE_STATUS_PATH: &str = "/run/tiaris-nest-pxe/status.json";
+/// The longest wait for the first check after a start. It starts sooner,
+/// as soon as what it tests has settled (`settled_after_start`).
 const START_DELAY: Duration = Duration::from_secs(60);
+const SETTLED_POLL: Duration = Duration::from_secs(2);
 const PERIOD: Duration = Duration::from_secs(6 * 3600);
 const RETRY_WHILE_NOT_PASSING: Duration = Duration::from_secs(15 * 60);
 const MIN_INTERVAL: Duration = Duration::from_secs(60);
@@ -293,7 +296,7 @@ pub fn spawn(state: AppState) {
 async fn run(state: AppState) {
     let data_dir = state.config.paths.data_dir.clone();
     tokio::select! {
-        _ = sleep(START_DELAY) => {}
+        _ = first_check_wait(settled_after_start) => {}
         _ = check_now().notified() => {}
     }
     let mut trigger = Trigger::Start;
@@ -349,6 +352,34 @@ async fn run(state: AppState) {
             _ = check_now().notified() => Trigger::Requested,
         };
     }
+}
+
+/// The kernel says network time has not set the clock (yet).
+pub(crate) fn clock_not_synchronized() -> bool {
+    probes::clock() == probes::Clock::NotSynchronized
+}
+
+/// Waits until `settled` holds, asked every `SETTLED_POLL`, or at most
+/// `START_DELAY`.
+async fn first_check_wait(settled: impl Fn() -> bool) {
+    let deadline = Instant::now() + START_DELAY;
+    while !settled() && Instant::now() < deadline {
+        sleep(SETTLED_POLL.min(deadline - Instant::now())).await;
+    }
+}
+
+/// What the first check after a start tests has settled: the Nest has
+/// reached Tiaris (and has its targets), its clock is set and, on an
+/// appliance, it answers network starts. A check before that would report a
+/// failure for 15 minutes that was only the start.
+fn settled_after_start() -> bool {
+    crate::manage::sync_health().last_success_at.is_some()
+        && probes::clock() == probes::Clock::Synchronized
+        && (!crate::appliance::is_managed_appliance()
+            || crate::pxe_discovery::status()
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                == Some("active"))
 }
 
 /// `https://host[:port]/...` as host and port.
