@@ -33,7 +33,7 @@ pub(crate) const SCRUB_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 /// hour, and the root is not due again for at least an hour. Reused for the
 /// whole day, members hashed minutes apart came due one by one, and each
 /// made the next sync walk the whole closure (some 2,000 members) again.
-pub(crate) const MAX_AGE: Duration = Duration::from_secs(23 * 60 * 60);
+pub(crate) const MAX_AGE: Duration = Duration::from_secs(SCRUB_EVERY.as_secs() - 60 * 60);
 const SETTLE: Duration = Duration::from_secs(2);
 /// Far above the members of a full cache; reached only by churn.
 const MAX_ENTRIES: usize = 1 << 18;
