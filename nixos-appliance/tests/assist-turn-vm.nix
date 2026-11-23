@@ -6,7 +6,6 @@
 }:
 import (nixpkgs + "/nixos/tests/make-test-python.nix") ({ pkgs, ... }: {
   name = "tiaris-nest-assist-turn${if smoke then "-smoke" else ""}";
-  defaults.virtualisation.qemu.options = [ "-no-user-config" ];
   nodes = {
     appliance = { lib, ... }:
       let
@@ -46,6 +45,7 @@ import (nixpkgs + "/nixos/tests/make-test-python.nix") ({ pkgs, ... }: {
         };
         system.stateVersion = "26.05";
         virtualisation = { memorySize = 1024; vlans = [ 1 ]; };
+        virtualisation.qemu.options = [ "-no-user-config" ];
         services.timesyncd.enable = lib.mkForce false;
         networking.interfaces.eth1.ipv4.addresses = lib.mkForce [
           { address = "100.64.50.10"; prefixLength = 24; }
@@ -84,6 +84,7 @@ import (nixpkgs + "/nixos/tests/make-test-python.nix") ({ pkgs, ... }: {
     peer = { lib, ... }: {
       system.stateVersion = "26.05";
       virtualisation = { memorySize = 768; vlans = [ 1 ]; };
+      virtualisation.qemu.options = [ "-no-user-config" ];
       networking.firewall.enable = false;
       networking.interfaces.eth1.ipv4.addresses = lib.mkForce [
         { address = "100.64.50.20"; prefixLength = 24; }
