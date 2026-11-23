@@ -338,6 +338,9 @@ fn initialize_cache_root_blocking(cache_dir: &Path) -> Result<()> {
     let staged = cache_dir.join(".nix-cache-info.tmp");
     fs::write(&staged, NIX_CACHE_INFO_CONTENTS)
         .with_context(|| format!("write {}", staged.display()))?;
+    // nginx reads the cache as its own user, as for every member Nix writes.
+    fs::set_permissions(&staged, fs::Permissions::from_mode(0o644))
+        .with_context(|| format!("set permissions on {}", staged.display()))?;
     fs::rename(&staged, &path).with_context(|| format!("publish {}", path.display()))?;
     Ok(())
 }
