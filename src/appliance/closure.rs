@@ -399,6 +399,11 @@ pub struct AuthenticatedArchive {
     state: FileState,
 }
 impl AuthenticatedArchive {
+    /// The signed archive this is.
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
     /// Hash an archive found on disk, for example one an earlier run left.
     pub fn open(path: &Path, release: &NixosRelease) -> Result<Self> {
         let file = OpenOptions::new()
