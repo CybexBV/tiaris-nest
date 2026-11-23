@@ -226,10 +226,12 @@ def cleanup(receipt):
         raise ValueError('inbox changed before terminal cleanup')
     if request:
         remove(REQUEST)
-    bundle = STAGING / 'inbox' / (attempt + '.tar.zst')
-    bundle.unlink(missing_ok=True) # unlink the exact untrusted basename, never follow it
-    if bundle.parent.exists():
-        sync_dir(bundle.parent)
+    # The archive, or the members by store path: unlink the exact untrusted
+    # basenames, never follow them.
+    for name in (attempt + '.tar.zst', attempt + '.members.tar'):
+        (STAGING / 'inbox' / name).unlink(missing_ok=True)
+    if (STAGING / 'inbox').exists():
+        sync_dir(STAGING / 'inbox')
     for staging in (STAGING / 'private' / attempt, CONTROL / 'appliance-updates' / attempt):
         if staging.exists():
             if staging.is_symlink() or staging.stat().st_uid != 0:

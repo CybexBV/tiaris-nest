@@ -1,4 +1,5 @@
 pub mod closure;
+pub mod members;
 pub mod nixos;
 pub mod release_v3;
 pub mod schedule;

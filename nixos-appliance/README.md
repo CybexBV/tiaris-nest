@@ -188,12 +188,33 @@ measured available RAM for this budget. The updater verifies once too: root
 hashes the daemon's archive while it copies it privately, then one pass
 verifies and extracts (`src/appliance/closure.rs`).
 
+The archive is one zstd frame of raw 128 KiB blocks (`tools/pack-system-closure.py`):
+its tar stream as it is, because every payload is a zstd NAR already (compressing
+again saved 1 %). Every decoder reads it as before, and each tar byte sits at a
+fixed place in the archive. So a Nest update fetches only the store paths the
+running system lacks (`src/appliance/members.rs`; 35 of 1149 members, 118 MiB of
+1.69 GiB from 0.2.181 to 0.2.182): the metadata at the archive's start and each
+missing member's bytes with HTTP Range from the signed archive URL; a dropped
+connection costs the member it was fetching. Without the archive's hash, what it
+uses is held to signatures: the manifest's identity fields to the signed
+descriptor, every store path with its NAR hash, size and references to its NARInfo
+signed with the release key, the set to the exact graph of the signed toplevel,
+each fetched NAR to its signed hash. The daemon stages the metadata and those
+payloads as one archive-shaped tar stream (`<attempt>.members.tar` in the inbox).
+Root reads it once, verifying what it copies into its private cache
+(`closure::verify_staged`), and requires each member it leaves out in the closure
+of `/run/current-system` with the signed NAR hash. The full archive stays the way
+for installations, for an archive packed before this layout, when more than half
+of its members are new, and when the server does not answer byte ranges or sends
+bytes that do not verify.
+
 `manifest.json` is canonical recursively key-sorted compact UTF-8 JSON plus LF,
 schema `tiaris.nest.system-closure.v1`. It contains descriptor identity fields,
 the pinned public Nix signing key, exact Tiaris source identity, Intel/AMD
 microcode versions, sorted `store_paths` with NAR hashes/sizes/references and
-`total_nar_bytes`. The signed archive hash authenticates it; the manifest does
-not contain its own archive digest or final descriptor. The immutable system
+`total_nar_bytes`. The signed archive hash authenticates it (an update by store
+path holds its fields to the descriptor and the signed NARInfos instead); the
+manifest does not contain its own archive digest or final descriptor. The immutable system
 metadata also omits its own toplevel; derive actual boot identity from
 `/run/current-system` and the external signed STATE receipt. Import trusts the key
 already installed in the ISO/system policy, not a key supplied only by the archive.

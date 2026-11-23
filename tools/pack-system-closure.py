@@ -9,7 +9,6 @@ import os
 from pathlib import Path
 import runpy
 import stat
-import subprocess
 import sys
 import tarfile
 import tempfile
@@ -54,6 +53,40 @@ def stage_cache(source, destination):
                 os.close(fd)
 
 
+class RawFrame:
+    """One zstd frame whose blocks hold the tar stream as it is, 128 KiB each.
+
+    Every payload is a zstd-compressed NAR already: compressing the stream again
+    saved 1 % (0.2.182). Stored as it is, tar byte t sits at a fixed place in
+    the archive, so a Nest that lacks a few store paths fetches just their
+    bytes with HTTP Range (tiaris-nest `src/appliance/members.rs`). Any zstd
+    decoder reads the frame: a 128 KiB window, no dictionary, no checksum (the
+    signed SHA-256 covers the archive)."""
+
+    BLOCK = 128 * 1024
+    HEADER = b"\x28\xb5\x2f\xfd\x00\x38"
+
+    def __init__(self, target):
+        self.target, self.pending = target, bytearray()
+        target.write(self.HEADER)
+
+    def _block(self, data, last):
+        self.target.write(((len(data) << 3) | last).to_bytes(3, "little"))
+        self.target.write(data)
+
+    def write(self, data):
+        self.pending += data
+        # A full block stays pending until more follows: the last one says so.
+        while len(self.pending) > self.BLOCK:
+            self._block(self.pending[:self.BLOCK], 0)
+            del self.pending[:self.BLOCK]
+        return len(data)
+
+    def close(self):
+        self._block(self.pending, 1)
+        self.pending = bytearray()
+
+
 def pack(cache, output):
     """Canonical USTAR: manifest, cache metadata, NARInfos, then NAR payloads."""
     members = [cache / "manifest.json", cache / "nix-cache-info"]
@@ -61,34 +94,25 @@ def pack(cache, output):
     members += [cache / "nar"]
     members += sorted((cache / "nar").glob("*.nar.zst"))
     with output.open("xb") as target:
-        process = subprocess.Popen(["zstd", "-q", "-T1", "-10", "--long=27", "-c"],
-                                   stdin=subprocess.PIPE, stdout=target, stderr=subprocess.PIPE)
-        try:
-            with tarfile.open(fileobj=process.stdin, mode="w|", format=tarfile.USTAR_FORMAT) as archive:
-                for member in members:
-                    name = member.relative_to(cache).as_posix()
-                    if name == "nar":
-                        info = tarfile.TarInfo("nar/")
-                        info.type, info.mode = tarfile.DIRTYPE, 0o755
-                        archive.addfile(info)
-                        continue
-                    if len(name) > 100:
-                        API._fail("closure member cannot fit the canonical USTAR name field")
-                    info = tarfile.TarInfo(name)
-                    info.size = member.stat().st_size
-                    info.mode, info.uid, info.gid, info.mtime = 0o644, 0, 0, 0
-                    with member.open("rb") as source:
-                        archive.addfile(info, source)
-            process.stdin.close()
-            if process.wait() != 0:
-                API._fail("closure archive compression failed")
-            target.flush()
-            os.fsync(target.fileno())
-        finally:
-            if process.poll() is None:
-                process.kill()
-            process.wait()
-            process.stderr.close()
+        frame = RawFrame(target)
+        with tarfile.open(fileobj=frame, mode="w|", format=tarfile.USTAR_FORMAT) as archive:
+            for member in members:
+                name = member.relative_to(cache).as_posix()
+                if name == "nar":
+                    info = tarfile.TarInfo("nar/")
+                    info.type, info.mode = tarfile.DIRTYPE, 0o755
+                    archive.addfile(info)
+                    continue
+                if len(name) > 100:
+                    API._fail("closure member cannot fit the canonical USTAR name field")
+                info = tarfile.TarInfo(name)
+                info.size = member.stat().st_size
+                info.mode, info.uid, info.gid, info.mtime = 0o644, 0, 0, 0
+                with member.open("rb") as source:
+                    archive.addfile(info, source)
+        frame.close()
+        target.flush()
+        os.fsync(target.fileno())
 
 
 def main():
