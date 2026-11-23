@@ -118,7 +118,8 @@
       # retain the earlier fail-closed proof, then bypass only that dependency
       # so real packaged binaries can probe their actual HTTP and TFTP assets.
       machine.succeed("install -d -m0750 -o root -g tiaris-nest /var/lib/tiaris-nest/state")
-      machine.succeed("install -d -m0700 -o tiaris-nest -g tiaris-nest /var/lib/tiaris-nest/state/agent /var/lib/tiaris-nest/state/inbox /var/cache/tiaris-nest/agent/{home,cache,config,state,tmp} /var/cache/tiaris-nest/{build,build-outputs,www/cache}")
+      machine.succeed("install -d -m0700 -o tiaris-nest -g tiaris-nest /var/lib/tiaris-nest/state/agent /var/lib/tiaris-nest/state/inbox /var/cache/tiaris-nest/agent/{home,cache,config,state,tmp} /var/cache/tiaris-nest/{build,build-outputs}")
+      machine.succeed("install -d -m0755 -o tiaris-nest -g tiaris-nest /var/cache/tiaris-nest/www/cache")
       machine.succeed("install -d -m0755 -o root -g root /var/cache/tiaris-nest/tftp")
       machine.succeed("install -m0644 /usr/lib/ipxe/snponly.efi /var/cache/tiaris-nest/tftp/snponly.efi")
       machine.succeed("install -m0644 /usr/lib/ipxe/ipxe-amd64.efi /var/cache/tiaris-nest/tftp/ipxe.efi")

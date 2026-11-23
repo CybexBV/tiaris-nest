@@ -548,6 +548,10 @@ class PermissionLayout(unittest.TestCase):
             self.assertEqual((child.stat().st_uid, child.stat().st_gid, child.stat().st_mode & 0o777),
                              (self.uid, self.gid, 0o700))
         self.assertEqual((cache / 'www').stat().st_mode & 0o777, 0o755)
+        # nginx (another user) sends the cache members: it enters the cache root.
+        self.assertEqual((cache / 'www/cache').stat().st_mode & 0o777, 0o755)
+        for name in ('build', 'build-outputs'):
+            self.assertEqual((cache / name).stat().st_mode & 0o777, 0o750)
         self.assertEqual((cache / 'tftp').stat().st_mode & 0o777, 0o755)
 
     def test_public_runtime_and_source_directories_repair_only_owned_ordinary_paths(self):

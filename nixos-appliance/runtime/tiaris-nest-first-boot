@@ -62,7 +62,11 @@ def prepare_cache_directories(root=Path('/var/cache/tiaris-nest'), uid=UID, gid=
         directory(root / 'agent' / name, 0o700, uid, gid)
     directory(root / 'www', 0o755, uid, gid)
     directory(root / 'www/assets', 0o755, uid, gid)
-    for name in ('www/cache', 'build', 'build-outputs'):
+    # nginx sends the cache members as its own user (nginx.nix): it must be
+    # able to enter the cache root, as tmpfiles makes it. The members are
+    # public on the LAN already.
+    directory(root / 'www/cache', 0o755, uid, gid)
+    for name in ('build', 'build-outputs'):
         directory(root / name, 0o750, uid, gid)
     directory(root / 'tftp', 0o755, root_uid, root_gid)
 
