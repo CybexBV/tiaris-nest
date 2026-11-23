@@ -27,6 +27,11 @@ pub(crate) struct Fixture {
 }
 impl Fixture {
     pub(crate) fn new() -> Self {
+        Self::with(&[])
+    }
+    /// With more store paths, each a file the system refers to; their
+    /// hashes must sort after the source's (`1111…`).
+    pub(crate) fn with(extra: &[(&str, Vec<u8>)]) -> Self {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
             "../../protocol/fixtures/nest-appliance-v3.json"
         ))
@@ -42,10 +47,24 @@ impl Fixture {
         let mut rows = Vec::new();
         let mut infos = Vec::new();
         let mut payloads = Vec::new();
-        for (path, body, refs) in [
-            (top, nar("directory", b""), vec![source.into()]),
+        let mut paths = vec![
+            (
+                top,
+                nar("directory", b""),
+                [source]
+                    .iter()
+                    .chain(extra.iter().map(|(path, _)| path))
+                    .map(|path| path.to_string())
+                    .collect(),
+            ),
             (source, nar("regular", source_bytes), vec![]),
-        ] {
+        ];
+        paths.extend(
+            extra
+                .iter()
+                .map(|(path, contents)| (*path, nar("regular", contents), vec![])),
+        );
+        for (path, body, refs) in paths {
             let hash = &store_path(path).unwrap()[..32];
             let compressed = zstd::stream::encode_all(Cursor::new(&body), 3).unwrap();
             let entry = StorePath {

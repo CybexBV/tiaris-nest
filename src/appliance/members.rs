@@ -728,11 +728,14 @@ async fn at_most<'a, T>(
     results.into_iter().flatten().collect()
 }
 
+/// Written only at explicit places, never in append mode: on Linux a write
+/// at a place in a file opened to append lands at its end instead, so
+/// members fetched at once ended up in the order they arrived.
 fn open_partial(partial: &Path) -> Result<File> {
     let open = || {
         OpenOptions::new()
             .read(true)
-            .append(true)
+            .write(true)
             .create(true)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)

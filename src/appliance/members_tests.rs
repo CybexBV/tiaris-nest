@@ -93,42 +93,23 @@ async fn serve(
     let server = tokio::spawn(async move {
         loop {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            while !request.ends_with(b"\r\n\r\n") {
-                let mut buffer = [0; 1024];
-                let read = stream.read(&mut buffer).await.unwrap();
-                if read == 0 {
-                    break;
-                }
-                request.extend_from_slice(&buffer[..read]);
-            }
-            let request = String::from_utf8_lossy(&request).to_lowercase();
-            let range = request
-                .lines()
-                .find_map(|line| line.strip_prefix("range: bytes="))
-                .unwrap_or("")
-                .to_string();
+            let range = requested_range(&mut stream).await;
             log.lock().unwrap().push(range.clone());
-            let total = archive.len();
             let response = match range.split_once('-') {
                 Some((first, last)) if ranges => {
                     let (first, last): (usize, usize) =
                         (first.parse().unwrap(), last.parse().unwrap());
-                    let mut body = archive[first..=last].to_vec();
-                    let length = body.len();
+                    let length = last + 1 - first;
                     if first > 0 && !dropped.swap(true, Ordering::SeqCst) {
-                        body.truncate(length / 2);
+                        partial_content(&archive, first, last, length / 2)
+                    } else {
+                        partial_content(&archive, first, last, length)
                     }
-                    let mut head = format!(
-                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {first}-{last}/{total}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
-                    )
-                    .into_bytes();
-                    head.extend(body);
-                    head
                 }
                 _ => {
                     let mut head = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n"
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        archive.len()
                     )
                     .into_bytes();
                     head.extend(&archive);
@@ -139,6 +120,38 @@ async fn serve(
         }
     });
     (url, seen, server)
+}
+
+/// The byte range a request asks for (`first-last`), or "" for none.
+async fn requested_range(stream: &mut tokio::net::TcpStream) -> String {
+    let mut request = Vec::new();
+    while !request.ends_with(b"\r\n\r\n") {
+        let mut buffer = [0; 1024];
+        let read = stream.read(&mut buffer).await.unwrap();
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&buffer[..read]);
+    }
+    String::from_utf8_lossy(&request)
+        .to_lowercase()
+        .lines()
+        .find_map(|line| line.strip_prefix("range: bytes="))
+        .unwrap_or("")
+        .to_string()
+}
+
+/// A 206 answer for `archive[first..=last]` that sends only its first
+/// `sent` bytes.
+fn partial_content(archive: &[u8], first: usize, last: usize, sent: usize) -> Vec<u8> {
+    let mut answer = format!(
+        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {first}-{last}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        archive.len(),
+        last + 1 - first
+    )
+    .into_bytes();
+    answer.extend(&archive[first..first + sent]);
+    answer
 }
 
 fn temporary(name: &str) -> PathBuf {
@@ -315,6 +328,115 @@ async fn members_are_fetched_a_few_at_a_time() {
         .collect();
     assert_eq!(at_most(AT_ONCE, tasks).await, (0..10).collect::<Vec<_>>());
     assert_eq!(most.load(Ordering::SeqCst), AT_ONCE);
+}
+
+/// Serves ranges of `archive` like [`serve`], but holds the first `wave`
+/// requests and answers them last first, each once the client has read the
+/// one before and closed it: members fetched at once arrive in the reverse
+/// of their order.
+async fn serve_last_first(archive: Vec<u8>, wave: usize) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "http://{}/tiaris-nest-appliance-closure.tar.zst",
+        listener.local_addr().unwrap()
+    );
+    let server = tokio::spawn(async move {
+        let (mut held, mut wave) = (Vec::new(), wave);
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let range = requested_range(&mut stream).await;
+            let (first, last) = range.split_once('-').unwrap();
+            let (first, last): (usize, usize) = (first.parse().unwrap(), last.parse().unwrap());
+            held.push((first, last, stream));
+            if held.len() < wave {
+                continue;
+            }
+            wave = 1;
+            held.sort_by_key(|(first, _, _)| std::cmp::Reverse(*first));
+            for (first, last, mut stream) in held.drain(..) {
+                let answer = partial_content(&archive, first, last, last + 1 - first);
+                let _ = stream.write_all(&answer).await;
+                let _ = stream.read(&mut [0; 1]).await;
+            }
+        }
+    });
+    (url, server)
+}
+
+/// Members fetched at once each land in their own place, whatever order
+/// their bytes arrive in (0.2.183-dev.2: the staged stream was opened to
+/// append, so they landed in the order they arrived and the update took the
+/// whole archive). The archive has the real shape: payloads crossing 128 KiB
+/// blocks, with the members the running system holds between the missing.
+#[tokio::test]
+async fn members_fetched_at_once_land_in_their_places() {
+    // Incompressible, so each payload crosses a block.
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    let mut noise = |bytes: usize| -> Vec<u8> {
+        (0..bytes)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect()
+    };
+    let paths: Vec<String> = (2..8)
+        .map(|digit| format!("/nix/store/{}-member", digit.to_string().repeat(32)))
+        .collect();
+    let extra: Vec<(&str, Vec<u8>)> = paths
+        .iter()
+        .zip(0..)
+        .map(|(path, index)| (path.as_str(), noise(150_000 + index * 20_000)))
+        .collect();
+    let mut fixture = Fixture::with(&extra);
+    let tar = fixture.tar();
+    let archive = raw_frame(&tar);
+    fixture.bind(&archive);
+    let key = fixture.key.verifying_key();
+    let manifest = fixture.verify(&archive).unwrap();
+    // The system and every other store path after it are missing.
+    let present: Present = manifest
+        .store_paths
+        .iter()
+        .skip(1)
+        .step_by(2)
+        .map(|path| (path.path.clone(), path.nar_hash.clone()))
+        .collect();
+    let (url, _, server) = serve(archive.clone(), true, false).await;
+    let inbox = temporary("tiaris-members-at-once");
+    let mut plan = plan(&fixture.release, &key, &url, true, &inbox, &present)
+        .await
+        .unwrap()
+        .unwrap();
+    server.abort();
+    assert_eq!(plan.members(), 4);
+    let (url, server) = serve_last_first(archive, plan.members().min(AT_ONCE)).await;
+    plan.source.url = url;
+    let target = inbox.join("attempt.members.tar");
+    tokio::time::timeout(Duration::from_secs(30), stage(&plan, &target))
+        .await
+        .expect("the members were fetched at once")
+        .unwrap();
+    server.abort();
+    // The archive's tar stream without the payloads the system holds.
+    let held: Vec<String> = present
+        .keys()
+        .map(|path| format!("nar/{}.nar.zst", &path[11..43]))
+        .collect();
+    let mut expected = Vec::new();
+    for entry in tar::Archive::new(&tar[..]).entries().unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.path().unwrap().to_string_lossy().into_owned();
+        if !held.contains(&name) {
+            let start = entry.raw_header_position() as usize;
+            expected.extend(&tar[start..start + 512 + entry.size().div_ceil(512) as usize * 512]);
+        }
+    }
+    expected.extend([0; 1024]);
+    assert_eq!(fs::read(&target).unwrap(), expected);
+    fs::remove_dir_all(inbox).unwrap();
 }
 
 /// An install leaves out only members whose whole closure it leaves out:
