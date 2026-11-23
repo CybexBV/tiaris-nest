@@ -61,7 +61,7 @@ impl Layout {
     fn block_header(self, index: u64) -> [u8; 3] {
         let size = (self.tar_bytes - index * BLOCK).min(BLOCK);
         let last = u64::from(index + 1 == self.tar_bytes.div_ceil(BLOCK));
-        let value = (size << 3 | last).to_le_bytes();
+        let value = ((size << 3) | last).to_le_bytes();
         [value[0], value[1], value[2]]
     }
 }

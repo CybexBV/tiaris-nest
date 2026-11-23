@@ -17,7 +17,7 @@ fn raw_frame(tar: &[u8]) -> Vec<u8> {
     let blocks = tar.len().div_ceil(BLOCK as usize);
     for (index, chunk) in tar.chunks(BLOCK as usize).enumerate() {
         let last = u32::from(index + 1 == blocks);
-        out.extend(&((chunk.len() as u32) << 3 | last).to_le_bytes()[..3]);
+        out.extend(&(((chunk.len() as u32) << 3) | last).to_le_bytes()[..3]);
         out.extend(chunk);
     }
     out
