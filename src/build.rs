@@ -49,6 +49,15 @@ pub(crate) const BUILTIN_NIXOS_RELEASE: &str = "26.05";
 /// be newer.
 pub(crate) const BUILTIN_LAST_MODIFIED: i64 = 1_783_549_019;
 
+/// Wakes the idle build workers: a sync brought a queued job.
+static NEW_WORK: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// A job was queued: idle workers claim it now instead of at their next
+/// look (every 2 s).
+pub fn wake_workers() {
+    NEW_WORK.notify_waiters();
+}
+
 const BLUEPRINT_BUILD_INPUT_KIND: &str = "blueprint_nixos_module";
 const LEGACY_DESKTOP_EXPERIENCE_BUILD_INPUT_KIND: &str = "desktop_experience_nixos_module";
 const INSTALLER_TARGET_BUILD_INPUT_KIND: &str = "installer_target_nixos_module";
@@ -331,7 +340,10 @@ async fn worker_loop(state: AppState, worker_index: usize) {
                 drop(_maintenance_lease);
                 drop(_memory_lease);
                 claim_failures = 0;
-                sleep(Duration::from_secs(2)).await;
+                tokio::select! {
+                    () = sleep(Duration::from_secs(2)) => {}
+                    () = NEW_WORK.notified() => {}
+                }
             }
             Err(err) => {
                 drop(_maintenance_lease);

@@ -802,6 +802,9 @@ static BUILD_WORK_PROBE: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 const BUILD_WORK_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 /// Wakes the sync loop: a build ended, so Manage hears of it at once.
 static SYNC_NOW: tokio::sync::Notify = tokio::sync::Notify::const_new();
+/// The appliance update attempt the last configuration handed over. A probe
+/// that names another one syncs at once (`new_build_work`).
+static KNOWN_APPLIANCE_UPDATE: std::sync::Mutex<Option<Uuid>> = std::sync::Mutex::new(None);
 
 /// Sync with Manage now instead of at the next interval. A request while a
 /// sync runs makes the next one start right after it.
@@ -904,20 +907,24 @@ async fn wait_for_next_sync<F, Fut>(
     }
 }
 
-/// Whether Manage names a queued build job this Nest does not have yet. An
+/// Whether Manage names a queued build job this Nest does not have yet, or
+/// an appliance update its last configuration did not hand over. An
 /// unanswered question is no work: the regular sync still comes.
 async fn new_build_work(state: &AppState) -> bool {
     // A question that hangs never holds back the regular sync for long.
-    let queued =
+    let work =
         match tokio::time::timeout(BUILD_WORK_PROBE_INTERVAL, probe_build_work(state)).await {
-            Ok(Ok(queued)) => queued,
+            Ok(Ok(work)) => work,
             Ok(Err(error)) => {
                 debug!(error = %safe_error(&error), "could not ask Tiaris for queued build work");
                 return false;
             }
             Err(_) => return false,
         };
-    match db::has_unknown_managed_build_job(&state.db, &queued).await {
+    if new_appliance_update(work.appliance_update_attempt_id) {
+        return true;
+    }
+    match db::has_unknown_managed_build_job(&state.db, &work.queued_build_job_ids).await {
         Ok(unknown) => unknown,
         Err(error) => {
             warn!(error = %error, "could not compare queued build work with this Nest's builds");
@@ -926,12 +933,25 @@ async fn new_build_work(state: &AppState) -> bool {
     }
 }
 
+/// Whether the probe names an appliance update the last configuration did
+/// not hand over (a Manage before 0.2.183's names none).
+fn new_appliance_update(named: Option<Uuid>) -> bool {
+    named.is_some()
+        && named
+            != *KNOWN_APPLIANCE_UPDATE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[derive(Debug, Deserialize)]
 struct BuildWorkResponse {
     queued_build_job_ids: Vec<String>,
+    /// The appliance update attempt Manage's configuration hands over.
+    #[serde(default)]
+    appliance_update_attempt_id: Option<Uuid>,
 }
 
-async fn probe_build_work(state: &AppState) -> Result<Vec<String>> {
+async fn probe_build_work(state: &AppState) -> Result<BuildWorkResponse> {
     let managed = load_managed_state(state)?;
     let device_id = managed_device_id(&managed)?;
     let path = format!("/v1/agent/devices/{device_id}/nest/build-work");
@@ -944,7 +964,7 @@ async fn probe_build_work(state: &AppState) -> Result<Vec<String>> {
     if work.queued_build_job_ids.len() > MAX_MANAGED_BUILD_JOBS {
         bail!("Tiaris named more than {MAX_MANAGED_BUILD_JOBS} queued build jobs");
     }
-    Ok(work.queued_build_job_ids)
+    Ok(work)
 }
 
 pub async fn sync_once(state: &AppState) -> Result<SyncOnceReport> {
@@ -1439,6 +1459,10 @@ async fn apply_nest_desired(
     {
         retain_sync_failure(first_failure, "appliance update schedule", error);
     }
+    *KNOWN_APPLIANCE_UPDATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        desired.appliance_update.as_ref().map(|update| update.attempt_id);
     if let Some(update) = desired.appliance_update {
         // Queued first: the update waits for it before the restart.
         if let Some(prepare) = desired.workstation_netboot_prepare {
