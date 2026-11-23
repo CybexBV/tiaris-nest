@@ -235,6 +235,10 @@ struct AgentNestConfigResponse {
     update_schedule: Option<Value>,
     #[serde(default)]
     workstation_netboot: Option<Value>,
+    /// The runtime of the `appliance_update` release, to prepare before the
+    /// restart (`netboot::prepare`); an older Manage sends none.
+    #[serde(default)]
+    workstation_netboot_prepare: Option<Value>,
     #[serde(default)]
     software_cache: Option<Value>,
     /// Manage accepts `software_cache_upload_v1` in reports; until it says
@@ -1436,6 +1440,11 @@ async fn apply_nest_desired(
         retain_sync_failure(first_failure, "appliance update schedule", error);
     }
     if let Some(update) = desired.appliance_update {
+        // Queued first: the update waits for it before the restart.
+        if let Some(prepare) = desired.workstation_netboot_prepare {
+            let crate::appliance::release_v3::ReleaseDescriptor::Nixos(release) = &update.release;
+            crate::netboot::prepare::queue(state, prepare, &release.release_id);
+        }
         if !crate::appliance::nixos::queue(update) {
             debug!("coalesced the latest appliance update behind the in-flight download");
         }

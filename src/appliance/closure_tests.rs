@@ -20,13 +20,13 @@ fn nar(kind: &str, contents: &[u8]) -> Vec<u8> {
     token(b")", &mut out);
     out
 }
-struct Fixture {
-    key: SigningKey,
-    release: NixosRelease,
-    members: Vec<(String, Vec<u8>)>,
+pub(crate) struct Fixture {
+    pub(crate) key: SigningKey,
+    pub(crate) release: NixosRelease,
+    pub(crate) members: Vec<(String, Vec<u8>)>,
 }
 impl Fixture {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
             "../../protocol/fixtures/nest-appliance-v3.json"
         ))
@@ -129,6 +129,14 @@ impl Fixture {
         }
     }
     fn archive(&mut self, modify: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+        let mut tar = self.tar();
+        modify(&mut tar);
+        let bytes = zstd::stream::encode_all(Cursor::new(tar), 3).unwrap();
+        self.bind(&bytes);
+        bytes
+    }
+    /// The archive's tar stream.
+    pub(crate) fn tar(&self) -> Vec<u8> {
         let mut tar = Vec::new();
         {
             let mut builder = tar::Builder::new(&mut tar);
@@ -150,12 +158,9 @@ impl Fixture {
             }
             builder.finish().unwrap();
         }
-        modify(&mut tar);
-        let bytes = zstd::stream::encode_all(Cursor::new(tar), 3).unwrap();
-        self.bind(&bytes);
-        bytes
+        tar
     }
-    fn bind(&mut self, bytes: &[u8]) {
+    pub(crate) fn bind(&mut self, bytes: &[u8]) {
         self.release.system_closure.size_bytes = bytes.len() as u64;
         self.release.system_closure.sha256 = hex::encode(Sha256::digest(bytes));
         self.release.signature = STANDARD.encode(
@@ -164,7 +169,7 @@ impl Fixture {
                 .to_bytes(),
         );
     }
-    fn verify(&self, bytes: &[u8]) -> Result<ClosureManifest> {
+    pub(crate) fn verify(&self, bytes: &[u8]) -> Result<ClosureManifest> {
         let dir = std::env::temp_dir().join(format!("nest-closure-test-{}", Uuid::new_v4()));
         fs::create_dir(&dir)?;
         let path = dir.join("closure.tar.zst");
@@ -189,7 +194,7 @@ impl Fixture {
         )
     }
 }
-fn files(root: &Path) -> BTreeMap<String, Vec<u8>> {
+pub(crate) fn files(root: &Path) -> BTreeMap<String, Vec<u8>> {
     let mut found = BTreeMap::new();
     for directory in [root.to_path_buf(), root.join("nar")] {
         for entry in fs::read_dir(directory).unwrap() {
@@ -293,6 +298,12 @@ fn python_packer_archive_verifies_and_extracts_in_rust() {
         .unwrap();
     assert!(status.success());
     let bytes = fs::read(&packed).unwrap();
+    // Raw blocks where an update by store path looks for them.
+    let tar = zstd::stream::decode_all(&bytes[..]).unwrap();
+    assert_eq!(
+        super::super::members::Layout::of(bytes.len() as u64).map(|layout| layout.tar_bytes),
+        Some(tar.len() as u64)
+    );
     fixture.bind(&bytes);
     let extracted = root.join("verified");
     let verified = fixture.open(&packed, Some(&extracted), |_, _| Ok(()));

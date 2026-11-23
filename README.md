@@ -51,7 +51,11 @@ IPv4 and, with a global IPv6 route, also IPv6, and shows four letters and a
 full code (`KX-4821-QM`) on its screen. An administrator claims it in the
 Console; Tiaris then hands over the session's signed envelope. The bootstrap
 verifies those bytes exactly as it verifies a filled slot and runs the existing flow: session claim, disk approval,
-installation. The envelope is kept in `/run` until STATE exists and on STATE
+installation. While the setup waits for approval, the ISO downloads the signed
+closure the session pinned (Tiaris's `closure_offer`) into RAM, when it fits the
+install's own memory limit; approval then waits for that download and verifies
+the archive once (`src/provisioning/closure_prefetch.rs`). Nothing touches the
+disk before approval. The envelope is kept in `/run` until STATE exists and on STATE
 (`.setup-claim-envelope.bin`, root 0600) from then
 on, so resuming after a power cut never needs the ISO. Booted on a server
 that already holds an installed Nest (a completed installation with that
@@ -197,6 +201,17 @@ background task, so downloads and import failures do not delay Build, Cache,
 appliance reporting, or managed heartbeats. Nest keeps serving its verified
 active runtime while a newer candidate is retried; the candidate import state
 and current service availability are intentionally separate signals in Tiaris.
+
+A runtime belongs to the appliance release it was published with, and Tiaris
+selects it only after the Nest reports that release. With an appliance update
+Tiaris also sends `workstation_netboot_prepare`, the signed runtime of exactly
+that release: the same worker downloads, hashes, extracts and checks it after
+the runtime in use and keeps it as an unused verified bundle (no progress
+shown for it, no watermark moved, never served). The update hands its request
+to the updater only once that ended (at most 30 minutes; a failure lets the
+update go ahead as before), so after the restart the Nest promotes the
+prepared runtime at once instead of downloading 1.3 GB. A Nest that rolls back
+is never told to use it (`src/netboot_prepare.rs`).
 
 Nest also advertises `workstation_netboot_transport_v1` for explicitly allowlisted
 offline qualification fixtures. Its optional unsigned `bundle_transport_url` changes
