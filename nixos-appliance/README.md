@@ -46,11 +46,13 @@ customer configuration and private workstation cache keys are created at runtime
 Activation installs `/usr/share/tiaris-nest/workstation-cache-seeds.json`, the
 sorted store paths of `services.tiaris-nest.workstationCacheSeeds`. The same list
 is the system's `extraDependencies`, so the closure carries every seed the daemon
-publishes into the Nest cache.
+publishes into the Nest cache. A `debug` output is no seed: no workstation installs
+it (the agent's was 42 MiB of every release and update).
 
 The exact Tiaris source archive and digest metadata are embedded as immutable
 store paths and exposed at `/usr/share/tiaris-nest/manage-source/<revision>.tar`
-and `.json`. Activation verifies signed identity and makes atomic fsynced
+and `.json`. The archive is in the closure once (`tiaris-manage-<revision>.tar`,
+the manifest's `manage_source`); the metadata directory links to it. Activation verifies signed identity and makes atomic fsynced
 root-owned 0444 single-link copies in an ordinary root-owned 0755 directory.
 Store directories are 0555 and optimized files may be hardlinked, so a directory
 symlink or direct bind fails existing verification. Retain bounded secure reopening;
@@ -193,9 +195,11 @@ its tar stream as it is, because every payload is a zstd NAR already (compressin
 again saved 1 %). Every decoder reads it as before, and each tar byte sits at a
 fixed place in the archive. So a Nest update fetches only the store paths the
 running system lacks (`src/appliance/members.rs`; 35 of 1149 members, 118 MiB of
-1.69 GiB from 0.2.181 to 0.2.182): the metadata at the archive's start and each
-missing member's bytes with HTTP Range from the signed archive URL; a dropped
-connection costs the member it was fetching. Without the archive's hash, what it
+1.69 GiB from 0.2.181 to 0.2.182, about 51 MiB once a release carries its Tiaris
+source once and no agent debug output): the metadata at the archive's start (1 MiB,
+then the rest as the manifest sizes it) and each missing member's bytes with HTTP
+Range from the signed archive URL, four members at a time, each into its own place
+in the staged stream; a dropped connection costs the members it was fetching. Without the archive's hash, what it
 uses is held to signatures: the manifest's identity fields to the signed
 descriptor, every store path with its NAR hash, size and references to its NARInfo
 signed with the release key, the set to the exact graph of the signed toplevel,
@@ -203,10 +207,18 @@ each fetched NAR to its signed hash. The daemon stages the metadata and those
 payloads as one archive-shaped tar stream (`<attempt>.members.tar` in the inbox).
 Root reads it once, verifying what it copies into its private cache
 (`closure::verify_staged`), and requires each member it leaves out in the closure
-of `/run/current-system` with the signed NAR hash. The full archive stays the way
-for installations, for an archive packed before this layout, when more than half
-of its members are new, and when the server does not answer byte ranges or sends
-bytes that do not verify.
+of `/run/current-system` with the signed NAR hash. Setup from the ISO does the same
+with the ISO's own store (`nixos_install::stage_members`; 571 of 1149 members,
+1,186 of 1,727 MiB for 0.2.182-dev.1): it leaves out only members whose whole
+closure (the signed reference graph) the ISO holds, fetches the rest into RAM,
+verifies them once before the disk is touched, puts the release's signatures from
+the verified NARInfos onto the ISO's paths (`nix store copy-sigs`: only for the same
+NAR hash, size and references), copies those into the target store with the release
+key required (Nix hashes every NAR as it copies it) and then the rest from the
+verified cache the same way.
+The full archive stays the way for an archive packed before this layout, when more
+than half of its members and of its bytes are new, and when the server does not
+answer byte ranges or sends bytes that do not verify.
 
 `manifest.json` is canonical recursively key-sorted compact UTF-8 JSON plus LF,
 schema `tiaris.nest.system-closure.v1`. It contains descriptor identity fields,

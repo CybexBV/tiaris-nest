@@ -7,13 +7,15 @@
   services.tiaris-nest = {
     enable = true;
     inherit appliance;
-    # Keep the exact workstation agent (every output) and the Blueprint custom
-    # outputs as cache seeds without starting the agent service on Nest. The
-    # signed system closure exports only reachable paths; the module keeps
-    # these in the closure and lists them for the daemon to publish into its
-    # binary cache.
+    # Keep the exact workstation agent and the Blueprint custom outputs as
+    # cache seeds without starting the agent service on Nest. The signed
+    # system closure exports only reachable paths; the module keeps these in
+    # the closure and lists them for the daemon to publish into its binary
+    # cache. Not the agent's `debug` output: no workstation installs it, and
+    # it was 42 MiB of every release and update.
     workstationCacheSeeds =
-      map (output: lib.getOutput output appliance.workstationAgent) (appliance.workstationAgent.outputs or [ "out" ])
+      map (output: lib.getOutput output appliance.workstationAgent)
+        (lib.remove "debug" (appliance.workstationAgent.outputs or [ "out" ]))
       ++ appliance.workstationCacheSeeds.packages;
   };
   networking.hostName = "tiaris-nest";

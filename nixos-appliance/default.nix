@@ -35,13 +35,17 @@ let
     mkdir -p $out
     python3 ${./metadata.py} migrations ${../migrations} $out/sqlite-migrations.json
   '';
+  # The source's metadata beside a link to the one embedded source archive
+  # (`archiveInput`, the manifest's `manage_source`): a copy would ship the
+  # same 72 MiB twice in every release. First boot copies both into
+  # /usr/share/tiaris-nest/manage-source (runtime/source-copy.py).
   sourceArchive = pkgs.runCommand "tiaris-nest-manage-source-${manageSourceRevision}" {
     nativeBuildInputs = [ pkgs.python3 ];
   } ''
     mkdir -p $out
-    cp ${archiveInput} $out/${manageSourceRevision}.tar
+    ln -s ${archiveInput} $out/${manageSourceRevision}.tar
     python3 ${./metadata.py} source $out/${manageSourceRevision}.tar ${manageSourceRevision} $out/${manageSourceRevision}.json
-    chmod 0444 $out/*
+    chmod 0444 $out/${manageSourceRevision}.json
   '';
   # The offline production fixture builds the workstation target from this
   # exact Manage revision. Seed its agent output in the signed appliance cache

@@ -18,7 +18,7 @@ let
   incusLoader = installed.virtualisation.incus.package.agent_loader;
   seedManifest = installed.services.tiaris-nest.workstationCacheSeedManifest;
   expectedSeedPaths = lib.sort builtins.lessThan (map toString
-    ([ workstationAgent.out workstationAgent.debug ] ++ appliance.workstationCacheSeeds.packages));
+    ([ workstationAgent.out ] ++ appliance.workstationCacheSeeds.packages));
   extraDependencyPaths = map toString installed.system.extraDependencies;
   checks = {
     installedGuestAgentEnabled = installed.services.qemuGuest.enable;
@@ -54,8 +54,9 @@ let
       && builtins.all (user: user == "root") installed.nix.settings.trusted-users
       && builtins.elem "tiaris-nest-appliance-1:${appliance.releasePublicKey}" installed.nix.settings.trusted-public-keys;
     stateVersionPreserved = installed.system.stateVersion == "26.05";
+    # Its debug output is no seed: no workstation installs it.
     workstationAgentRemainsCacheSeed = builtins.elem appliance.workstationAgent installed.system.extraDependencies
-      && builtins.elem workstationAgent.debug installed.system.extraDependencies;
+      && !builtins.elem workstationAgent.debug installed.system.extraDependencies;
     workstationCustomOutputsRemainCacheSeeds = builtins.all
       (package: builtins.elem package installed.system.extraDependencies)
       appliance.workstationCacheSeeds.packages;

@@ -1,6 +1,8 @@
 //! While an administrator reviews a claimed Nest, the ISO downloads the
 //! signed closure its setup will install into RAM, so approval starts from a
-//! finished or partly finished download instead of from nothing.
+//! finished or partly finished download instead of from nothing: only the
+//! members the ISO does not carry when the archive allows it
+//! (`nixos_install::stage_members`), else the whole archive.
 //!
 //! Tiaris offers the release the session pinned at the claim
 //! (`closure_offer`), the one its approved plan carries too. The download
@@ -23,8 +25,12 @@ use serde_json::Value;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use super::{SignedInstallPlan, nixos_install, setup_status::SetupStatusReporter};
-use crate::appliance::{closure::AuthenticatedArchive, nixos, release_v3::ReleaseDescriptor};
+use super::{
+    SignedInstallPlan,
+    nixos_install::{self, Prefetched},
+    setup_status::SetupStatusReporter,
+};
+use crate::appliance::{nixos, release_v3::ReleaseDescriptor};
 
 #[derive(Deserialize)]
 struct ClosureOffer {
@@ -36,7 +42,7 @@ struct Download {
     closure_sha256: String,
     /// Bytes received and the signed total, shown once the plan is approved.
     progress: Arc<(AtomicU64, AtomicU64)>,
-    task: JoinHandle<Result<AuthenticatedArchive>>,
+    task: JoinHandle<Result<Prefetched>>,
 }
 
 pub(super) struct ClosurePrefetch {
@@ -79,19 +85,24 @@ impl ClosurePrefetch {
             release.release_id == self.release_version,
             "the offered release is not the one this setup installs"
         );
-        release.verify_file(&self.key_path)?;
+        let key = release.verify_file(&self.key_path)?;
         let transport = offer.package_transport_url;
         nixos_install::validate_closure_transport(&transport, &release.system_closure)?;
         let available = nixos_install::ram_staging()?;
         if nixos_install::archive_staged() {
             return Ok(None);
         }
-        nixos_install::ensure_ram_budget(&release, available)?;
         info!(release = %release.release_id, "downloading the closure while the setup waits for approval");
         let progress = Arc::new((AtomicU64::new(0), AtomicU64::new(0)));
         let shown = progress.clone();
         let closure_sha256 = release.system_closure.sha256.clone();
         let task = tokio::spawn(async move {
+            if let Some(members) =
+                nixos_install::stage_members(&release, &key, &transport, available).await?
+            {
+                return Ok(Prefetched::Members(members));
+            }
+            nixos_install::ensure_ram_budget(&release, available)?;
             nixos::download_with_progress(
                 &release,
                 &transport,
@@ -103,6 +114,7 @@ impl ClosurePrefetch {
                 },
             )
             .await
+            .map(Prefetched::Archive)
         });
         Ok(Some(Download {
             closure_sha256,
@@ -120,7 +132,7 @@ impl ClosurePrefetch {
         &mut self,
         plan: &SignedInstallPlan,
         status: &SetupStatusReporter,
-    ) -> Option<AuthenticatedArchive> {
+    ) -> Option<Prefetched> {
         let mut download = self.download.take()?;
         let approved = plan
             .appliance_release
@@ -162,7 +174,7 @@ mod tests {
     use super::*;
     use crate::provisioning::protocol::tests::signed_plan_fixture;
 
-    fn download(closure_sha256: &str, task: JoinHandle<Result<AuthenticatedArchive>>) -> Download {
+    fn download(closure_sha256: &str, task: JoinHandle<Result<Prefetched>>) -> Download {
         Download {
             closure_sha256: closure_sha256.to_string(),
             progress: Arc::new((AtomicU64::new(0), AtomicU64::new(0))),
@@ -180,7 +192,7 @@ mod tests {
         let status = SetupStatusReporter::new(None);
         let mut prefetch = ClosurePrefetch::new(Path::new("/nonexistent"), "1.2.3");
 
-        let other = tokio::spawn(std::future::pending::<Result<AuthenticatedArchive>>());
+        let other = tokio::spawn(std::future::pending::<Result<Prefetched>>());
         let stopped = other.abort_handle();
         prefetch.download = Some(download(&"0".repeat(64), other));
         assert!(prefetch.hand_over(&plan, &status).await.is_none());

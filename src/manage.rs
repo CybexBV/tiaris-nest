@@ -43,6 +43,7 @@ use crate::{
 };
 
 mod compact_report;
+mod findings_ack;
 
 const CAPABILITY_BOOT_V1: &str = "boot_v1";
 const CAPABILITY_BUILDER_V1: &str = "builder_v1";
@@ -288,6 +289,9 @@ struct NestReportResponse {
     cache_evidence_required: Option<Value>,
     #[serde(default)]
     build_jobs_settled: Option<Value>,
+    /// The findings digest Manage holds (`findings_ack`).
+    #[serde(default)]
+    software_update_findings_acknowledged: Option<Value>,
 }
 
 #[derive(Debug, Default)]
@@ -597,6 +601,10 @@ struct NestAgentReportRequest {
     /// its App List packages at the candidate's commit.
     #[serde(skip_serializing_if = "Option::is_none")]
     software_update_findings: Option<Vec<crate::software_updates::findings::FindingReport>>,
+    /// The SHA-256 of the findings lane, also when it is left out because
+    /// Manage acknowledged it (`findings_ack`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    software_update_findings_sha256: Option<String>,
     /// To a Manage that accepts `site_check_v1`: the latest site check.
     #[serde(skip_serializing_if = "Option::is_none")]
     site_check: Option<crate::site_check::Report>,
@@ -802,6 +810,9 @@ static BUILD_WORK_PROBE: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 const BUILD_WORK_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 /// Wakes the sync loop: a build ended, so Manage hears of it at once.
 static SYNC_NOW: tokio::sync::Notify = tokio::sync::Notify::const_new();
+/// The appliance update attempt the last configuration handed over. A probe
+/// that names another one syncs at once (`new_build_work`).
+static KNOWN_APPLIANCE_UPDATE: std::sync::Mutex<Option<Uuid>> = std::sync::Mutex::new(None);
 
 /// Sync with Manage now instead of at the next interval. A request while a
 /// sync runs makes the next one start right after it.
@@ -904,20 +915,24 @@ async fn wait_for_next_sync<F, Fut>(
     }
 }
 
-/// Whether Manage names a queued build job this Nest does not have yet. An
+/// Whether Manage names a queued build job this Nest does not have yet, or
+/// an appliance update its last configuration did not hand over. An
 /// unanswered question is no work: the regular sync still comes.
 async fn new_build_work(state: &AppState) -> bool {
     // A question that hangs never holds back the regular sync for long.
-    let queued =
-        match tokio::time::timeout(BUILD_WORK_PROBE_INTERVAL, probe_build_work(state)).await {
-            Ok(Ok(queued)) => queued,
-            Ok(Err(error)) => {
-                debug!(error = %safe_error(&error), "could not ask Tiaris for queued build work");
-                return false;
-            }
-            Err(_) => return false,
-        };
-    match db::has_unknown_managed_build_job(&state.db, &queued).await {
+    let work = match tokio::time::timeout(BUILD_WORK_PROBE_INTERVAL, probe_build_work(state)).await
+    {
+        Ok(Ok(work)) => work,
+        Ok(Err(error)) => {
+            debug!(error = %safe_error(&error), "could not ask Tiaris for queued build work");
+            return false;
+        }
+        Err(_) => return false,
+    };
+    if new_appliance_update(work.appliance_update_attempt_id) {
+        return true;
+    }
+    match db::has_unknown_managed_build_job(&state.db, &work.queued_build_job_ids).await {
         Ok(unknown) => unknown,
         Err(error) => {
             warn!(error = %error, "could not compare queued build work with this Nest's builds");
@@ -926,12 +941,25 @@ async fn new_build_work(state: &AppState) -> bool {
     }
 }
 
+/// Whether the probe names an appliance update the last configuration did
+/// not hand over (a Manage before 0.2.183's names none).
+fn new_appliance_update(named: Option<Uuid>) -> bool {
+    named.is_some()
+        && named
+            != *KNOWN_APPLIANCE_UPDATE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[derive(Debug, Deserialize)]
 struct BuildWorkResponse {
     queued_build_job_ids: Vec<String>,
+    /// The appliance update attempt Manage's configuration hands over.
+    #[serde(default)]
+    appliance_update_attempt_id: Option<Uuid>,
 }
 
-async fn probe_build_work(state: &AppState) -> Result<Vec<String>> {
+async fn probe_build_work(state: &AppState) -> Result<BuildWorkResponse> {
     let managed = load_managed_state(state)?;
     let device_id = managed_device_id(&managed)?;
     let path = format!("/v1/agent/devices/{device_id}/nest/build-work");
@@ -944,7 +972,7 @@ async fn probe_build_work(state: &AppState) -> Result<Vec<String>> {
     if work.queued_build_job_ids.len() > MAX_MANAGED_BUILD_JOBS {
         bail!("Tiaris named more than {MAX_MANAGED_BUILD_JOBS} queued build jobs");
     }
-    Ok(work.queued_build_job_ids)
+    Ok(work)
 }
 
 pub async fn sync_once(state: &AppState) -> Result<SyncOnceReport> {
@@ -1439,6 +1467,12 @@ async fn apply_nest_desired(
     {
         retain_sync_failure(first_failure, "appliance update schedule", error);
     }
+    *KNOWN_APPLIANCE_UPDATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = desired
+        .appliance_update
+        .as_ref()
+        .map(|update| update.attempt_id);
     if let Some(update) = desired.appliance_update {
         // Queued first: the update waits for it before the restart.
         if let Some(prepare) = desired.workstation_netboot_prepare {
@@ -1448,6 +1482,8 @@ async fn apply_nest_desired(
         if !crate::appliance::nixos::queue(update) {
             debug!("coalesced the latest appliance update behind the in-flight download");
         }
+    } else if let Err(error) = crate::appliance::nixos::discard_abandoned_partials() {
+        debug!(error = %error, "could not remove abandoned appliance update downloads");
     }
 
     let build_count_valid = desired.build_jobs.len() <= MAX_MANAGED_BUILD_JOBS;
@@ -1485,7 +1521,10 @@ async fn apply_nest_desired(
             )
             .await;
             match sync {
-                Ok(_) => {
+                Ok(stored) => {
+                    if stored.status == "queued" {
+                        crate::build::wake_workers();
+                    }
                     if let Err(error) = crate::software_updates::findings::record_hint(
                         &state.config.paths.data_dir,
                         &job.id,
@@ -1846,6 +1885,8 @@ async fn report_nest_state(
             None,
         )
     };
+    let (software_update_findings, software_update_findings_sha256) =
+        findings_ack::lane(software_update_findings);
     let body = NestAgentReportRequest {
         protocol_version: report_protocol,
         capabilities: nest_capabilities(peer_supports_scheduling, peer_support),
@@ -1865,6 +1906,7 @@ async fn report_nest_state(
         detected_nixpkgs_commits,
         software_update_checked_at,
         software_update_findings,
+        software_update_findings_sha256,
         site_check: peer_support
             .site_check
             .then(|| crate::site_check::report(&state.config.paths.data_dir))
@@ -1918,6 +1960,14 @@ fn accept_nest_report_response(
     if let Some(compact_refresh) = compact_refresh {
         compact_report::record(managed, body, compact_refresh, response);
     }
+    findings_ack::record(
+        body.software_update_findings.is_some(),
+        body.software_update_findings_sha256.as_deref(),
+        response
+            .software_update_findings_acknowledged
+            .as_ref()
+            .and_then(Value::as_str),
+    );
     log_nest_report_warnings(&response.warnings, managed);
     validate_workstation_netboot_report_receipt(response)
 }
@@ -6913,6 +6963,7 @@ mod tests {
             detected_nixpkgs_commits: None,
             software_update_checked_at: None,
             software_update_findings: None,
+            software_update_findings_sha256: None,
             site_check: None,
         }
     }

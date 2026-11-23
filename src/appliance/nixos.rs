@@ -552,16 +552,45 @@ fn discard_other_partials(partial: &Path) -> Result<()> {
     let directory = partial
         .parent()
         .ok_or_else(|| anyhow!("closure partial download has no directory"))?;
+    discard_partials(directory, |path, _| path != partial)
+}
+
+/// How long a partial download stays in the inbox while Tiaris offers no
+/// update: an attempt it hands again within this continues it.
+const ABANDONED_PARTIAL: Duration = Duration::from_secs(2 * 24 * 60 * 60);
+
+/// Remove the partial downloads nothing wrote to for [`ABANDONED_PARTIAL`],
+/// while Tiaris offers no appliance update: the attempt that left them
+/// ended, and each can be 1.7 GB. Never while a download runs.
+pub fn discard_abandoned_partials() -> Result<()> {
+    if !is_nixos() {
+        return Ok(());
+    }
+    let Ok(queue) = QUEUE.lock() else {
+        return Ok(());
+    };
+    if queue.0 {
+        return Ok(());
+    }
+    let cutoff = std::time::SystemTime::now() - ABANDONED_PARTIAL;
+    discard_partials(Path::new(UPDATE_BUNDLE_ROOT), |_, modified| {
+        modified < cutoff
+    })
+}
+
+/// Remove the partial download files in `directory` that `remove` picks,
+/// by path and last write.
+fn discard_partials(
+    directory: &Path,
+    remove: impl Fn(&Path, std::time::SystemTime) -> bool,
+) -> Result<()> {
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
-        if entry.path() == partial {
-            continue;
-        }
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             continue;
         };
-        let other_partial = name
+        let partial = name
             .strip_suffix(".part")
             .map(|stem| stem.strip_suffix(".members").unwrap_or(stem))
             .is_some_and(|hash| {
@@ -571,7 +600,11 @@ fn discard_other_partials(partial: &Path) -> Result<()> {
             .strip_suffix(".tmp")
             .and_then(|stem| stem.rsplit_once('.'))
             .is_some_and(|(stem, id)| stem.ends_with(".tar") && Uuid::parse_str(id).is_ok());
-        if (other_partial || old_temporary) && entry.file_type()?.is_file() {
+        if !(partial || old_temporary) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.is_file() && remove(&entry.path(), metadata.modified()?) {
             fs::remove_file(entry.path())?;
         }
     }
@@ -1446,6 +1479,43 @@ mod tests {
     };
 
     const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// A partial download no update asks for goes once nothing wrote to it
+    /// for two days; a recent one stays for the attempt Tiaris hands again,
+    /// and other files are never touched.
+    #[test]
+    fn abandoned_partial_downloads_go_after_two_days() {
+        let inbox = std::env::temp_dir().join(format!("tiaris-nest-inbox-{}", Uuid::new_v4()));
+        fs::create_dir(&inbox).unwrap();
+        let path = |name: &str| inbox.join(name);
+        let old = format!("{}.part", "a".repeat(64));
+        let old_members = format!("{}.members.part", "b".repeat(64));
+        let recent = format!("{}.part", "c".repeat(64));
+        let staged = format!("{}.members.tar", Uuid::from_u128(1));
+        for name in [&old, &old_members, &recent, &staged] {
+            fs::write(path(name), b"bytes").unwrap();
+        }
+        let long_ago = std::time::SystemTime::now() - ABANDONED_PARTIAL - Duration::from_secs(60);
+        for name in [&old, &old_members, &staged] {
+            fs::File::options()
+                .write(true)
+                .open(path(name))
+                .unwrap()
+                .set_modified(long_ago)
+                .unwrap();
+        }
+        let cutoff = std::time::SystemTime::now() - ABANDONED_PARTIAL;
+        discard_partials(&inbox, |_, modified| modified < cutoff).unwrap();
+        let mut left: Vec<String> = fs::read_dir(&inbox)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        let mut expected = vec![recent, staged];
+        expected.sort();
+        assert_eq!(left, expected);
+        fs::remove_dir_all(&inbox).unwrap();
+    }
 
     #[test]
     fn a_room_request_names_the_attempt_and_what_must_be_free() {

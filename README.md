@@ -53,8 +53,10 @@ Console; Tiaris then hands over the session's signed envelope. The bootstrap
 verifies those bytes exactly as it verifies a filled slot and runs the existing flow: session claim, disk approval,
 installation. While the setup waits for approval, the ISO downloads the signed
 closure the session pinned (Tiaris's `closure_offer`) into RAM, when it fits the
-install's own memory limit; approval then waits for that download and verifies
-the archive once (`src/provisioning/closure_prefetch.rs`). Nothing touches the
+install's own memory limit: only the members its own store does not carry when
+the archive allows it (`nixos-appliance/README.md`), else the whole archive;
+approval then waits for that download and verifies it once
+(`src/provisioning/closure_prefetch.rs`). Nothing touches the
 disk before approval. The envelope is kept in `/run` until STATE exists and on STATE
 (`.setup-claim-envelope.bin`, root 0600) from then
 on, so resuming after a power cut never needs the ISO. Booted on a server
@@ -114,7 +116,10 @@ protocol 5, reported in `detected_nixpkgs_commits`.
 When Nest has built the update candidate Manage prepares from a released
 Blueprint at such a commit, it scans the release and candidate closures with
 vulnix and reports the advisories the candidate fixes, with the cache status
-of each App List package at that commit, in `software_update_findings`.
+of each App List package at that commit, in `software_update_findings`, with the
+lane's SHA-256. While Tiaris acknowledges that digest (it holds every finding),
+the Nest sends only the digest until the lane changes, the Nest restarts or six
+hours pass (`src/manage/findings_ack.rs`).
 
 ## Workstation cache seeds
 
@@ -187,8 +192,11 @@ Tiaris every 30 seconds (`manage.sync_interval_seconds`), every 5 while it
 builds, and right after a build ends. In between, while idle, it asks Tiaris
 every 5 seconds which build jobs wait for it (`GET .../nest/build-work`, only
 when Tiaris's configuration says `build_work_probe_supported`) and syncs at
-once when one is new to it, so a build starts within seconds of being queued
-instead of up to 30 seconds later (`manage::wait_for_next_sync`). It reports
+once when one is new to it, or when the answer names an appliance update
+(`appliance_update_attempt_id`) its last configuration did not hand over, so a
+build or a Nest update starts within seconds instead of up to 30 seconds later
+(`manage::wait_for_next_sync`). A sync that queues a job wakes the idle build
+workers at once. It reports
 `appliance_update_v1` for networking/recovery and additive `appliance_update_v3`
 for signed system-closure updates from Tiaris. Workstation-netboot publication and appliance maintenance coordinate
 through a shared lock so runtime promotion cannot race an appliance update.
