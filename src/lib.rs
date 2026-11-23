@@ -1,6 +1,7 @@
 pub mod activity;
 pub mod appliance;
 pub mod assets;
+mod assist_turn;
 pub mod boot;
 pub mod boot_identity;
 pub mod boot_machines;

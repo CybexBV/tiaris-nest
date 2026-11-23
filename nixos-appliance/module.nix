@@ -51,6 +51,8 @@ in {
       schema = "tiaris.nest.workstation-cache-seeds.v1";
       store_paths = lib.unique (lib.sort builtins.lessThan (map toString cfg.workstationCacheSeeds));
     };
+    users.groups.tiaris-turn.gid = 437;
+    users.users.tiaris-turn = { uid = 437; group = "tiaris-turn"; isSystemUser = true; };
     users.groups.tiaris-nest.gid = 985;
     users.groups.nix-users = {};
     users.groups.tftp = {};
@@ -243,6 +245,43 @@ in {
       serviceConfig = { ExecStart = command "time"; Restart = "always"; RestartSec = "5s"; DynamicUser = true; AmbientCapabilities = [ "CAP_NET_BIND_SERVICE" ]; CapabilityBoundingSet = [ "CAP_NET_BIND_SERVICE" ]; NoNewPrivileges = true; ProtectSystem = "strict"; ProtectHome = true; PrivateTmp = true; PrivateDevices = true; RestrictAddressFamilies = [ "AF_INET" "AF_UNIX" ]; MemoryMax = "64M"; };
     };
     systemd.services.tiaris-nest-network-runtime = (rootService "network-runtime") // { after = [ "tiaris-nest-first-boot.service" "tiaris-nest-network-guard.service" "network-online.target" ]; wants = [ "network-online.target" ]; before = [ "tiaris-nest.service" ]; serviceConfig = { Type = "oneshot"; ExecStart = command "network-runtime"; TimeoutStartSec = "30s"; }; };
+    systemd.services.tiaris-nest-assist-turn = (rootService "assist-turn") // {
+      wantedBy = [ "multi-user.target" ];
+      requires = [ "tiaris-nest-first-boot.service" ];
+      after = [ "tiaris-nest-first-boot.service" "tiaris-nest-network-runtime.service" ];
+    };
+    systemd.paths.tiaris-nest-assist-turn = {
+      wantedBy = [ "multi-user.target" ];
+      pathConfig.PathChanged = "/var/lib/tiaris-nest/state/agent/assist-turn.json";
+    };
+    systemd.timers.tiaris-nest-assist-turn = {
+      wantedBy = [ "timers.target" ];
+      timerConfig = { OnBootSec = "30s"; OnUnitInactiveSec = "30s"; AccuracySec = "1s"; };
+    };
+    systemd.services.tiaris-nest-turn = {
+      description = "Tiaris Nest LAN TURN relay";
+      unitConfig.ConditionPathExists = "/run/tiaris-nest-turn/turnserver.conf";
+      serviceConfig = {
+        Type = "exec";
+        ExecStart = "${pkgs.coturn}/bin/turnserver -c /run/tiaris-nest-turn/turnserver.conf";
+        ExecStopPost = "+${pkgs.coreutils}/bin/rm -f /run/tiaris-nest-turn/status.json";
+        User = "tiaris-turn";
+        UMask = "0077";
+        NoNewPrivileges = true;
+        ProtectSystem = "strict";
+        ProtectHome = true;
+        PrivateTmp = true;
+        PrivateDevices = true;
+        CapabilityBoundingSet = "";
+        RestrictAddressFamilies = [ "AF_INET" "AF_UNIX" "AF_NETLINK" ];
+        ReadWritePaths = [ "/var/lib/tiaris-nest-turn" "/run/tiaris-nest-turn/turnserver.pid" ];
+        LimitCORE = 0;
+        MemoryMax = "256M";
+        CPUQuota = "50%";
+        Restart = "on-failure";
+        RestartSec = "2s";
+      };
+    };
     systemd.timers.tiaris-nest-network-runtime = { wantedBy = [ "timers.target" ]; timerConfig = { OnBootSec = "1min"; OnUnitActiveSec = "1min"; }; };
     # Updates are prepared while the Nest serves computers: verification and
     # import yield CPU and disk to them (generation_update.prepare). The first

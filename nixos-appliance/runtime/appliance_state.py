@@ -22,12 +22,14 @@ def run(*arguments, **kwargs):
     return subprocess.run([str(a) for a in arguments], check=True, text=True, capture_output=True, timeout=kwargs.pop('timeout', 60), **kwargs).stdout.strip()
 
 
-def read(path, maximum=1024 * 1024, owner=0):
+def read(path, maximum=1024 * 1024, owner=0, mode=None):
     fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, 'rb') as stream:
         info = os.fstat(stream.fileno())
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != owner or info.st_mode & 0o022 or info.st_size > maximum:
             raise ValueError('unsafe appliance state file: ' + str(path))
+        if mode is not None and stat.S_IMODE(info.st_mode) != mode:
+            raise ValueError('unexpected appliance state file permissions: ' + str(path))
         body = stream.read(maximum + 1)
         after = os.fstat(stream.fileno())
     if len(body) > maximum or len(body) != info.st_size or (info.st_size, info.st_mtime_ns) != (after.st_size, after.st_mtime_ns):

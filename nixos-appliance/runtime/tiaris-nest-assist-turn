@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""Reconcile the appliance's LAN-only TURN service from its managed config."""
+import datetime
+import ipaddress
+import json
+from pathlib import Path
+import re
+import shutil
+import sqlite3
+import subprocess
+import time
+import tomllib
+
+from appliance_state import UID, canonical, directory, read, write
+
+INBOX = Path('/var/lib/tiaris-nest/state/agent/assist-turn.json')
+SERVER = Path('/etc/tiaris-nest/config.toml')
+RUN = Path('/run/tiaris-nest-turn')
+CONFIG = RUN / 'turnserver.conf'
+PID = RUN / 'turnserver.pid'
+STATE = Path('/var/lib/tiaris-nest-turn')
+DATABASE = STATE / 'turndb'
+TURN_ID = 437
+UNIT = 'tiaris-nest-turn.service'
+TABLE = 'tiaris_nest_turn'
+REALM = 'tiaris-assist'
+SCHEMA = 'tiaris.nest.assist-turn.v1'
+SETTINGS = dict(port=3478, relay_ports=[61000, 61040], max_bps=3000000,
+                bps_capacity=30000000, total_quota=40, user_quota=2)
+PRIVATE = tuple(map(ipaddress.IPv4Network, ('10.0.0.0/8', '172.16.0.0/12',
+                                            '192.168.0.0/16', '100.64.0.0/10')))
+
+
+def desired():
+    try:
+        raw = read(INBOX, maximum=4096, owner=UID, mode=0o600)
+    except FileNotFoundError:
+        return {}
+    document = json.loads(raw)
+    if document == {'schema': SCHEMA, 'enabled': False} and document['enabled'] is False:
+        return {}
+    if not isinstance(document, dict) or set(document) != {'schema', 'enabled', 'secrets', *SETTINGS}:
+        raise ValueError('invalid TURN document')
+    if document['schema'] != SCHEMA or document['enabled'] is not True or any(
+        type(document[key]) is not type(value) or document[key] != value
+        for key, value in SETTINGS.items()
+    ):
+        raise ValueError('invalid TURN settings')
+    entries = document['secrets']
+    if not isinstance(entries, list) or not 1 <= len(entries) <= 2:
+        raise ValueError('invalid TURN key count')
+    keys = {}
+    for entry in entries:
+        if (not isinstance(entry, dict) or set(entry) != {'id', 'value'}
+                or not isinstance(entry['id'], str) or not re.fullmatch(r'[0-9]{8}-[0-9a-f]{8}', entry['id'])
+                or not isinstance(entry['value'], str) or not re.fullmatch(r'[A-Za-z0-9_-]{43}', entry['value'])
+                or entry['id'] in keys or entry['value'] in keys.values()):
+            raise ValueError('invalid TURN key')
+        keys[entry['id']] = entry['value']
+    return keys
+
+
+def command(*args, **kwargs):
+    return subprocess.run(args, text=True, capture_output=True, timeout=10, **kwargs)
+
+
+def active_address():
+    config = tomllib.loads(read(SERVER, maximum=65536).decode())
+    url = config.get('server', {}).get('public_base_url')
+    if not isinstance(url, str) or not url.startswith('http://'):
+        raise ValueError('missing LAN IPv4')
+    address = ipaddress.IPv4Address(url.removeprefix('http://'))
+    if not any(address in network for network in PRIVATE):
+        raise ValueError('LAN IPv4 outside the allowed ranges')
+    interfaces = json.loads(command('ip', '-j', '-4', 'address', 'show', 'up', check=True).stdout)
+    if not any(entry.get('local') == str(address) for interface in interfaces
+               for entry in interface.get('addr_info', [])):
+        raise ValueError('LAN IPv4 is no longer assigned')
+    return address
+
+
+def render_config(address):
+    return f"""listening-ip={address}
+relay-ip={address}
+listening-port=3478
+min-port=61000
+max-port=61040
+realm={REALM}
+use-auth-secret
+userdb={DATABASE}
+no-tcp
+no-tls
+no-dtls
+no-tcp-relay
+no-cli
+no-loopback-peers
+no-multicast-peers
+no-rfc5780
+no-stun-backward-compatibility
+no-software-attribute
+fingerprint
+denied-peer-ip=0.0.0.0-0.255.255.255
+denied-peer-ip=127.0.0.0-127.255.255.255
+denied-peer-ip=169.254.0.0-169.254.255.255
+denied-peer-ip=224.0.0.0-255.255.255.255
+denied-peer-ip={address}
+user-quota=2
+total-quota=40
+max-bps=3000000
+bps-capacity=30000000
+stale-nonce=600
+pidfile={PID}
+log-file=stdout
+simple-log
+""".encode()
+
+
+def render_firewall(address):
+    return f"""table inet {TABLE} {{
+    set private4 {{
+        type ipv4_addr; flags interval;
+        elements = {{ {', '.join(map(str, PRIVATE))} }}
+    }}
+    chain input {{
+        type filter hook input priority -5; policy accept;
+        meta nfproto ipv6 udp dport {{ 3478, 61000-61040 }} drop
+        udp dport {{ 3478, 61000-61040 }} ip daddr != {address} drop
+        udp dport {{ 3478, 61000-61040 }} ip saddr != @private4 counter drop
+        tcp dport 3478 drop
+    }}
+    chain output {{
+        type filter hook output priority -5; policy accept;
+        meta skuid {TURN_ID} meta nfproto ipv6 drop
+        meta skuid {TURN_ID} meta l4proto != udp drop
+        meta skuid {TURN_ID} ip daddr != @private4 counter drop
+        meta skuid {TURN_ID} fib daddr type {{ local, broadcast, multicast }} counter drop
+        meta skuid {TURN_ID} udp dport 0-1023 counter drop
+    }}
+}}
+"""
+
+
+def install_firewall(address=None):
+    existing = command('nft', 'list', 'table', 'inet', TABLE).returncode == 0
+    rules = f'delete table inet {TABLE}\n' if existing else ''
+    if address is not None:
+        rules += render_firewall(address)
+    if rules:
+        command('nft', '--check', '-f', '-', input=rules, check=True)
+        command('nft', '-f', '-', input=rules, check=True)
+
+
+def install_keys(keys):
+    directory(STATE, 0o750, gid=TURN_ID)
+    # coturn reads this table for each new REST authentication. Bound SQLite
+    # values keep keys out of turnadmin arguments, command output and the journal.
+    if not DATABASE.exists():
+        write(DATABASE, b'', mode=0o640, group=TURN_ID)
+    with sqlite3.connect(DATABASE, timeout=3) as db:
+        db.execute('PRAGMA secure_delete = ON')
+        db.execute('BEGIN IMMEDIATE')
+        db.execute('CREATE TABLE IF NOT EXISTS turn_secret '
+                   '(realm varchar(127), value varchar(127), PRIMARY KEY (realm, value))')
+        current = {value for value, in db.execute('SELECT value FROM turn_secret WHERE realm = ?', (REALM,))}
+        wanted = set(keys.values())
+        db.executemany('INSERT INTO turn_secret (realm, value) VALUES (?, ?)',
+                       [(REALM, value) for value in wanted - current])
+        db.executemany('DELETE FROM turn_secret WHERE realm = ? AND value = ?',
+                       [(REALM, value) for value in current - wanted])
+
+
+def status(state, address=None, ids=(), error=None):
+    value = {
+        'state': state,
+        'listen_ipv4': str(address) if address else None,
+        'port': SETTINGS['port'] if address else None,
+        'relay_ports': SETTINGS['relay_ports'] if address else None,
+        'secret_ids': sorted(ids),
+        'error': error,
+        'checked_at': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'),
+    }
+    write(RUN / 'status.json', canonical(value), mode=0o644, group=0)
+
+
+def disable(error=None):
+    command('systemctl', 'stop', UNIT, check=True)
+    install_firewall()
+    if STATE.exists():
+        shutil.rmtree(STATE)
+    CONFIG.unlink(missing_ok=True)
+    PID.unlink(missing_ok=True)
+    status('failed' if error else 'stopped', error=error)
+
+
+def running(address):
+    if command('systemctl', 'is-active', '--quiet', UNIT).returncode:
+        return False
+    pid = command('systemctl', 'show', '--property=MainPID', '--value', UNIT, check=True).stdout.strip()
+    listeners = command('ss', '-H', '-4', '-l', '-u', '-n', '-p', 'sport = :3478', check=True).stdout.splitlines()
+    return bool(listeners) and all(
+        f' {address}:3478 ' in line and f'pid={pid},' in line for line in listeners
+    )
+
+
+def enable(address, keys):
+    new_config = render_config(address)
+    changed = not CONFIG.is_file() or CONFIG.read_bytes() != new_config
+    install_firewall(address)
+    install_keys(keys)
+    if changed:
+        write(CONFIG, new_config, mode=0o640, group=TURN_ID)
+    if changed or not running(address):
+        write(PID, b'', mode=0o600, owner=TURN_ID, group=TURN_ID)
+        command('systemctl', 'restart' if changed else 'start', UNIT, check=True)
+        for _ in range(30):
+            if running(address):
+                break
+            time.sleep(0.1)
+        else:
+            raise ValueError('TURN listener did not start')
+    status('running', address=address, ids=keys)
+
+
+def main():
+    directory(RUN, 0o755, gid=0)
+    error = 'turn_configuration_invalid'
+    try:
+        keys = desired()
+        if keys:
+            error = 'turn_address_unavailable'
+            address = active_address()
+            error = 'turn_service_failed'
+            enable(address, keys)
+        else:
+            error = 'turn_cleanup_failed'
+            disable()
+        return 0
+    except (ValueError, OSError, sqlite3.Error, subprocess.SubprocessError):
+        # Do not log input, SQLite values or child command output.
+        try:
+            disable(error)
+        except (ValueError, OSError, subprocess.SubprocessError):
+            status('failed', error='turn_cleanup_failed')
+        return 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
