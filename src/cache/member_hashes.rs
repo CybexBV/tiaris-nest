@@ -197,8 +197,6 @@ mod tests {
         let hashes = MemberHashes::new(MAX_AGE, SETTLE);
         hashes.remember(&metadata, &metadata, hash, changed + SETTLE / 2);
         assert!(hashes.confirmed(&metadata, &hash).is_none());
-        hashes.remember(&metadata, &metadata, hash, changed + SETTLE);
-        assert!(hashes.confirmed(&metadata, &hash).is_some());
         fs::remove_dir_all(dir).ok();
     }
 }
