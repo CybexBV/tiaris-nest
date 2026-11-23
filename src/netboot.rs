@@ -34,6 +34,8 @@ use crate::{
     manage_source, release_transport,
 };
 
+#[path = "netboot_prepare.rs"]
+pub mod prepare;
 #[path = "netboot_transport.rs"]
 mod transport;
 
@@ -248,11 +250,18 @@ enum RuntimeReconcileRequest {
         failure_kind: &'static str,
         failure_message: String,
     },
+    /// The runtime of the appliance release this Nest is updating to.
+    Prepare {
+        state: AppState,
+        prepare: Box<prepare::PreparedWorkstationNetboot>,
+    },
 }
 
 struct RuntimeReconcileQueue {
     worker_running: bool,
     pending: Option<RuntimeReconcileRequest>,
+    /// A runtime to prepare waits behind the runtime in use (`pending`).
+    prepare: Option<RuntimeReconcileRequest>,
 }
 
 impl RuntimeReconcileQueue {
@@ -260,11 +269,16 @@ impl RuntimeReconcileQueue {
         Self {
             worker_running: false,
             pending: None,
+            prepare: None,
         }
     }
 
     fn enqueue(&mut self, request: RuntimeReconcileRequest) -> bool {
-        self.pending = Some(request);
+        if matches!(request, RuntimeReconcileRequest::Prepare { .. }) {
+            self.prepare = Some(request);
+        } else {
+            self.pending = Some(request);
+        }
         if self.worker_running {
             false
         } else {
@@ -285,6 +299,9 @@ struct DownloadProgressCheckpoint {
     progress_percent: i64,
     bytes_downloaded: u64,
     persisted_at: Instant,
+    /// False for a runtime prepared ahead: the runtime row shows the
+    /// runtime in use, not this download.
+    report: bool,
 }
 
 impl DownloadProgressCheckpoint {
@@ -295,6 +312,7 @@ impl DownloadProgressCheckpoint {
             progress_percent: 1,
             bytes_downloaded: 0,
             persisted_at,
+            report: true,
         }
     }
 
@@ -539,7 +557,7 @@ async fn drain_runtime_reconcile_queue() {
             let mut queue = RECONCILE_QUEUE
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            match queue.pending.take() {
+            match queue.pending.take().or_else(|| queue.prepare.take()) {
                 Some(request) => request,
                 None => {
                     queue.worker_running = false;
@@ -573,6 +591,9 @@ async fn drain_runtime_reconcile_queue() {
                         "could not persist workstation runtime desired-state decoding failure"
                     );
                 }
+            }
+            RuntimeReconcileRequest::Prepare { state, prepare } => {
+                prepare::run(&state, &prepare).await;
             }
         }
     }
@@ -1113,6 +1134,34 @@ async fn import_bundle(
     compatibility_epoch: u32,
     bundle_transport_url: Option<&str>,
 ) -> Result<bool> {
+    import_bundle_reporting(
+        state,
+        descriptor,
+        compatibility_epoch,
+        bundle_transport_url,
+        true,
+    )
+    .await
+}
+
+/// Download, hash, extract, check and publish a bundle as verified. Only
+/// with `report` does the runtime row show its progress: a runtime prepared
+/// ahead of an appliance update (`prepare`) leaves the row to the runtime in
+/// use.
+async fn import_bundle_reporting(
+    state: &AppState,
+    descriptor: &WorkstationNetbootDescriptor,
+    compatibility_epoch: u32,
+    bundle_transport_url: Option<&str>,
+    report: bool,
+) -> Result<bool> {
+    let show = |status: &'static str, progress: i64, downloaded: u64| async move {
+        if report {
+            set_runtime_state(state, status, progress, downloaded, descriptor.size_bytes).await
+        } else {
+            Ok(())
+        }
+    };
     let existing_epoch: Option<(i64,)> = sqlx::query_as(
         "SELECT compatibility_epoch FROM workstation_netboot_bundles WHERE bundle_sha256 = ?",
     )
@@ -1153,41 +1202,20 @@ async fn import_bundle(
         )?;
     }
 
-    set_runtime_state(state, "downloading", 1, 0, descriptor.size_bytes).await?;
+    show("downloading", 1, 0).await?;
     let part = transport::partial_path(&staging_root, descriptor, bundle_transport_url)?;
     transport::discard_other_partials(&staging_root, descriptor, &part).await?;
-    download_bundle(state, descriptor, &part, bundle_transport_url).await?;
-    set_runtime_state(
-        state,
-        "verifying",
-        70,
-        descriptor.size_bytes,
-        descriptor.size_bytes,
-    )
-    .await?;
+    download_bundle_reporting(state, descriptor, &part, bundle_transport_url, report).await?;
+    show("verifying", 70, descriptor.size_bytes).await?;
     let actual = sha256_file(part.clone()).await?;
     if actual != descriptor.sha256 {
         tokio_fs::remove_file(&part).await.ok();
         bail!("workstation netboot bundle SHA-256 mismatch");
     }
 
-    set_runtime_state(
-        state,
-        "extracting",
-        80,
-        descriptor.size_bytes,
-        descriptor.size_bytes,
-    )
-    .await?;
+    show("extracting", 80, descriptor.size_bytes).await?;
     if crate::maintenance::lease_active()? {
-        set_runtime_state(
-            state,
-            "held",
-            80,
-            descriptor.size_bytes,
-            descriptor.size_bytes,
-        )
-        .await?;
+        show("held", 80, descriptor.size_bytes).await?;
         return Ok(false);
     }
     // systemd exposes the private data and served roots as separate writable
@@ -1222,14 +1250,7 @@ async fn import_bundle(
 
     if crate::maintenance::lease_active()? {
         fs::remove_dir_all(&stage).context("remove held netboot staging tree")?;
-        set_runtime_state(
-            state,
-            "held",
-            90,
-            descriptor.size_bytes,
-            descriptor.size_bytes,
-        )
-        .await?;
+        show("held", 90, descriptor.size_bytes).await?;
         return Ok(false);
     }
 
@@ -1331,17 +1352,31 @@ fn expected_expanded_runtime_bytes(descriptor: &WorkstationNetbootDescriptor) ->
     })
 }
 
+#[cfg(test)]
 async fn download_bundle(
     state: &AppState,
     descriptor: &WorkstationNetbootDescriptor,
     part: &Path,
     bundle_transport_url: Option<&str>,
 ) -> Result<()> {
+    download_bundle_reporting(state, descriptor, part, bundle_transport_url, true).await
+}
+
+async fn download_bundle_reporting(
+    state: &AppState,
+    descriptor: &WorkstationNetbootDescriptor,
+    part: &Path,
+    bundle_transport_url: Option<&str>,
+    report: bool,
+) -> Result<()> {
     if let Some(value) = bundle_transport_url {
         validate_descriptor(descriptor, &state.config.update.trusted_public_key)?;
         transport::validate_url(value, descriptor)?;
     }
-    let mut progress_checkpoint = DownloadProgressCheckpoint::new(Instant::now());
+    let mut progress_checkpoint = DownloadProgressCheckpoint {
+        report,
+        ..DownloadProgressCheckpoint::new(Instant::now())
+    };
     let mut offset = match tokio_fs::symlink_metadata(part).await {
         Ok(metadata)
             if metadata.file_type().is_file()
@@ -1506,7 +1541,7 @@ async fn persist_download_progress(
     force: bool,
 ) -> Result<bool> {
     let progress = download_progress_percent(downloaded, total);
-    if !checkpoint.due(progress, downloaded, now, force) {
+    if !checkpoint.report || !checkpoint.due(progress, downloaded, now, force) {
         return Ok(false);
     }
     set_runtime_state(state, "downloading", progress, downloaded, total).await?;
@@ -1898,7 +1933,6 @@ async fn promote_existing(
     Ok(())
 }
 
-#[cfg(test)]
 async fn enforce_watermark(
     state: &AppState,
     descriptor: &WorkstationNetbootDescriptor,
@@ -4062,6 +4096,86 @@ mod tests {
     /// Bundles in use stay: active, previous, desired, and one a boot session
     /// still reads. Of the others only the newest stays, and only for the
     /// retention period; a development Nest once kept 29 trees of 1.4 GB.
+    /// The runtime of a coming appliance release is downloaded and checked
+    /// before the restart, but the Nest keeps reporting, serving and
+    /// guarding the runtime in use (a rollback keeps it). Once Tiaris
+    /// selects the prepared runtime, it is promoted without a download.
+    #[tokio::test]
+    async fn a_prepared_runtime_is_ready_before_the_restart_and_used_only_once_selected() {
+        let fixture = RuntimeFilesystemFixture::new().await;
+        let active = fixture.install_bundle("1.0.0", &"1".repeat(64)).await;
+        fixture.activate(&active, None).await;
+        let (archive, mut coming) = fixture.runtime_archive("2.0.0");
+        let (base_url, server) = one_shot_http_response("200 OK", archive).await;
+        coming.url = format!(
+            "{base_url}/tiaris-workstation-netboot-2.0.0-aaaaaaaaaaaa-{ARCHITECTURE}.tar.zst"
+        );
+        fixture.sign_descriptor(&mut coming);
+        let prepare = serde_json::json!({
+            "appliance_release": "0.2.200",
+            "compatibility_epoch": COMPATIBILITY_EPOCH,
+            "descriptor": coming,
+        });
+
+        // Only with the update to its own release.
+        prepare::queue(&fixture.state, prepare.clone(), "0.2.201");
+        prepare::queue(&fixture.state, prepare, "0.2.200");
+        tokio::time::timeout(Duration::from_secs(30), prepare::wait("0.2.200"))
+            .await
+            .unwrap();
+        await_one_shot_server(server).await;
+
+        let verified: (String,) = sqlx::query_as(
+            "SELECT retention_state FROM workstation_netboot_bundles WHERE bundle_sha256 = ?",
+        )
+        .bind(&coming.sha256)
+        .fetch_one(&fixture.state.db)
+        .await
+        .unwrap();
+        assert_eq!(verified.0, "verified");
+        let serving = report(&fixture.state).await.unwrap();
+        assert_eq!(
+            (
+                serving.state.as_str(),
+                serving.active_bundle_sha256.as_str()
+            ),
+            ("ready", active.sha256.as_str())
+        );
+        assert_eq!(serving.runtime_version, "1.0.0");
+        let launch = create_boot_session(&fixture.state, "02:00:00:00:00:01", None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(launch.bundle_sha256, active.sha256);
+        let guarded: (String,) =
+            sqlx::query_as("SELECT runtime_version FROM workstation_netboot_watermarks")
+                .fetch_one(&fixture.state.db)
+                .await
+                .unwrap();
+        assert_eq!(guarded.0, "1.0.0");
+
+        // After the restart: nothing serves the archive any more.
+        reconcile_desired(
+            &fixture.state,
+            &DesiredWorkstationNetboot {
+                compatibility_epoch: COMPATIBILITY_EPOCH,
+                descriptor: coming.clone(),
+                reconcile_generation: 2,
+                bundle_transport_url: None,
+            },
+        )
+        .await
+        .unwrap();
+        let promoted = report(&fixture.state).await.unwrap();
+        assert_eq!(
+            (
+                promoted.state.as_str(),
+                promoted.active_bundle_sha256.as_str()
+            ),
+            ("ready", coming.sha256.as_str())
+        );
+        fixture.cleanup();
+    }
+
     #[tokio::test]
     async fn retention_keeps_bundles_in_use_and_only_the_newest_other_one() {
         let fixture = RuntimeFilesystemFixture::new().await;
@@ -4785,6 +4899,51 @@ mod tests {
             descriptor.size_bytes = size_bytes;
             self.sign_descriptor(&mut descriptor);
             descriptor
+        }
+
+        /// A signed runtime's archive as a release serves it, and its
+        /// descriptor (sign it again after setting its URL).
+        fn runtime_archive(
+            &self,
+            runtime_version: &str,
+        ) -> (Vec<u8>, WorkstationNetbootDescriptor) {
+            let bodies: [(&str, &[u8]); 3] = [
+                ("bzImage", b"coming-kernel"),
+                ("initrd", b"coming-initrd"),
+                ("nix-store.squashfs", b"coming-store"),
+            ];
+            let mut descriptor = fixture_descriptor();
+            descriptor.runtime_version = runtime_version.to_string();
+            descriptor.components = ComponentDescriptors {
+                bz_image: component_descriptor(bodies[0].1),
+                initrd: component_descriptor(bodies[1].1),
+                nix_store_squashfs: component_descriptor(bodies[2].1),
+            };
+            let mut manifest =
+                serde_json::to_vec(&serde_json::to_value(fixture_manifest(&descriptor)).unwrap())
+                    .unwrap();
+            manifest.push(b'\n');
+            descriptor.manifest_sha256 = sha256_bytes(&manifest);
+            let mut entries = bodies.to_vec();
+            entries.insert(2, ("manifest.json", manifest.as_slice()));
+            let mut tar = tar::Builder::new(Vec::new());
+            for (name, body) in entries {
+                let mut header = tar::Header::new_ustar();
+                header.set_path(name).unwrap();
+                header.set_size(body.len() as u64);
+                header.set_mode(0o644);
+                header.set_uid(0);
+                header.set_gid(0);
+                header.set_mtime(1);
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_cksum();
+                tar.append(&header, body).unwrap();
+            }
+            let archive = zstd::encode_all(&tar.into_inner().unwrap()[..], 0).unwrap();
+            descriptor.sha256 = sha256_bytes(&archive);
+            descriptor.size_bytes = archive.len() as u64;
+            self.sign_descriptor(&mut descriptor);
+            (archive, descriptor)
         }
 
         fn sign_descriptor(&self, descriptor: &mut WorkstationNetbootDescriptor) {

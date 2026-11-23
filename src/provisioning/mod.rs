@@ -5,6 +5,7 @@
 //! that installed identity.
 
 mod clock;
+mod closure_prefetch;
 mod inventory;
 mod network_runtime;
 mod nixos_install;
@@ -458,6 +459,10 @@ async fn prepare_verified(
     .await
     .map_err(|error| setup_claim::ended_if_closed(generic, error))?;
     status.session_claimed(&inventory);
+    let mut prefetch = closure_prefetch::ClosurePrefetch::new(
+        &options.release_public_key_path,
+        &verified.envelope.release_version,
+    );
     let mut signed_plan = if recovering {
         let plan = recovery::active_plan(&session, &verified, &inventory)?;
         // Sequence 1 may already be committed and disk preparation may
@@ -472,6 +477,7 @@ async fn prepare_verified(
             &inventory,
             &mut session,
             None,
+            &mut prefetch,
         )
         .await
         .map_err(|error| setup_claim::ended_if_closed(generic, error))?;
@@ -484,6 +490,7 @@ async fn prepare_verified(
             &options.release_public_key_path,
             &verified.envelope.manage_origin,
             status,
+            &mut prefetch,
         )
         .await
         {
@@ -615,6 +622,7 @@ async fn prepare_approved_plan(
     release_public_key_path: &Path,
     manage_origin: &str,
     status: &SetupStatusReporter,
+    prefetch: &mut closure_prefetch::ClosurePrefetch,
 ) -> std::result::Result<
     (
         NestProvisioningInventory,
@@ -653,7 +661,8 @@ async fn prepare_approved_plan(
                 error,
             )
         })?;
-    let staged = nixos_install::stage_closure(plan, release_public_key_path, status)
+    let prefetched = prefetch.hand_over(plan, status).await;
+    let staged = nixos_install::stage_closure(plan, release_public_key_path, status, prefetched)
         .await
         .map_err(|error| {
             PreDestructiveFailure::new(
@@ -777,6 +786,7 @@ async fn wait_for_approved_plan(
     inventory: &NestProvisioningInventory,
     session: &mut protocol::AgentSessionResponse,
     previous_plan_id: Option<uuid::Uuid>,
+    prefetch: &mut closure_prefetch::ClosurePrefetch,
 ) -> Result<SignedInstallPlan> {
     loop {
         if session.state == "approved" {
@@ -793,7 +803,8 @@ async fn wait_for_approved_plan(
             }
         }
         match session.state.as_str() {
-            "created" | "awaiting_approval" | "approved" => {}
+            "created" | "awaiting_approval" => prefetch.offer(session.closure_offer.as_ref()),
+            "approved" => {}
             "revoked" | "expired" | "failed" => {
                 bail!("this provisioned Nest media can no longer install")
             }
@@ -827,7 +838,7 @@ async fn resume_prepare(
     inventory::preflight_network(&signed_plan, &inventory, &verified.envelope.manage_origin)
         .await?;
     let mut staged =
-        nixos_install::stage_closure(&signed_plan, &options.release_public_key_path, status)
+        nixos_install::stage_closure(&signed_plan, &options.release_public_key_path, status, None)
             .await?;
     status.step(InstallStep::RecheckHardware);
     let inventory = inventory::collect_inventory().await?;

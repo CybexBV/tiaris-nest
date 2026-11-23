@@ -411,6 +411,7 @@ async fn handle(
         .and_then(|path| fs::read(path).ok())
         .and_then(|body| serde_json::from_slice(&body).ok());
     let path = uri.path().to_string();
+    let path_and_query = uri.path_and_query().map(|value| value.to_string());
     let now = std::time::Instant::now();
     let too_fast = path.ends_with("/status")
         && fake
@@ -432,7 +433,7 @@ async fn handle(
     };
     fake.seen.push(Seen {
         method,
-        path,
+        path: path_and_query.unwrap_or(path),
         headers,
         body,
         screen,
@@ -613,7 +614,7 @@ async fn generic_iso_registers_is_claimed_and_continues_with_the_existing_sessio
             status_path.as_str(),
             status_path.as_str(),
             status_path.as_str(),
-            &*format!("/v1/agent/nest/provisioning-sessions/{session}/plan"),
+            &*format!("/v1/agent/nest/provisioning-sessions/{session}/plan?closure_offer=1"),
             "/v1/agent/nest/provisioning-sessions/claim",
         ]
     );

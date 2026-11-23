@@ -130,6 +130,10 @@ pub(crate) struct AgentSessionResponse {
     pub session_revision: i64,
     pub poll_after_seconds: u32,
     pub plan: Option<Value>,
+    /// The release this setup installs, while it waits for approval
+    /// (`closure_prefetch`); only with `?closure_offer=1`.
+    #[serde(default)]
+    pub closure_offer: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -689,8 +693,9 @@ impl ProvisioningClient {
     }
 
     pub(crate) async fn poll_plan(&self, key: &SigningKey) -> Result<AgentSessionResponse> {
+        // Signed with the path; a Tiaris that predates the offer ignores it.
         let path = format!(
-            "/v1/agent/nest/provisioning-sessions/{}/plan",
+            "/v1/agent/nest/provisioning-sessions/{}/plan?closure_offer=1",
             self.session_id
         );
         let response = self
