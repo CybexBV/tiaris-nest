@@ -175,7 +175,13 @@ to select a Nix binary. Optional non-mutating development API checks run with
 `TIARIS_NEST_LIVE_ORIGIN=https://dev.tiaris.com` on the Python appliance suite.
 
 The installed service uses `/etc/tiaris-nest/config.toml` and the V2-activated
-identity at `/var/lib/tiaris-nest/state/manage-state.json`. It reports
+identity at `/var/lib/tiaris-nest/state/manage-state.json`. It syncs with
+Tiaris every 30 seconds (`manage.sync_interval_seconds`), every 5 while it
+builds, and right after a build ends. In between, while idle, it asks Tiaris
+every 5 seconds which build jobs wait for it (`GET .../nest/build-work`, only
+when Tiaris's configuration says `build_work_probe_supported`) and syncs at
+once when one is new to it, so a build starts within seconds of being queued
+instead of up to 30 seconds later (`manage::wait_for_next_sync`). It reports
 `appliance_update_v1` for networking/recovery and additive `appliance_update_v3`
 for signed system-closure updates from Tiaris. Workstation-netboot publication and appliance maintenance coordinate
 through a shared lock so runtime promotion cannot race an appliance update.
