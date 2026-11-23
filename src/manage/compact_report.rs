@@ -48,6 +48,41 @@ fn settled() -> MutexGuard<'static, BTreeMap<i64, String>> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// The file next to `manage-state.json` that keeps the cache inventories
+/// across restarts.
+pub(super) const INVENTORIES_FILE: &str = "manage-cache-inventories.json";
+
+/// The cache inventories a restarted Nest keeps, so it does not send every
+/// closure manifest again. Not in `manage-state.json`: they grow with the
+/// cache (about 90 bytes an artifact), and the root updater reads that file
+/// with a 1 MiB limit. Earlier releases kept them there under the same
+/// names, so that file reads as well.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+pub(super) struct Inventories {
+    nest_cache_content: Option<CacheInventoryContent>,
+    nest_cache_acknowledged: Option<CacheInventoryContent>,
+}
+
+impl Inventories {
+    pub(super) fn of(managed: &ManagedState) -> Self {
+        Self {
+            nest_cache_content: managed.nest_cache_content.clone(),
+            nest_cache_acknowledged: managed.nest_cache_acknowledged.clone(),
+        }
+    }
+
+    /// Unreadable: none, and the inventory starts again.
+    pub(super) fn read(saved: &[u8]) -> Self {
+        serde_json::from_slice(saved).unwrap_or_default()
+    }
+
+    pub(super) fn restore(self, managed: &mut ManagedState) {
+        managed.nest_cache_content = self.nest_cache_content;
+        managed.nest_cache_acknowledged = self.nest_cache_acknowledged;
+    }
+}
+
 /// What the report sees of one artifact: its local id and when its reported
 /// content last changed.
 pub(super) type InventoryMember = (i64, String);

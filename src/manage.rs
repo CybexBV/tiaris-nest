@@ -120,9 +120,12 @@ struct ManagedState {
     /// When Manage confirmed `last_peer_contract` (Unix seconds).
     last_peer_contract_at: Option<i64>,
     /// The cache inventory the report sees and the generation it was first
-    /// seen at (`compact_report`).
+    /// seen at (`compact_report`). Saved in their own file
+    /// ([`compact_report::Inventories`]).
+    #[serde(skip)]
     nest_cache_content: Option<compact_report::CacheInventoryContent>,
     /// The cache inventory Manage last acknowledged complete.
+    #[serde(skip)]
     nest_cache_acknowledged: Option<compact_report::CacheInventoryContent>,
 }
 
@@ -3182,7 +3185,19 @@ fn load_managed_state_from_config(config: &AppConfig) -> Result<ManagedState> {
         return Ok(ManagedState::default());
     }
     let raw = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_slice(&raw).with_context(|| format!("failed to parse {}", path.display()))
+    let mut managed: ManagedState = serde_json::from_slice(&raw)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    // Earlier releases kept the inventories in the state file itself.
+    let inventories = fs::read(cache_inventories_path(config)).unwrap_or(raw);
+    compact_report::Inventories::read(&inventories).restore(&mut managed);
+    Ok(managed)
+}
+
+fn cache_inventories_path(config: &AppConfig) -> PathBuf {
+    config
+        .manage
+        .state_path
+        .with_file_name(compact_report::INVENTORIES_FILE)
 }
 
 fn managed_state_lock_path(config: &AppConfig) -> Result<PathBuf> {
@@ -3260,10 +3275,14 @@ fn acquire_managed_state_lock(config: &AppConfig) -> Result<AdvisoryFileLock> {
 }
 
 fn save_managed_state(state: &AppState, managed: &ManagedState) -> Result<()> {
+    write_secure_json(
+        &cache_inventories_path(&state.config),
+        &compact_report::Inventories::of(managed),
+    )?;
     write_secure_json(&state.config.manage.state_path, managed)
 }
 
-fn write_secure_json(path: &Path, value: &ManagedState) -> Result<()> {
+fn write_secure_json(path: &Path, value: &impl Serialize) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -3293,7 +3312,7 @@ fn secure_json_tmp_path(path: &Path) -> Result<PathBuf> {
     Ok(path.with_file_name(tmp_name))
 }
 
-fn write_secure_json_via_tmp(path: &Path, tmp: &Path, value: &ManagedState) -> Result<()> {
+fn write_secure_json_via_tmp(path: &Path, tmp: &Path, value: &impl Serialize) -> Result<()> {
     let mut options = fs::OpenOptions::new();
     options.create_new(true).write(true);
     #[cfg(unix)]
@@ -4130,6 +4149,44 @@ mod tests {
                 .verify(unprefixed.as_bytes(), &signature)
                 .is_err()
         );
+    }
+
+    /// The root updater reads `manage-state.json` with a 1 MiB limit; one it
+    /// cannot read holds back every Nest update. The cache inventories grow
+    /// with the cache, so they keep their own file.
+    #[tokio::test]
+    async fn a_restarted_nest_keeps_its_cache_inventories_outside_the_state_file() {
+        let root = temp_state_dir();
+        let mut config = AppConfig::default();
+        config.manage.state_path = root.join("manage-state.json");
+        let state = AppState::new(config, managed_test_pool().await);
+        let mut managed = ManagedState {
+            device_id: Some("nest-123".into()),
+            ..ManagedState::default()
+        };
+        let members = (1..=20_000)
+            .map(|id| (id, format!("2026-11-23T10:00:00.{id:09}+00:00")))
+            .collect();
+        compact_report::content_generation(&mut managed, "inst", 7, members);
+        managed.nest_cache_acknowledged = managed.nest_cache_content.clone();
+        save_managed_state(&state, &managed).unwrap();
+        let written = fs::metadata(&state.config.manage.state_path).unwrap().len();
+        assert!(written < 1024 * 1024, "{written} bytes");
+
+        let restarted = load_managed_state(&state).unwrap();
+        assert_eq!(restarted.device_id.as_deref(), Some("nest-123"));
+        assert_eq!(restarted.nest_cache_content, managed.nest_cache_content);
+        assert!(compact_report::inventory_acknowledged(&restarted));
+
+        // A state file from an earlier release still holds them itself.
+        fs::remove_file(cache_inventories_path(&state.config)).unwrap();
+        let mut earlier = serde_json::to_value(&managed).unwrap();
+        earlier["nest_cache_content"] = json!(managed.nest_cache_content);
+        earlier["nest_cache_acknowledged"] = json!(managed.nest_cache_acknowledged);
+        fs::write(&state.config.manage.state_path, earlier.to_string()).unwrap();
+        let updated = load_managed_state(&state).unwrap();
+        assert!(compact_report::inventory_acknowledged(&updated));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
