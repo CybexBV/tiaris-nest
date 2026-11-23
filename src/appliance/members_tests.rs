@@ -268,3 +268,51 @@ fn the_running_system_is_read_from_every_path_info_shape() {
     }
     assert!(present(b"{}").is_err());
 }
+
+/// The manifest says how far the metadata goes: the request after it asks
+/// for the rest of the metadata and the first payload's header, at most a
+/// block per member more, instead of fixed steps.
+#[test]
+fn the_manifest_sizes_the_rest_of_the_metadata_request() {
+    let fixture = Fixture::new();
+    let tar = fixture.tar();
+    let end = metadata_end(&tar).unwrap().unwrap() as u64;
+    let (_, manifest_length, _, _) = closure::header(tar[..512].try_into().unwrap()).unwrap();
+    let manifest_end = 512 + manifest_length;
+    assert_eq!(metadata_want(&tar[..300]), None);
+    assert_eq!(
+        metadata_want(&tar[..manifest_end as usize - 1]),
+        Some(manifest_end)
+    );
+    let want = metadata_want(&tar[..manifest_end as usize]).unwrap();
+    let members = fixture
+        .members
+        .iter()
+        .filter(|(name, _)| name.ends_with(".narinfo"))
+        .count() as u64;
+    assert!(
+        want >= end + 512 && want - (end + 512) < 512 * members,
+        "{want} for metadata ending at {end}"
+    );
+}
+
+/// Members run a few at a time, and every result comes back in its order.
+#[tokio::test]
+async fn members_are_fetched_a_few_at_a_time() {
+    let running = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let most = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let tasks: Vec<Pin<Box<dyn Future<Output = usize> + Send>>> = (0..10usize)
+        .map(|index| {
+            let (running, most) = (running.clone(), most.clone());
+            Box::pin(async move {
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                most.fetch_max(now, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+                running.fetch_sub(1, Ordering::SeqCst);
+                index
+            }) as Pin<Box<dyn Future<Output = usize> + Send>>
+        })
+        .collect();
+    assert_eq!(at_most(AT_ONCE, tasks).await, (0..10).collect::<Vec<_>>());
+    assert_eq!(most.load(Ordering::SeqCst), AT_ONCE);
+}

@@ -16,6 +16,10 @@
 //! this layout), for an update where most members are new, and when the
 //! server does not answer ranges or sends bytes that do not verify. A dropped
 //! connection costs the member it was fetching; the next try continues.
+//!
+//! Each member has its fixed place in the staged stream, so a few are fetched
+//! at once ([`AT_ONCE`]): every answer starts slowly (a redirect, a new
+//! connection), and one member at a time left the line idle meanwhile.
 use super::{
     closure::{self, Metadata, NarInfo, Present},
     release_v3::NixosRelease,
@@ -25,16 +29,23 @@ use ed25519_dalek::VerifyingKey;
 use serde_json::Value;
 use std::{
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    future::Future,
+    io::Read,
+    os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
+    pin::Pin,
+    task::Poll,
     time::Duration,
 };
 
 const FRAME: [u8; 6] = [0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x38];
 const BLOCK: u64 = 128 * 1024;
-/// The metadata is fetched in steps (2.2 MiB for 1149 members).
-const METADATA_STEP: u64 = 4 * 1024 * 1024;
+/// The first metadata request, and each further one when the manifest does
+/// not say how far the metadata goes (2.2 MiB for 1149 members; the
+/// manifest, 0.6 MiB of it, comes first).
+const METADATA_STEP: u64 = 1024 * 1024;
+/// Members fetched at once.
+const AT_ONCE: usize = 4;
 const MAX_METADATA: u64 = 64 * 1024 * 1024;
 const RESUMES: u32 = 8;
 const RESUME_PAUSE: Duration = Duration::from_secs(5);
@@ -344,6 +355,50 @@ fn metadata_end(prefix: &[u8]) -> Result<Option<usize>> {
     Ok(None)
 }
 
+/// How much of the tar stream the metadata in `prefix` needs, through the
+/// first payload's header: the manifest comes first and names every store
+/// path, and each NARInfo is the export's (`nixos-appliance/export-cache.py`,
+/// signed by `tools/pack-system-closure.py`) with its file size at most one
+/// digit longer than the NAR size. Before the manifest is complete, its own
+/// end. Only an estimate: the metadata is verified when it is read, and a
+/// short estimate continues in steps.
+fn metadata_want(prefix: &[u8]) -> Option<u64> {
+    let raw: &[u8; 512] = prefix.get(..512)?.try_into().ok()?;
+    let (name, length, _, _) = closure::header(raw).ok()?;
+    if name != "manifest.json" {
+        return None;
+    }
+    let padded = |bytes: u64| bytes.div_ceil(512) * 512;
+    let manifest_end = 512 + length;
+    let Some(manifest) = prefix.get(512..usize::try_from(manifest_end).ok()?) else {
+        return Some(manifest_end);
+    };
+    let manifest: Value = serde_json::from_slice(manifest).ok()?;
+    let line = |name: &str, value: usize| (name.len() + 2 + value + 1) as u64;
+    let digits = |value: u64| value.to_string().len();
+    // The manifest, then nix-cache-info (one block), the NARInfos, `nar/`.
+    let mut end = 512 + padded(length) + 1024;
+    for path in manifest["store_paths"].as_array()? {
+        let (store_path, nar_hash) = (path["path"].as_str()?, path["nar_hash"].as_str()?);
+        let nar_size = path["nar_size"].as_u64()?;
+        let mut references = 0;
+        for (index, reference) in path["references"].as_array()?.iter().enumerate() {
+            references += usize::from(index > 0) + reference.as_str()?.len() - "/nix/store/".len();
+        }
+        let body = line("StorePath", store_path.len())
+            + line("URL", "nar/".len() + 32 + ".nar.zst".len())
+            + line("Compression", "zstd".len())
+            + line("FileHash", "sha256:".len() + 52)
+            + line("FileSize", digits(nar_size) + 1)
+            + line("NarHash", nar_hash.len())
+            + line("NarSize", digits(nar_size))
+            + line("References", references)
+            + line("Sig", "tiaris-nest-appliance-1:".len() + 88);
+        end += 512 + padded(body);
+    }
+    Some(end + 512 + 512)
+}
+
 struct Wanted {
     name: String,
     /// The tar offset of its header.
@@ -362,13 +417,26 @@ pub struct Plan {
     pub bytes: u64,
 }
 impl Plan {
-    /// The bytes still to download: an earlier try may have left part.
+    /// The bytes still to download: an earlier try may have left part
+    /// (counted as written, for the stream has holes where members were
+    /// still coming).
     pub fn remaining_bytes(&self) -> u64 {
         let have = fs::symlink_metadata(&self.partial)
             .ok()
             .filter(|metadata| metadata.is_file())
-            .map_or(0, |metadata| metadata.len());
+            .map_or(0, |metadata| metadata.len().min(metadata.blocks() * 512));
         self.bytes.saturating_sub(have)
+    }
+
+    /// Where each wanted member's entry starts in the staged stream.
+    fn slots(&self) -> Result<Vec<u64>> {
+        let mut at = self.prefix.len() as u64;
+        let mut slots = Vec::with_capacity(self.wanted.len());
+        for wanted in &self.wanted {
+            slots.push(at);
+            at += 512 + self.info(wanted)?.file_size.div_ceil(512) * 512;
+        }
+        Ok(slots)
     }
 
     pub fn members(&self) -> usize {
@@ -412,9 +480,9 @@ pub async fn plan(
         pause: RESUME_PAUSE,
     };
     let mut prefix = Vec::new();
+    let mut want = METADATA_STEP.min(layout.tar_bytes);
     let end = loop {
         let mut got = prefix.len() as u64;
-        let want = (got + METADATA_STEP).min(layout.tar_bytes);
         match source
             .fill(&mut got, want, &mut |bytes| {
                 prefix.extend_from_slice(bytes);
@@ -432,6 +500,10 @@ pub async fn plan(
             want < layout.tar_bytes && want < MAX_METADATA,
             "the closure metadata is unbounded"
         );
+        want = metadata_want(&prefix)
+            .filter(|next| *next > want)
+            .unwrap_or(want + METADATA_STEP)
+            .min(layout.tar_bytes);
     };
     prefix.truncate(end);
     let metadata = closure::read_metadata(&prefix, release, key)?;
@@ -469,34 +541,40 @@ pub async fn plan(
 }
 
 /// Fetch what `plan` wants into its partial stream and complete it as
-/// `target`. Each member is checked against its signed NARInfo once its
-/// bytes are there; a member that does not verify ends this way (take the
-/// full archive). Errors are [`KeepTrying`] or such a reason.
+/// `target`, [`AT_ONCE`] members at a time, each into its own place. Each
+/// member is checked against its signed NARInfo once its bytes are there; a
+/// member that does not verify ends this way (take the full archive). Errors
+/// are [`KeepTrying`] or such a reason.
 pub async fn stage(plan: &Plan, target: &Path) -> Result<()> {
     let partial = &plan.partial;
-    let mut file = open_partial(partial)?;
-    let (mut position, resumed) = resume(&mut file, plan)?;
-    for wanted in &plan.wanted[resumed..] {
-        let info = plan.info(wanted)?;
-        let start = position;
-        let end = wanted.offset + 512 + info.file_size;
-        let mut got = wanted.offset;
-        let fetched = plan
-            .source
-            .fill(&mut got, end, &mut |bytes| Ok(file.write_all(bytes)?))
-            .await;
-        let checked = fetched.and_then(|()| verify_entry(&file, start, wanted, plan));
-        if let Err(error) = checked {
-            // A drop keeps what verified before this member; the next try
-            // continues from there.
-            file.set_len(start)?;
-            return Err(error);
+    let file = open_partial(partial)?;
+    let slots = plan.slots()?;
+    let done = resume(&file, plan, &slots)?;
+    let fetches: Vec<Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>> = plan
+        .wanted
+        .iter()
+        .zip(&slots)
+        .zip(done)
+        .filter(|(_, done)| !done)
+        .map(|((wanted, at), _)| {
+            Box::pin(fetch_member(plan, &file, wanted, *at))
+                as Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>
+        })
+        .collect();
+    let mut keep_trying = None;
+    for result in at_most(AT_ONCE, fetches).await {
+        match result {
+            Ok(()) => {}
+            // What verified stays; the next try fetches the rest.
+            Err(error) if error.is::<KeepTrying>() => keep_trying = Some(error),
+            Err(error) => return Err(error),
         }
-        let padding = info.file_size.div_ceil(512) * 512 - info.file_size;
-        file.write_all(&vec![0; padding as usize])?;
-        position = start + 512 + info.file_size + padding;
     }
-    file.write_all(&[0; 1024])?;
+    if let Some(error) = keep_trying {
+        return Err(error);
+    }
+    file.write_all_at(&[0; 1024], plan.bytes - 1024)?;
+    file.set_len(plan.bytes)?;
     file.sync_all()?;
     ensure!(
         file.metadata()?.len() == plan.bytes,
@@ -505,6 +583,59 @@ pub async fn stage(plan: &Plan, target: &Path) -> Result<()> {
     fs::rename(partial, target)?;
     super::sync_directory(target.parent().ok_or_else(|| anyhow!("inbox"))?)?;
     Ok(())
+}
+
+/// Fetch one member into its place `at` and check it.
+async fn fetch_member(plan: &Plan, file: &File, wanted: &Wanted, at: u64) -> Result<()> {
+    let info = plan.info(wanted)?;
+    let mut got = wanted.offset;
+    let mut cursor = at;
+    plan.source
+        .fill(&mut got, wanted.offset + 512 + info.file_size, &mut |bytes| {
+            file.write_all_at(bytes, cursor)?;
+            cursor += bytes.len() as u64;
+            Ok(())
+        })
+        .await?;
+    verify_entry(file, at, wanted, plan)?;
+    let padding = info.file_size.div_ceil(512) * 512 - info.file_size;
+    file.write_all_at(&vec![0; padding as usize], at + 512 + info.file_size)?;
+    Ok(())
+}
+
+/// Run `tasks` on this task, at most `limit` at once; their results in
+/// their order.
+async fn at_most<'a, T>(
+    limit: usize,
+    tasks: Vec<Pin<Box<dyn Future<Output = T> + Send + 'a>>>,
+) -> Vec<T> {
+    let mut results: Vec<Option<T>> = tasks.iter().map(|_| None).collect();
+    let mut waiting = tasks.into_iter().enumerate();
+    let mut running = Vec::new();
+    std::future::poll_fn(|context| {
+        loop {
+            while running.len() < limit {
+                let Some(task) = waiting.next() else { break };
+                running.push(task);
+            }
+            if running.is_empty() {
+                return Poll::Ready(());
+            }
+            let before = running.len();
+            running.retain_mut(|(index, task)| match task.as_mut().poll(context) {
+                Poll::Ready(result) => {
+                    results[*index] = Some(result);
+                    false
+                }
+                Poll::Pending => true,
+            });
+            if running.len() == before {
+                return Poll::Pending;
+            }
+        }
+    })
+    .await;
+    results.into_iter().flatten().collect()
 }
 
 fn open_partial(partial: &Path) -> Result<File> {
@@ -530,49 +661,58 @@ fn open_partial(partial: &Path) -> Result<File> {
     Ok(open()?)
 }
 
-/// Keep what an earlier try staged: the same metadata, then each complete
-/// entry that still verifies. Returns where the stream continues and the
-/// first member it still lacks.
-fn resume(file: &mut File, plan: &Plan) -> Result<(u64, usize)> {
+/// Keep what an earlier try staged: the same metadata, then each member in
+/// its place that still verifies. Returns which members are there.
+fn resume(file: &File, plan: &Plan, slots: &[u64]) -> Result<Vec<bool>> {
     let length = file.metadata()?.len();
     let mut found = vec![0; plan.prefix.len().min(length as usize)];
-    file.seek(SeekFrom::Start(0))?;
-    file.read_exact(&mut found)?;
+    file.read_exact_at(&mut found, 0)?;
     if found != plan.prefix {
         file.set_len(0)?;
-        file.write_all(&plan.prefix)?;
-        return Ok((plan.prefix.len() as u64, 0));
+        file.write_all_at(&plan.prefix, 0)?;
+        return Ok(vec![false; plan.wanted.len()]);
     }
-    let mut position = plan.prefix.len() as u64;
-    let mut next = 0;
-    for wanted in &plan.wanted {
-        let size = plan.info(wanted)?.file_size;
-        let entry = 512 + size.div_ceil(512) * 512;
-        if length < position + entry || verify_entry(file, position, wanted, plan).is_err() {
-            break;
-        }
-        position += entry;
-        next += 1;
+    plan.wanted
+        .iter()
+        .zip(slots)
+        .map(|(wanted, at)| {
+            let entry = 512 + plan.info(wanted)?.file_size.div_ceil(512) * 512;
+            Ok(length >= at + entry && verify_entry(file, *at, wanted, plan).is_ok())
+        })
+        .collect()
+}
+
+/// Reads `file` from `position` on, without its shared offset: members are
+/// read and written at once.
+struct At<'a> {
+    file: &'a File,
+    position: u64,
+}
+impl Read for At<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.file.read_at(buffer, self.position)?;
+        self.position += read as u64;
+        Ok(read)
     }
-    file.set_len(position)?;
-    Ok((position, next))
 }
 
 /// The entry at `at` is `wanted`'s: its header, then its payload as its
 /// signed NARInfo says.
 fn verify_entry(file: &File, at: u64, wanted: &Wanted, plan: &Plan) -> Result<()> {
     let info = plan.info(wanted)?;
-    let mut reader = file;
-    reader.seek(SeekFrom::Start(at))?;
     let mut raw = [0; 512];
-    reader.read_exact(&mut raw)?;
+    file.read_exact_at(&mut raw, at)?;
     let (name, length, directory, _) = closure::header(&raw)?;
     ensure!(
         name == wanted.name && length == info.file_size && !directory,
         "the fetched member is not the one asked for"
     );
+    let payload = At {
+        file,
+        position: at + 512,
+    };
     plan.metadata
-        .verify_payload(info, reader.take(length), None)
+        .verify_payload(info, payload.take(length), None)
         .map_err(|error| error.context("a fetched closure member does not verify"))
 }
 
