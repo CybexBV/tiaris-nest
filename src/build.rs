@@ -270,7 +270,7 @@ pub fn spawn(state: AppState, _: crate::software_updates::OlderNestsCommitsTaken
         }
         sweep_stale_job_dirs(&state.config).await;
 
-        for worker_index in 0..state.config.build.max_concurrent_builds {
+        for worker_index in 0..state.config.build.concurrent_builds() {
             let worker_state = state.clone();
             tokio::spawn(async move { worker_loop(worker_state, worker_index).await });
         }
@@ -2144,6 +2144,10 @@ fn build_result_metadata(
         json!(crate::resources::job_peaks(job.id)),
     );
     metadata.insert("max_nix_jobs".into(), json!(config.build.max_nix_jobs));
+    metadata.insert(
+        "concurrent_builds".into(),
+        json!(config.build.concurrent_builds()),
+    );
     metadata.insert(
         "memory_per_build_bytes".into(),
         json!(config.build.memory_per_build_bytes),

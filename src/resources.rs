@@ -463,7 +463,8 @@ impl Admission {
             full_pressure = full_pressure.max(cgroup.pressure.full_avg10.unwrap_or(0.0));
         }
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.count >= config.max_concurrent_builds {
+        let concurrent_builds = config.concurrent_builds();
+        if state.count >= concurrent_builds {
             return None;
         }
         let mut capacity = snapshot.guest_total_bytes;
@@ -500,7 +501,7 @@ impl Admission {
         let required = config
             .memory_per_build_bytes
             .saturating_add(config.serving_memory_reserve_bytes);
-        if state.count >= config.max_concurrent_builds
+        if state.count >= concurrent_builds
             || full_pressure >= config.memory_pressure_full_percent as f64
             || available.saturating_sub(unconsumed) < required
         {
@@ -530,7 +531,10 @@ mod tests {
     }
     #[test]
     fn preserves_concurrency_and_does_not_double_charge_resident_builds() {
-        let config = crate::config::BuildConfig::default();
+        let config = crate::config::BuildConfig {
+            max_concurrent_builds: 2,
+            ..Default::default()
+        };
         let admission = Admission::default();
         let mut sample = Snapshot {
             guest_total_bytes: Some(18 * GIB),
