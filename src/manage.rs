@@ -43,6 +43,7 @@ use crate::{
 };
 
 mod compact_report;
+mod findings_ack;
 
 const CAPABILITY_BOOT_V1: &str = "boot_v1";
 const CAPABILITY_BUILDER_V1: &str = "builder_v1";
@@ -288,6 +289,9 @@ struct NestReportResponse {
     cache_evidence_required: Option<Value>,
     #[serde(default)]
     build_jobs_settled: Option<Value>,
+    /// The findings digest Manage holds (`findings_ack`).
+    #[serde(default)]
+    software_update_findings_acknowledged: Option<Value>,
 }
 
 #[derive(Debug, Default)]
@@ -597,6 +601,10 @@ struct NestAgentReportRequest {
     /// its App List packages at the candidate's commit.
     #[serde(skip_serializing_if = "Option::is_none")]
     software_update_findings: Option<Vec<crate::software_updates::findings::FindingReport>>,
+    /// The SHA-256 of the findings lane, also when it is left out because
+    /// Manage acknowledged it (`findings_ack`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    software_update_findings_sha256: Option<String>,
     /// To a Manage that accepts `site_check_v1`: the latest site check.
     #[serde(skip_serializing_if = "Option::is_none")]
     site_check: Option<crate::site_check::Report>,
@@ -1511,7 +1519,10 @@ async fn apply_nest_desired(
             )
             .await;
             match sync {
-                Ok(_) => {
+                Ok(stored) => {
+                    if stored.status == "queued" {
+                        crate::build::wake_workers();
+                    }
                     if let Err(error) = crate::software_updates::findings::record_hint(
                         &state.config.paths.data_dir,
                         &job.id,
@@ -1872,6 +1883,8 @@ async fn report_nest_state(
             None,
         )
     };
+    let (software_update_findings, software_update_findings_sha256) =
+        findings_ack::lane(software_update_findings);
     let body = NestAgentReportRequest {
         protocol_version: report_protocol,
         capabilities: nest_capabilities(peer_supports_scheduling, peer_support),
@@ -1891,6 +1904,7 @@ async fn report_nest_state(
         detected_nixpkgs_commits,
         software_update_checked_at,
         software_update_findings,
+        software_update_findings_sha256,
         site_check: peer_support
             .site_check
             .then(|| crate::site_check::report(&state.config.paths.data_dir))
@@ -1944,6 +1958,14 @@ fn accept_nest_report_response(
     if let Some(compact_refresh) = compact_refresh {
         compact_report::record(managed, body, compact_refresh, response);
     }
+    findings_ack::record(
+        body.software_update_findings.is_some(),
+        body.software_update_findings_sha256.as_deref(),
+        response
+            .software_update_findings_acknowledged
+            .as_ref()
+            .and_then(Value::as_str),
+    );
     log_nest_report_warnings(&response.warnings, managed);
     validate_workstation_netboot_report_receipt(response)
 }
@@ -6939,6 +6961,7 @@ mod tests {
             detected_nixpkgs_commits: None,
             software_update_checked_at: None,
             software_update_findings: None,
+            software_update_findings_sha256: None,
             site_check: None,
         }
     }
