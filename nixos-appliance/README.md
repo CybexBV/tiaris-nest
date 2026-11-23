@@ -514,6 +514,25 @@ generation. SSH permits only locked `tiaris-support`, disables root/password/
 keyboard-interactive login and delegates forwarding permission to the short-lived
 certificate extensions. Private key material never appears in evidence or logs.
 
+### Remote assistance on the school network
+
+When the organization enables remote assistance, the Nest runs coturn on its
+current LAN IPv4 address. Allow workstations and staff browsers to reach that
+address on UDP 3478. Also allow staff browsers to reach UDP 61000–61040 on the
+same address for relayed video. The Nest must be able to send UDP replies and
+relay traffic to the browser's high ports. These rules apply on the school's
+VPN as well. The Nest accepts sources in 10/8, 172.16/12, 192.168/16 and
+100.64/10. A browser uses unauthenticated STUN on UDP 3478 to learn its
+address. The workstation uses a short-lived TURN credential after the
+signed-in user allows the session.
+
+The relay can send only to high UDP ports on private IPv4 peers outside the
+Nest itself. Manage delivers the keys over the signed Nest configuration lane.
+The root service keeps the local keys in coturn's private SQLite database and
+changes them in place during rotation. When disabled, it stops coturn and
+removes the TURN firewall table, database and rendered configuration.
+`/run/tiaris-nest-turn/status.json` shows the listener, state and active key IDs.
+
 ## Generation update, commit and rollback
 
 NixOS advertises `appliance_update_v3`, retains `appliance_update_v1` for network

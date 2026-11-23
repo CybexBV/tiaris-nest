@@ -4,7 +4,8 @@ umask 077
 
 result="$(/usr/lib/tiaris-nest/tiaris-nest-bootstrap reconcile-network-runtime)"
 case "$result" in
-  unchanged|changed) ;;
+  unchanged) ;;
+  changed) systemctl --no-block start tiaris-nest-assist-turn.service ;;
   *)
     echo "network runtime reconciliation returned an invalid outcome" >&2
     exit 1
