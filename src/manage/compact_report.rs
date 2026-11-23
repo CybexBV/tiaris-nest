@@ -15,7 +15,8 @@
 //!   carries the new results of running installs and rollouts first. Which
 //!   ones Manage settled lives in memory: a restarted Nest sends each once
 //!   more. A job Manage lists again (its database was restored) changes
-//!   (`db::upsert_managed_build_job`), so its result goes again.
+//!   (`db::upsert_managed_build_job`, `db::record_rejected_managed_build_job`),
+//!   so its result goes again.
 //!
 //! The inventory generation advances on every local write to the cache table,
 //! also when the integrity check only records that it verified an artifact.
