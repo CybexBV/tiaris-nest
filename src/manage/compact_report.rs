@@ -15,7 +15,8 @@
 //!   carries the new results of running installs and rollouts first. Which
 //!   ones Manage settled lives in memory: a restarted Nest sends each once
 //!   more. A job Manage lists again (its database was restored) changes
-//!   (`db::upsert_managed_build_job`), so its result goes again.
+//!   (`db::upsert_managed_build_job`, `db::record_rejected_managed_build_job`),
+//!   so its result goes again.
 //!
 //! The inventory generation advances on every local write to the cache table,
 //! also when the integrity check only records that it verified an artifact.
@@ -45,6 +46,41 @@ fn settled() -> MutexGuard<'static, BTreeMap<i64, String>> {
     SETTLED
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The file next to `manage-state.json` that keeps the cache inventories
+/// across restarts.
+pub(super) const INVENTORIES_FILE: &str = "manage-cache-inventories.json";
+
+/// The cache inventories a restarted Nest keeps, so it does not send every
+/// closure manifest again. Not in `manage-state.json`: they grow with the
+/// cache (about 90 bytes an artifact), and the root updater reads that file
+/// with a 1 MiB limit. Earlier releases kept them there under the same
+/// names, so that file reads as well.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+pub(super) struct Inventories {
+    nest_cache_content: Option<CacheInventoryContent>,
+    nest_cache_acknowledged: Option<CacheInventoryContent>,
+}
+
+impl Inventories {
+    pub(super) fn of(managed: &ManagedState) -> Self {
+        Self {
+            nest_cache_content: managed.nest_cache_content.clone(),
+            nest_cache_acknowledged: managed.nest_cache_acknowledged.clone(),
+        }
+    }
+
+    /// Unreadable: none, and the inventory starts again.
+    pub(super) fn read(saved: &[u8]) -> Self {
+        serde_json::from_slice(saved).unwrap_or_default()
+    }
+
+    pub(super) fn restore(self, managed: &mut ManagedState) {
+        managed.nest_cache_content = self.nest_cache_content;
+        managed.nest_cache_acknowledged = self.nest_cache_acknowledged;
+    }
 }
 
 /// What the report sees of one artifact: its local id and when its reported

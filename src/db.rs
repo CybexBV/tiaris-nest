@@ -1495,6 +1495,11 @@ pub async fn upsert_managed_build_job(
 /// Tiaris screens reported free text for words like "credential" and blanks
 /// the whole value when it finds one -- which is every protected-material
 /// rejection -- so the prose alone reaches operators as "[redacted]".
+///
+/// Only a queued row takes the rejection. Any row Manage lists again changes
+/// (`updated_at`), as in [`upsert_managed_build_job`]: a Manage restored from
+/// a backup lists a rejected job again, and the result it settled before
+/// must go again (`manage::compact_report`).
 #[allow(clippy::too_many_arguments)]
 pub async fn record_rejected_managed_build_job(
     pool: &SqlitePool,
@@ -1519,15 +1524,22 @@ pub async fn record_rejected_managed_build_job(
           error, rejection_code, cache_metadata, completed_at, created_at, updated_at)
          VALUES (?, ?, '{}', ?, ?, ?, ?, 'failed', 100, 'failed', ?, ?, ?, '{}', ?, ?, ?)
          ON CONFLICT(managed_job_id) DO UPDATE SET
-             status = 'failed',
-             progress_percent = 100,
-             progress_stage = 'failed',
-             progress_message = excluded.progress_message,
-             error = excluded.error,
-             rejection_code = excluded.rejection_code,
-             completed_at = COALESCE(nest_build_jobs.completed_at, excluded.updated_at),
-             updated_at = excluded.updated_at
-         WHERE nest_build_jobs.status = 'queued'",
+             status = CASE WHEN nest_build_jobs.status = 'queued'
+                 THEN 'failed' ELSE nest_build_jobs.status END,
+             progress_percent = CASE WHEN nest_build_jobs.status = 'queued'
+                 THEN 100 ELSE nest_build_jobs.progress_percent END,
+             progress_stage = CASE WHEN nest_build_jobs.status = 'queued'
+                 THEN 'failed' ELSE nest_build_jobs.progress_stage END,
+             progress_message = CASE WHEN nest_build_jobs.status = 'queued'
+                 THEN excluded.progress_message ELSE nest_build_jobs.progress_message END,
+             error = CASE WHEN nest_build_jobs.status = 'queued'
+                 THEN excluded.error ELSE nest_build_jobs.error END,
+             rejection_code = CASE WHEN nest_build_jobs.status = 'queued'
+                 THEN excluded.rejection_code ELSE nest_build_jobs.rejection_code END,
+             completed_at = CASE WHEN nest_build_jobs.status = 'queued'
+                 THEN COALESCE(nest_build_jobs.completed_at, excluded.updated_at)
+                 ELSE nest_build_jobs.completed_at END,
+             updated_at = excluded.updated_at",
     )
     .bind(&managed_job_id)
     .bind(sanitize_report_field(
@@ -4412,8 +4424,13 @@ mod tests {
         // The rejected spec itself is never persisted.
         assert_eq!(recorded.build_spec, json!({}));
 
-        // Repeated sync cycles must not keep rewriting a terminal row.
-        let before = recorded.updated_at.clone();
+        // Manage settled the rejection, then a restored Manage lists the job
+        // again: the result goes again, with the reason first recorded.
+        let settled = [(recorded.id, recorded.updated_at.clone())];
+        let page = list_build_jobs_report_page(&pool, None, None, None, 1, &settled, 8, 1_000_000)
+            .await
+            .unwrap();
+        assert!(page.is_empty());
         record_rejected_managed_build_job(
             &pool,
             "managed-rejected-1",
@@ -4426,11 +4443,13 @@ mod tests {
         )
         .await
         .unwrap();
-        let unchanged = get_build_job_by_managed_id(&pool, "managed-rejected-1")
+        let page = list_build_jobs_report_page(&pool, None, None, None, 1, &settled, 8, 1_000_000)
             .await
             .unwrap();
-        assert_eq!(unchanged.updated_at, before);
-        assert!(unchanged.error.contains("protected material"));
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].status, "failed");
+        assert!(page[0].error.contains("protected material"));
+        assert_eq!(page[0].completed_at, recorded.completed_at);
     }
 
     #[test]

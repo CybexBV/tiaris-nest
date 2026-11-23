@@ -1235,4 +1235,4 @@ mod tests {
 
 #[cfg(test)]
 #[path = "closure_tests.rs"]
-pub(super) mod full_archive_tests;
+pub(crate) mod full_archive_tests;
