@@ -133,6 +133,8 @@ import (nixpkgs + "/nixos/tests/make-test-python.nix") ({ pkgs, ... }: {
     peer.wait_until_succeeds("ss -H -4lun | grep -F '198.51.100.20:5000'", timeout=15)
     peer.succeed(f"{fixture} provision initial")
     assert_address("100.64.50.10")
+    appliance.succeed("grep -Fx 'max-bps=500000' /run/tiaris-nest-turn/turnserver.conf")
+    appliance.succeed("grep -Fx 'bps-capacity=5000000' /run/tiaris-nest-turn/turnserver.conf")
     peer.succeed(f"{fixture} positive 100.64.50.10 0")
     appliance.succeed("test $(stat -c %a /var/lib/tiaris-nest/state/agent/assist-turn.json) = 600")
     appliance.succeed("test $(stat -c %U:%G:%a /run/tiaris-nest-turn/turnserver.conf) = root:tiaris-turn:640")

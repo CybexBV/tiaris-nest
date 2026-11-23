@@ -44,8 +44,8 @@ def provision(stage):
     config = {'schema': SCHEMA, 'enabled': stage != 'off'}
     if stage != 'off':
         selected = {'initial': (0,), 'overlap': (0, 1), 'rotated': (1,)}[stage]
-        config.update(port=PORT, relay_ports=[61000, 61040], max_bps=3000000,
-                      bps_capacity=30000000, total_quota=40, user_quota=2,
+        config.update(port=PORT, relay_ports=[61000, 61040], max_bps=500_000,
+                      bps_capacity=5_000_000, total_quota=40, user_quota=2,
                       secrets=[{'id': IDS[i], 'value': values[i]} for i in selected])
     req = urllib.request.Request(FIXTURE_HTTP, data=json.dumps(config).encode(), method='POST')
     with urllib.request.urlopen(req, timeout=3) as response:

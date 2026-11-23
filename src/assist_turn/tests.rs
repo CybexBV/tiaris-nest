@@ -31,7 +31,7 @@ fn config() -> Value {
         "schema": SCHEMA, "enabled": true,
         "secrets": [{"id": "20261123-abcdef01", "value": secret}],
         "port": PORT, "relay_ports": RELAY_PORTS,
-        "max_bps": 3_000_000, "bps_capacity": 30_000_000, "total_quota": 40, "user_quota": 2,
+        "max_bps": 500_000, "bps_capacity": 5_000_000, "total_quota": 40, "user_quota": 2,
     })
 }
 
@@ -49,6 +49,8 @@ fn atomic_configuration_is_private_and_withdraws_invalid_or_missing_settings() {
 
     for (field, bad_value) in [
         ("port", json!(3479)),
+        ("max_bps", json!(500_001)),
+        ("bps_capacity", json!(5_000_001)),
         ("relay_ports", json!([61000, 61041])),
         ("secrets", json!([])),
         ("schema", json!("unknown")),
