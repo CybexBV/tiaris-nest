@@ -3525,7 +3525,7 @@ mod tests {
             RuntimeReconcileRequest::Desired { desired, .. } => {
                 assert_eq!(desired.reconcile_generation, 2)
             }
-            RuntimeReconcileRequest::DecodeFailure { .. } => panic!("latest request changed kind"),
+            _ => panic!("latest request changed kind"),
         }
         fixture.cleanup();
     }

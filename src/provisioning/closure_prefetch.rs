@@ -180,7 +180,7 @@ mod tests {
         let status = SetupStatusReporter::new(None);
         let mut prefetch = ClosurePrefetch::new(Path::new("/nonexistent"), "1.2.3");
 
-        let other = tokio::spawn(std::future::pending());
+        let other = tokio::spawn(std::future::pending::<Result<AuthenticatedArchive>>());
         let stopped = other.abort_handle();
         prefetch.download = Some(download(&"0".repeat(64), other));
         assert!(prefetch.hand_over(&plan, &status).await.is_none());
