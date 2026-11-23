@@ -126,6 +126,7 @@ def binding(source, destination, expected):
         assert response.message_class == stun.Class.RESPONSE
         assert response.transaction_id == msg.transaction_id
         assert response.attributes['XOR-MAPPED-ADDRESS'] == probe.getsockname()[:2]
+        assert 'SOFTWARE' not in response.attributes and 'MAPPED-ADDRESS' not in response.attributes
 
 
 class Receiver(asyncio.DatagramProtocol):
@@ -178,6 +179,11 @@ async def rotation():
         await private_exchange(old)
         assert old.relayed_address == original_relay
         await asyncio.to_thread(uclient, LAN, 1)
+        retired = await client(0)
+        try:
+            await refused(retired.connect(), (401, 441))
+        finally:
+            retired.transport.close()
     finally:
         await old.delete()
 
@@ -207,13 +213,9 @@ async def boundary():
     try:
         for address in (LAN, '127.0.0.1', '0.0.0.0', PEER_IPV6):
             await refused(protocol.channel_bind(0x4010, (address, PEER_PORT)), (403, 443))
-        # Prove the kernel blocks these peers even when TURN allows the bind.
-        for address, port in ((PUBLIC, PEER_PORT), (PEER, LOW_PORT), (OTHER_LOCAL, PEER_PORT)):
-            await protocol.send_data(PAYLOAD, (address, port))
-            await no_packet(protocol.receiver.incoming, f'outbound {address}:{port}')
         await private_exchange(protocol)
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as outside:
-            outside.bind((PUBLIC, PEER_PORT + 1))
+            outside.bind((PUBLIC, 0))
             await protocol.channel_bind(0x4010, outside.getsockname())
             protocol.channel_to_peer[0x4010] = outside.getsockname()
             outside.sendto(PAYLOAD, relay)
@@ -221,6 +223,21 @@ async def boundary():
         await private_exchange(protocol)
     finally:
         await protocol.delete()
+
+    # A kernel denial returns EPERM. Coturn closes that relay socket, so use
+    # a separate verified allocation for each egress rule the VM checks.
+    for address, port in ((PUBLIC, PEER_PORT), (PEER, LOW_PORT), (OTHER_LOCAL, PEER_PORT)):
+        denied = await client(0)
+        await allocate(denied)
+        try:
+            await private_exchange(denied)
+            await denied.send_data(PAYLOAD, (address, port))
+            await no_packet(denied.receiver.incoming, f'outbound {address}:{port}')
+        finally:
+            try:
+                await asyncio.wait_for(denied.delete(), 2)
+            finally:
+                denied.transport.close()
 
     ipv6 = await client(0)
     # RFC 6156's requested address family attribute, absent in older aioice.

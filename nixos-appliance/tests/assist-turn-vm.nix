@@ -10,14 +10,14 @@ import (nixpkgs + "/nixos/tests/make-test-python.nix") ({ pkgs, ... }: {
     appliance = { lib, ... }:
       let
         bootstrap = pkgs.writeShellScript "turn-fixture-network-bootstrap" ''
-          if [[ -f /run/turn-next-address ]]; then
-            address="$(cat /run/turn-next-address)"
-            rm /run/turn-next-address
-            printf '[server]\npublic_base_url = "http://%s"\n' "$address" > /etc/tiaris-nest/config.toml
-            printf 'changed\n'
-          else
+          address=$(${pkgs.iproute2}/bin/ip -j -4 addr show dev eth1 dynamic |
+            ${pkgs.jq}/bin/jq -r '.[].addr_info[].local')
+          if [[ -z "$address" ]] || grep -Fxq "public_base_url = \"http://$address\"" /etc/tiaris-nest/config.toml; then
             printf 'unchanged\n'
+            exit
           fi
+          printf '[server]\npublic_base_url = "http://%s"\n' "$address" > /etc/tiaris-nest/config.toml
+          printf 'changed\n'
         '';
         package = pkgs.runCommand "turn-fixture-nest" { version = "0.0.0"; } ''
           mkdir -p $out/bin $out/share/tiaris-nest/assets
@@ -73,7 +73,10 @@ import (nixpkgs + "/nixos/tests/make-test-python.nix") ({ pkgs, ... }: {
           text = ''
             install -d -m0755 /etc/tiaris-nest
             install -d -m0750 -o root -g tiaris-nest /var/lib/tiaris-nest/state
-            install -d -m0700 -o tiaris-nest -g tiaris-nest /var/lib/tiaris-nest/state/agent
+            install -d -m0700 -o tiaris-nest -g tiaris-nest /var/lib/tiaris-nest/state/{agent,inbox}
+            install -d -m0755 /var/cache/tiaris-nest/tftp
+            install -d -m0750 /var/lib/tiaris-nest/control
+            install -m0640 /dev/null /var/lib/tiaris-nest/control/management-cidrs.txt
             printf '[server]\npublic_base_url = "http://100.64.50.10"\n' > /etc/tiaris-nest/config.toml
             chmod 0640 /etc/tiaris-nest/config.toml
           '';
@@ -93,7 +96,7 @@ import (nixpkgs + "/nixos/tests/make-test-python.nix") ({ pkgs, ... }: {
       networking.interfaces.eth1.ipv6.addresses = lib.mkForce [
         { address = "fd42:50::20"; prefixLength = 64; }
       ];
-      environment.systemPackages = [ pkgs.coturn (pkgs.python3.withPackages (ps: [ ps.aioice ])) ];
+      environment.systemPackages = [ pkgs.coturn pkgs.dnsmasq (pkgs.python3.withPackages (ps: [ ps.aioice ])) ];
       environment.etc."assist-turn-fixture.py".source = ./assist-turn-fixture.py;
     };
   };
@@ -105,11 +108,11 @@ import (nixpkgs + "/nixos/tests/make-test-python.nix") ({ pkgs, ... }: {
 
     def assert_address(address):
         appliance.wait_until_succeeds(f"jq -e '.state == \"running\" and .listen_ipv4 == \"{address}\"' {status}", timeout=25)
-        appliance.succeed(f"ss -H -4lun 'sport = :3478' | grep -F ' {address}:3478 '")
-        appliance.fail(f"ss -H -4lun 'sport = :3478' | grep -vF ' {address}:3478 '")
-        appliance.fail("ss -H -6lun 'sport = :3478' | grep .")
-        appliance.fail("ss -H -ltn 'sport = :3478' | grep .")
-        appliance.fail("ss -H -lun 'sport = :3479 or sport = :5349' | grep .")
+        listeners = appliance.succeed("ss -H -luntp | grep -F turnserver").splitlines()
+        assert listeners and all(
+            line.startswith("udp ") and f" {address}:3478 " in line
+            for line in listeners
+        ), listeners
 
     start_all()
     appliance.wait_for_unit("multi-user.target")
@@ -138,7 +141,7 @@ import (nixpkgs + "/nixos/tests/make-test-python.nix") ({ pkgs, ... }: {
             appliance.wait_until_succeeds("ss -H -lun | grep -F '100.64.50.12:5000'", timeout=15)
             peer.succeed("ss -H -lun | grep -F '100.64.50.20:900'")
             peer.succeed(f"{fixture} boundary")
-            appliance.succeed("nft list chain inet tiaris_nest_turn input | grep -E 'saddr != @private4 counter packets [2-9][0-9]* '")
+            appliance.succeed("nft list chain inet tiaris_nest_turn input | grep -E 'saddr != @private4 counter packets ([2-9]|[1-9][0-9]+) '")
             appliance.succeed("nft list chain inet tiaris_nest_turn output | grep -E 'daddr != @private4 counter packets [1-9][0-9]* '")
             appliance.succeed("nft list chain inet tiaris_nest_turn output | grep -E 'fib daddr type .*counter packets [1-9][0-9]* '")
             appliance.succeed("nft list chain inet tiaris_nest_turn output | grep -E 'udp dport 0-1023 counter packets [1-9][0-9]* '")
@@ -147,11 +150,12 @@ import (nixpkgs + "/nixos/tests/make-test-python.nix") ({ pkgs, ... }: {
             peer.succeed(f"{fixture} rotation")
             appliance.succeed(f"test $(systemctl show -p MainPID --value {unit}) = {pid}")
             appliance.succeed(f"jq -e '.secret_ids == [\"20261123-00000002\"]' {status}")
-        with subtest("re-render after the active address changes"):
-            appliance.succeed("sysctl -w net.ipv4.conf.eth1.promote_secondaries=1")
-            appliance.succeed("ip addr add 100.64.50.11/24 dev eth1")
-            appliance.succeed("ip addr del 100.64.50.10/24 dev eth1")
-            appliance.succeed("printf 100.64.50.11 > /run/turn-next-address")
+        with subtest("re-render after DHCP assigns a new address"):
+            appliance.succeed("systemctl stop tiaris-nest-network-runtime.timer")
+            peer.succeed("systemd-run --unit=turn-test-dhcp $(command -v dnsmasq) --no-daemon --port=0 --interface=eth1 --bind-interfaces --dhcp-range=100.64.50.11,100.64.50.11,255.255.255.0,5m --dhcp-option=option:router --dhcp-option=option:dns-server")
+            peer.wait_for_unit("turn-test-dhcp.service")
+            appliance.succeed("install -d /run/systemd/network/40-eth1.network.d; printf '[Network]\nDHCP=ipv4\n' > /run/systemd/network/40-eth1.network.d/turn-dhcp.conf; networkctl reload; networkctl reconfigure eth1")
+            appliance.wait_until_succeeds("ip -4 addr show dev eth1 dynamic | grep -F '100.64.50.11/24'", timeout=30)
             appliance.succeed("systemctl start tiaris-nest-network-runtime.service")
             assert_address("100.64.50.11")
             peer.succeed(f"{fixture} positive 100.64.50.11 1")
@@ -160,6 +164,8 @@ import (nixpkgs + "/nixos/tests/make-test-python.nix") ({ pkgs, ... }: {
     appliance.wait_until_succeeds(f"jq -e '.state == \"stopped\"' {status}", timeout=25)
     appliance.fail(f"systemctl is-active {unit}")
     appliance.fail("nft list table inet tiaris_nest_turn")
+    appliance.succeed("nft list table inet tiaris_nest >/dev/null")
+    appliance.succeed("jq -e '.enabled == false and (has(\"secrets\") | not)' /var/lib/tiaris-nest/state/agent/assist-turn.json")
     appliance.succeed("test ! -e /var/lib/tiaris-nest-turn && test ! -e /run/tiaris-nest-turn/turnserver.conf")
   '';
 }) { system = "x86_64-linux"; }
