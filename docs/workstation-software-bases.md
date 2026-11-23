@@ -50,9 +50,16 @@ Nest serves: would this commit make the Nest compile something the release's
 own nixpkgs commit (the pin) does not? If not, the commit is `ready` and
 Manage offers it as a software update.
 
-- **When.** Once a day at a random minute between 01:00 and 05:00 in the
-  update-schedule time zone (UTC without a schedule), and when Manage's Nest
-  configuration carries a newer `software_update_check_requested_at`. The
+- **When.** Every six hours, starting at a random minute between 01:00 and
+  05:00 in the update-schedule time zone (UTC without a schedule), and when
+  Manage's Nest configuration carries a newer
+  `software_update_check_requested_at`. Reading the channel is one small
+  request; the heavy evaluation of a new commit starts only in the night
+  window (01:00 to 05:00) or once nothing kept the Nest busy for 10 minutes
+  (no computer served or starting, no build), the same quiet period its own
+  updates wait for. A commit found by day looks every 5 minutes whether the
+  Nest became idle and is evaluated at night at the latest. A request from
+  Manage, and the look right after an update of this Nest, evaluate at once. The
   channel is `software_update_channel`, default `nixos-26.05`; Nest refuses any
   channel of another NixOS release, and a commit whose `lib.trivial.release`
   differs is never recorded. Only Nests with Blueprint targets that report to
@@ -73,8 +80,9 @@ Manage offers it as a software update.
   the record of every commit another Nest build held back is removed, and an
   updated Nest whose new build has recorded no commit yet reads the channel
   again at once: the update may be what the commit waited for. A newly
-  installed Nest has no records and waits for the daily check: the
-  evaluation is heavy and its first hours are the school's install day. A
+  installed Nest has no records and waits for the scheduled check, which
+  evaluates only when it is idle or at night: the evaluation is heavy and its
+  first hours are the school's install day. A
   ready commit stays ready. A request from Manage
   repeats only the channel lookup. One commit's
   evaluation is bounded to 60 minutes (`evaluation_failed`, `time limit`).

@@ -1,9 +1,11 @@
-//! Nest-driven software updates: the daily NixOS channel check.
+//! Nest-driven software updates: the NixOS channel check.
 //!
-//! Once a day, at a random minute between 01:00 and 05:00 in the Nest's
-//! update-schedule time zone, and when Manage asks
+//! Every six hours, at a random minute that falls between 01:00 and 05:00 in
+//! the Nest's update-schedule time zone, and when Manage asks
 //! (`software_update_check_requested_at`), Nest reads the newest commit of its
-//! NixOS channel. A commit it has not handled is evaluated, never built:
+//! NixOS channel. A commit it has not handled is evaluated, never built. The
+//! evaluation is heavy: a commit found by day waits until the Nest is idle or
+//! the night comes (`may_prepare`), so school hours are not slowed.
 //!
 //! 1. The commit must be on the channel's branch of NixOS/nixpkgs after the
 //!    release pin (GitHub compare). `nix flake metadata` records its
@@ -32,7 +34,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{DateTime, Days, NaiveTime, TimeZone, Utc};
+use chrono::{DateTime, Days, NaiveTime, TimeZone, Timelike, Utc};
 use rand::{Rng, RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -76,12 +78,19 @@ const GITHUB_COMPARE: &str = "https://api.github.com/repos/NixOS/nixpkgs/compare
 const MAX_GITHUB_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const SYSTEM_IDENTITY_PATH: &str = "/usr/share/tiaris-nest/system-identity.json";
 const MAX_SYSTEM_IDENTITY_BYTES: u64 = 64 * 1024;
-/// 01:00 local time, and the length of the daily window in minutes.
-const DAILY_WINDOW_START_MINUTE: u32 = 60;
-const DAILY_WINDOW_MINUTES: u32 = 240;
+/// 01:00 local time, and the length of the night window in minutes.
+const NIGHT_WINDOW_START_MINUTE: u32 = 60;
+const NIGHT_WINDOW_MINUTES: u32 = 240;
+/// The channel is read four times a day, the first in the night window.
+const CHECKS_PER_DAY: u32 = 4;
+/// A commit found by day is evaluated once nothing kept the Nest busy this
+/// long, as its own updates wait (`tiaris-nest-appliance-update-window`).
+const QUIET_BEFORE_PREPARING: chrono::Duration = chrono::Duration::minutes(10);
+/// How often a commit found by day looks whether the Nest became idle.
+const WAITING_POLL: Duration = Duration::from_secs(5 * 60);
 const ON_DEMAND_MIN_INTERVAL: chrono::Duration = chrono::Duration::minutes(10);
 /// The check right after an update of this Nest is tried this often, this
-/// far apart, before it is left to the daily check.
+/// far apart, before it is left to the scheduled checks.
 const STARTUP_CHECK_ATTEMPTS: u32 = 5;
 const STARTUP_CHECK_RETRY: Duration = Duration::from_secs(120);
 const CHANNEL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -221,7 +230,7 @@ fn parse_timestamp(value: Option<&str>) -> Option<DateTime<Utc>> {
 
 /// The software-update lane of the Nest configuration Manage sends. Both
 /// fields are optional; an older Manage sends neither and Nest follows the
-/// default channel on its daily schedule.
+/// default channel on its schedule.
 pub(crate) async fn apply_managed(
     data_dir: &Path,
     channel: Option<&Value>,
@@ -486,7 +495,7 @@ async fn ready_commits_in_use(db: &SqlitePool, data_dir: &Path) -> Result<Vec<St
         .collect())
 }
 
-/// Start the daily check. Only Nests that build Blueprints and report to
+/// Start the channel check. Only Nests that build Blueprints and report to
 /// Manage check for updates.
 pub fn spawn(state: AppState) {
     if !state.config.manage.enabled
@@ -500,7 +509,7 @@ pub fn spawn(state: AppState) {
 
 async fn run(state: AppState) {
     remove_interrupted_checks(&state.config).await;
-    let offset = rand::thread_rng().gen_range(0..DAILY_WINDOW_MINUTES);
+    let offset = rand::thread_rng().gen_range(0..NIGHT_WINDOW_MINUTES);
     match check_state(&state.config.paths.data_dir).await {
         Ok(current) if pending_request(&current).is_some() => check_now().notify_one(),
         Ok(_) => {}
@@ -508,7 +517,7 @@ async fn run(state: AppState) {
     }
     // After an update of this Nest, the ready commits of the previous build
     // stay, what it held back is forgotten, and the channel is looked at
-    // again now rather than at the daily check: the update may be what it
+    // again now rather than at the next scheduled check: the update may be what it
     // waited for. (The ready commits of Nest 0.2.173 and older were taken
     // over before this task started: `take_over_commits_of_older_nests`.)
     let data_dir = &state.config.paths.data_dir;
@@ -516,8 +525,8 @@ async fn run(state: AppState) {
     if forgot || updated_nest_has_not_looked(data_dir).await {
         // The network may come up after the Nest: try for some minutes.
         for attempt in 1..=STARTUP_CHECK_ATTEMPTS {
-            match check(&state).await {
-                Ok(()) => break,
+            match check(&state, Prepare::Now).await {
+                Ok(_) => break,
                 Err(error) => {
                     warn!(attempt, error = %error, "software update check after an update of this Nest failed");
                     sleep(STARTUP_CHECK_RETRY).await;
@@ -525,19 +534,27 @@ async fn run(state: AppState) {
             }
         }
     }
+    // A commit found by day that waits for a quiet Nest or the night.
+    let mut waiting = false;
     loop {
         let timezone = crate::appliance::nixos::is_nixos()
             .then(crate::appliance::schedule::timezone)
             .flatten()
             .unwrap_or(chrono_tz::UTC);
         let now = Utc::now();
-        let wait = (next_daily_check(now, timezone, offset) - now)
-            .to_std()
-            .unwrap_or_default();
+        let scheduled = next_check(now, timezone, offset);
+        let mut wait = (scheduled - now).to_std().unwrap_or_default();
+        if waiting {
+            wait = wait.min(WAITING_POLL);
+        }
         let on_demand = tokio::select! {
             _ = sleep(wait) => false,
             _ = check_now().notified() => true,
         };
+        if !on_demand && Utc::now() < scheduled && !may_prepare(Utc::now(), timezone) {
+            // Still busy, and still day: the commit waits.
+            continue;
+        }
         let current = check_state(&state.config.paths.data_dir)
             .await
             .unwrap_or_default();
@@ -554,8 +571,22 @@ async fn run(state: AppState) {
             }
             continue;
         }
-        let outcome = match check(&state).await {
-            Ok(()) => Ok(()),
+        // Manage's request is an admin's: it evaluates at once, as the check
+        // right after an update of this Nest does.
+        let prepare = if on_demand {
+            Prepare::Now
+        } else {
+            Prepare::WhenQuiet(timezone)
+        };
+        let outcome = match check(&state, prepare).await {
+            Ok(Checked::Waiting) => {
+                waiting = true;
+                continue;
+            }
+            Ok(Checked::Done) => {
+                waiting = false;
+                Ok(())
+            }
             Err(error) => {
                 warn!(error = %error, "software update check failed");
                 Err(format!("{error:#}").chars().take(500).collect::<String>())
@@ -618,19 +649,27 @@ pub(crate) async fn checked_at(data_dir: &Path) -> Result<Option<String>> {
         .map(|value| value.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)))
 }
 
-/// The next daily check after `now`: 01:00 plus `offset_minutes` (below 240)
-/// in `timezone`, today or tomorrow. A time skipped by a DST change runs an
-/// hour later.
-fn next_daily_check<Tz: TimeZone>(
+/// The next scheduled check after `now`: 01:00 plus `offset_minutes` (below
+/// 240) in `timezone`, and every six hours after it, today or tomorrow. A
+/// time skipped by a DST change runs an hour later.
+fn next_check<Tz: TimeZone>(
     now: DateTime<Utc>,
     timezone: Tz,
     offset_minutes: u32,
 ) -> DateTime<Utc> {
-    let minute = DAILY_WINDOW_START_MINUTE + offset_minutes % DAILY_WINDOW_MINUTES;
-    let time = NaiveTime::from_hms_opt(minute / 60, minute % 60, 0).expect("minute within a day");
+    let first = NIGHT_WINDOW_START_MINUTE + offset_minutes % NIGHT_WINDOW_MINUTES;
     let today = now.with_timezone(&timezone).date_naive();
-    for date in [today, today + Days::new(1), today + Days::new(2)] {
-        let local = date.and_time(time);
+    let times = [today, today + Days::new(1), today + Days::new(2)]
+        .into_iter()
+        .flat_map(|date| {
+            (0..CHECKS_PER_DAY).map(move |slot| {
+                let minute = first + slot * (24 * 60 / CHECKS_PER_DAY);
+                let time = NaiveTime::from_hms_opt(minute / 60, minute % 60, 0)
+                    .expect("minute within a day");
+                date.and_time(time)
+            })
+        });
+    for local in times {
         let candidate = timezone
             .from_local_datetime(&local)
             .earliest()
@@ -644,14 +683,45 @@ fn next_daily_check<Tz: TimeZone>(
             return candidate;
         }
     }
-    now + chrono::Duration::days(1)
+    now + chrono::Duration::hours(6)
+}
+
+/// Whether the heavy evaluation of a new commit may start: in the night
+/// window, or once nothing kept the Nest busy for `QUIET_BEFORE_PREPARING`.
+fn may_prepare<Tz: TimeZone>(now: DateTime<Utc>, timezone: Tz) -> bool {
+    let local = now.with_timezone(&timezone);
+    prepare_now(
+        local.hour() * 60 + local.minute(),
+        crate::activity::quiet_for(now),
+    )
+}
+
+fn prepare_now(local_minute: u32, quiet_for: Option<chrono::Duration>) -> bool {
+    (NIGHT_WINDOW_START_MINUTE..NIGHT_WINDOW_START_MINUTE + NIGHT_WINDOW_MINUTES)
+        .contains(&local_minute)
+        || quiet_for.is_some_and(|quiet| quiet >= QUIET_BEFORE_PREPARING)
+}
+
+/// When a new commit is evaluated.
+#[derive(Clone, Copy)]
+enum Prepare {
+    /// Now: an admin asked, or this Nest was just updated.
+    Now,
+    /// Only when `may_prepare`; otherwise the check waits.
+    WhenQuiet(chrono_tz::Tz),
+}
+
+enum Checked {
+    Done,
+    /// A new commit waits for a quiet Nest or the night.
+    Waiting,
 }
 
 /// Read the channel and handle its newest commit. A commit already recorded
 /// is evaluated again only when its evaluation, provenance or disk check
 /// failed at least a day ago; a request from Manage repeats only the channel
 /// lookup. Network failures before evaluation record nothing.
-async fn check(state: &AppState) -> Result<()> {
+async fn check(state: &AppState, prepare: Prepare) -> Result<Checked> {
     let data_dir = &state.config.paths.data_dir;
     let channel = check_state(data_dir)
         .await?
@@ -664,10 +734,16 @@ async fn check(state: &AppState) -> Result<()> {
     if !crate::config::workstation_nixpkgs_commits(&state.config).contains(&commit) {
         let existing = detected_row(data_dir, &commit).await?;
         if needs_evaluation(existing.as_ref(), Utc::now()) {
+            if let Prepare::WhenQuiet(timezone) = prepare {
+                if !may_prepare(Utc::now(), timezone) {
+                    info!(%commit, "found a newer NixOS channel commit; it is checked once the Nest is idle or at night");
+                    return Ok(Checked::Waiting);
+                }
+            }
             evaluate_and_record(state, &channel, &commit, existing.as_ref()).await?;
         }
     }
-    Ok(())
+    Ok(Checked::Done)
 }
 
 /// A commit is evaluated when it is new, and when its evaluation, provenance
@@ -752,9 +828,10 @@ async fn adopt_ready_commits_of_older_nests(data_dir: &Path) {
 /// Whether this Nest was updated and its new build has not recorded a commit
 /// yet: another build left records (in this Nest's folder or an older
 /// Nest's) and none is this build's. Such a Nest looks at the channel when
-/// it starts. A newly installed Nest has no records and waits for the daily
-/// check, at night: the evaluation is heavy, and its first hours are the
-/// day the school installs its computers.
+/// it starts. A newly installed Nest has no records and waits for the
+/// scheduled check, which evaluates only when the Nest is idle or at night:
+/// the evaluation is heavy, and its first hours are the day the school
+/// installs its computers.
 async fn updated_nest_has_not_looked(data_dir: &Path) -> bool {
     let build = nest_build_identity();
     let rows = detected_rows(data_dir).await.unwrap_or_default();
