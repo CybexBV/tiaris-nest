@@ -66,6 +66,11 @@ const FAILURE_MESSAGE_MAX_CHARS: usize = 512;
 pub const BOOT_SESSION_SECONDS: i64 = 24 * 60 * 60;
 const BOOT_CONTEXT_MAX_BYTES: usize = 64 * 1024;
 const BUNDLE_RETENTION_SECONDS: i64 = 7 * 24 * 60 * 60;
+/// Verified bundles kept besides the ones in use (active, previous, desired
+/// and those a live boot session names): the newest one, for at most
+/// `BUNDLE_RETENTION_SECONDS`. Each tree is about 1.4 GB, and a development
+/// Nest takes several runtimes a week.
+const MAX_UNREFERENCED_BUNDLES: i64 = 1;
 // Renew verified evidence with headroom before Tiaris's 24-hour freshness gate.
 const SCRUB_INTERVAL_SECONDS: i64 = 12 * 60 * 60;
 const MAINTENANCE_INTERVAL_SECONDS: u64 = 60 * 60;
@@ -2620,25 +2625,38 @@ async fn quarantine_tree_only(
     Ok(())
 }
 
-async fn prune_expired_bundles(state: &AppState) -> Result<usize> {
-    let now_text = now();
-    let now_unix = Utc::now().timestamp();
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT bundle.bundle_sha256, bundle.root_path
-         FROM workstation_netboot_bundles bundle
-         JOIN workstation_netboot_runtime runtime ON runtime.singleton_id = 1
-         WHERE bundle.retention_state = 'verified'
-           AND bundle.retained_until IS NOT NULL AND bundle.retained_until < ?
-           AND bundle.bundle_sha256 <> runtime.active_bundle_sha256
+/// A bundle nothing uses: not the active, previous or desired runtime, and
+/// no boot session that may still read it. The same condition guards the
+/// delete, so a bundle promoted meanwhile is put back, never removed.
+const BUNDLE_UNREFERENCED: &str = "bundle.bundle_sha256 <> runtime.active_bundle_sha256
            AND bundle.bundle_sha256 <> runtime.previous_bundle_sha256
+           AND bundle.bundle_sha256 IS NOT json_extract(
+                 CASE WHEN json_valid(runtime.desired_descriptor_json)
+                      THEN runtime.desired_descriptor_json END, '$.sha256')
            AND NOT EXISTS (
              SELECT 1 FROM nest_boot_sessions session
              WHERE session.bundle_sha256 = bundle.bundle_sha256 AND session.expires_at >= ?
-           )
-         ORDER BY bundle.retained_until LIMIT 8",
-    )
-    .bind(&now_text)
+           )";
+
+/// Remove verified bundles nothing uses once they are older than the
+/// retention period, or beyond the newest `MAX_UNREFERENCED_BUNDLES`.
+async fn prune_expired_bundles(state: &AppState) -> Result<usize> {
+    let now_text = now();
+    let now_unix = Utc::now().timestamp();
+    let rows: Vec<(String, String)> = sqlx::query_as(&format!(
+        "SELECT bundle_sha256, root_path FROM (
+           SELECT bundle.bundle_sha256, bundle.root_path, bundle.retained_until,
+                  ROW_NUMBER() OVER (ORDER BY bundle.verified_at DESC, bundle.bundle_sha256) AS newest
+           FROM workstation_netboot_bundles bundle
+           JOIN workstation_netboot_runtime runtime ON runtime.singleton_id = 1
+           WHERE bundle.retention_state = 'verified' AND {BUNDLE_UNREFERENCED}
+         )
+         WHERE newest > ? OR retained_until IS NULL OR retained_until < ?
+         ORDER BY newest DESC LIMIT 8"
+    ))
     .bind(now_unix)
+    .bind(MAX_UNREFERENCED_BUNDLES)
+    .bind(&now_text)
     .fetch_all(&state.db)
     .await?;
     let public_root = state.config.paths.boot_assets_dir.join("netboot");
@@ -2659,12 +2677,16 @@ async fn prune_expired_bundles(state: &AppState) -> Result<usize> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        let result = sqlx::query(
-            "DELETE FROM workstation_netboot_bundles
-             WHERE bundle_sha256 = ? AND retention_state = 'verified' AND retained_until < ?",
-        )
+        let result = sqlx::query(&format!(
+            "DELETE FROM workstation_netboot_bundles WHERE bundle_sha256 IN (
+               SELECT bundle.bundle_sha256 FROM workstation_netboot_bundles bundle
+               JOIN workstation_netboot_runtime runtime ON runtime.singleton_id = 1
+               WHERE bundle.bundle_sha256 = ? AND bundle.retention_state = 'verified'
+                 AND {BUNDLE_UNREFERENCED}
+             )"
+        ))
         .bind(&bundle_sha256)
-        .bind(&now_text)
+        .bind(now_unix)
         .execute(&state.db)
         .await;
         match result {
@@ -4034,6 +4056,109 @@ mod tests {
         let report = report(&fixture.state).await.unwrap();
         assert_eq!(report.active_bundle_sha256, newer.sha256);
         assert_eq!(report.reconcile_generation, Some(2));
+        fixture.cleanup();
+    }
+
+    /// Bundles in use stay: active, previous, desired, and one a boot session
+    /// still reads. Of the others only the newest stays, and only for the
+    /// retention period; a development Nest once kept 29 trees of 1.4 GB.
+    #[tokio::test]
+    async fn retention_keeps_bundles_in_use_and_only_the_newest_other_one() {
+        let fixture = RuntimeFilesystemFixture::new().await;
+        let mut bundles = Vec::new();
+        for (index, letter) in ["a", "b", "c", "d", "e", "f", "0"].iter().enumerate() {
+            let descriptor = fixture
+                .install_bundle(&format!("1.0.{index}"), &letter.repeat(64))
+                .await;
+            // Verified an hour apart, `a` last; all retained for a day.
+            sqlx::query(
+                "UPDATE workstation_netboot_bundles
+                 SET verified_at = ?, retained_until = ? WHERE bundle_sha256 = ?",
+            )
+            .bind(
+                (Utc::now() - chrono::Duration::hours(index as i64))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            )
+            .bind(
+                (Utc::now() + chrono::Duration::days(1))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            )
+            .bind(&descriptor.sha256)
+            .execute(&fixture.state.db)
+            .await
+            .unwrap();
+            bundles.push(descriptor);
+        }
+        let [
+            active,
+            previous,
+            session,
+            desired,
+            newest_other,
+            older,
+            oldest,
+        ] = <[_; 7]>::try_from(bundles).unwrap();
+        fixture.activate(&active, Some(&previous)).await;
+        create_boot_session(&fixture.state, "02:00:00:00:00:01", None, None, None)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE nest_boot_sessions SET bundle_sha256 = ?")
+            .bind(&session.sha256)
+            .execute(&fixture.state.db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE workstation_netboot_runtime SET desired_descriptor_json = ?")
+            .bind(serde_json::to_string(&desired).unwrap())
+            .execute(&fixture.state.db)
+            .await
+            .unwrap();
+        let kept = |expected: &[&WorkstationNetbootDescriptor]| {
+            let db = fixture.state.db.clone();
+            let expected: Vec<String> = expected.iter().map(|d| d.sha256.clone()).collect();
+            let roots: Vec<(String, PathBuf)> = [
+                &active,
+                &previous,
+                &session,
+                &desired,
+                &newest_other,
+                &older,
+                &oldest,
+            ]
+            .iter()
+            .map(|d| (d.sha256.clone(), fixture.bundle_root(d)))
+            .collect();
+            async move {
+                let rows: Vec<(String,)> = sqlx::query_as(
+                    "SELECT bundle_sha256 FROM workstation_netboot_bundles ORDER BY bundle_sha256",
+                )
+                .fetch_all(&db)
+                .await
+                .unwrap();
+                let rows: Vec<String> = rows.into_iter().map(|row| row.0).collect();
+                assert_eq!(rows, expected);
+                for (sha, root) in roots {
+                    assert_eq!(root.is_dir(), expected.contains(&sha), "{sha}");
+                }
+            }
+        };
+
+        assert_eq!(prune_expired_bundles(&fixture.state).await.unwrap(), 2);
+        kept(&[&active, &previous, &session, &desired, &newest_other]).await;
+
+        // The newest other bundle goes when its retention ends.
+        sqlx::query(
+            "UPDATE workstation_netboot_bundles SET retained_until = ? WHERE bundle_sha256 = ?",
+        )
+        .bind(
+            (Utc::now() - chrono::Duration::minutes(1))
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        )
+        .bind(&newest_other.sha256)
+        .execute(&fixture.state.db)
+        .await
+        .unwrap();
+        assert_eq!(prune_expired_bundles(&fixture.state).await.unwrap(), 1);
+        kept(&[&active, &previous, &session, &desired]).await;
         fixture.cleanup();
     }
 
