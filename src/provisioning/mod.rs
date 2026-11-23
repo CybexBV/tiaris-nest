@@ -475,7 +475,7 @@ async fn prepare_verified(
         status.plan_approved(&plan, &inventory);
         plan
     };
-    let fresh_inventory = loop {
+    let (fresh_inventory, mut staged) = loop {
         match prepare_approved_plan(
             &signed_plan,
             &options.release_public_key_path,
@@ -578,7 +578,13 @@ async fn prepare_verified(
     durable.next_event_sequence = 6;
     storage::save_durable_state(&prepared.state_mount, &durable)?;
     status.step(InstallStep::InstallSystem);
-    nixos_install::install(&prepared, &options.release_public_key_path, status).await
+    nixos_install::install(
+        &prepared,
+        &options.release_public_key_path,
+        status,
+        &mut staged,
+    )
+    .await
 }
 
 struct PreDestructiveFailure {
@@ -606,7 +612,13 @@ async fn prepare_approved_plan(
     release_public_key_path: &Path,
     manage_origin: &str,
     status: &SetupStatusReporter,
-) -> std::result::Result<NestProvisioningInventory, PreDestructiveFailure> {
+) -> std::result::Result<
+    (
+        NestProvisioningInventory,
+        crate::appliance::closure::VerifiedArchive,
+    ),
+    PreDestructiveFailure,
+> {
     status.step(InstallStep::StageRelease);
     let fresh_inventory = inventory::collect_inventory().await.map_err(|error| {
         PreDestructiveFailure::new(
@@ -638,7 +650,7 @@ async fn prepare_approved_plan(
                 error,
             )
         })?;
-    nixos_install::stage_closure(plan, release_public_key_path, status)
+    let staged = nixos_install::stage_closure(plan, release_public_key_path, status)
         .await
         .map_err(|error| {
             PreDestructiveFailure::new(
@@ -671,7 +683,7 @@ async fn prepare_approved_plan(
                 error,
             )
         })?;
-    Ok(fresh_inventory)
+    Ok((fresh_inventory, staged))
 }
 
 async fn report_failure_and_wait_for_retry(
@@ -811,7 +823,9 @@ async fn resume_prepare(
     }
     inventory::preflight_network(&signed_plan, &inventory, &verified.envelope.manage_origin)
         .await?;
-    nixos_install::stage_closure(&signed_plan, &options.release_public_key_path, status).await?;
+    let mut staged =
+        nixos_install::stage_closure(&signed_plan, &options.release_public_key_path, status)
+            .await?;
     status.step(InstallStep::RecheckHardware);
     let inventory = inventory::collect_inventory().await?;
     inventory::revalidate_durable_plan_hardware(&signed_plan, &inventory)?;
@@ -878,7 +892,13 @@ async fn resume_prepare(
         storage::save_durable_state(&prepared.state_mount, &durable)?;
     }
     status.step(InstallStep::InstallSystem);
-    nixos_install::install(&prepared, &options.release_public_key_path, status).await
+    nixos_install::install(
+        &prepared,
+        &options.release_public_key_path,
+        status,
+        &mut staged,
+    )
+    .await
 }
 
 /// Event 3: STATE exists. Its exact bytes are replayed, unchanged, to ask
