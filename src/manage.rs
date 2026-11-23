@@ -873,13 +873,16 @@ async fn wait_for_next_sync<F, Fut>(
 /// Whether Manage names a queued build job this Nest does not have yet. An
 /// unanswered question is no work: the regular sync still comes.
 async fn new_build_work(state: &AppState) -> bool {
-    let queued = match probe_build_work(state).await {
-        Ok(queued) => queued,
-        Err(error) => {
-            debug!(error = %safe_error(&error), "could not ask Tiaris for queued build work");
-            return false;
-        }
-    };
+    // A question that hangs never holds back the regular sync for long.
+    let queued =
+        match tokio::time::timeout(BUILD_WORK_PROBE_INTERVAL, probe_build_work(state)).await {
+            Ok(Ok(queued)) => queued,
+            Ok(Err(error)) => {
+                debug!(error = %safe_error(&error), "could not ask Tiaris for queued build work");
+                return false;
+            }
+            Err(_) => return false,
+        };
     match db::has_unknown_managed_build_job(&state.db, &queued).await {
         Ok(unknown) => unknown,
         Err(error) => {
