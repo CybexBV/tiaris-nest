@@ -183,10 +183,10 @@ fn source_location(source: &ManageSource) -> Result<(&str, &str)> {
     Ok((&source.store_path, ""))
 }
 
-struct NarInfo {
-    entry: StorePath,
+pub(super) struct NarInfo {
+    pub(super) entry: StorePath,
     file_hash: String,
-    file_size: u64,
+    pub(super) file_size: u64,
 }
 fn narinfo(body: &[u8], entry: &StorePath, key: &VerifyingKey) -> Result<(String, NarInfo)> {
     let text = std::str::from_utf8(body)?;
@@ -526,12 +526,31 @@ pub fn verify_archive(
     })
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Payloads {
+#[derive(Clone, Copy)]
+enum Payloads<'a> {
     Verify,
     /// Only [`VerifiedArchive::extract`]: the same file passed `Verify`.
     Copy,
+    /// Only [`verify_staged`]: the payloads of exactly the members the
+    /// store lacks, verified as `Verify` does.
+    Missing(&'a Present),
+    /// Only [`read_metadata`]: the stream ends before the first payload.
+    None,
 }
+impl Payloads<'_> {
+    /// Whether the stream carries the payload of `info`.
+    fn carries(self, info: &NarInfo) -> bool {
+        match self {
+            Self::Missing(present) => present.get(&info.entry.path) != Some(&info.entry.nar_hash),
+            Self::None => false,
+            Self::Verify | Self::Copy => true,
+        }
+    }
+}
+
+/// Store paths a Nest holds, each with the NAR hash its store records in
+/// the manifest's form (`sha256:` and Nix base32).
+pub type Present = BTreeMap<String, String>;
 
 fn walk(
     archive: &mut AuthenticatedArchive,
@@ -548,30 +567,141 @@ fn walk(
         "archive is not the exact ordinary signed file"
     );
     archive.unchanged()?;
-    let read = read_cache(&mut archive.file, release, key, output, mode, admit)?;
+    archive.file.rewind()?;
+    let mut decoder = zstd::stream::read::Decoder::new(&mut archive.file)?.single_frame();
+    decoder.window_log_max(27)?;
+    let mut tar = Counting::unhashed(decoder, MAX_EXPANDED);
+    let read = read_tar(&mut tar, release, key, output, mode, admit)?;
+    let mut compressed = tar.inner.finish();
+    ensure!(
+        compressed.fill_buf()?.is_empty(),
+        "concatenated zstd frame or trailing compressed garbage"
+    );
     archive.unchanged()?;
-    Ok(read)
+    Ok((read.manifest, read.cache_bytes))
 }
 
-/// The same file descriptor stays open throughout tar and NAR validation.
-/// Optional extraction targets only a new private root-owned cache directory.
-fn read_cache(
-    file: &mut File,
+/// The metadata at the start of a closure archive's tar stream (manifest,
+/// cache metadata, NARInfos, the `nar/` directory), verified as the
+/// archive's own pass verifies it: the manifest against the signed
+/// descriptor and its exact reference graph, every NARInfo's signature.
+pub struct Metadata {
+    pub manifest: ClosureManifest,
+    /// NAR payload name (`nar/….nar.zst`) to its NARInfo, in tar order.
+    pub(super) infos: BTreeMap<String, NarInfo>,
+}
+impl Metadata {
+    /// Verify one payload's NAR as the archive's pass does, copying the
+    /// compressed bytes it reads to `output`.
+    pub(super) fn verify_payload(
+        &self,
+        info: &NarInfo,
+        payload: impl Read,
+        output: Option<File>,
+    ) -> Result<()> {
+        let source = &self.manifest.manage_source;
+        let (source_root, source_relative) = source_location(source)?;
+        verify_nar(
+            payload,
+            info,
+            output,
+            (info.entry.path == source_root).then_some((source_relative, source)),
+        )
+    }
+}
+
+/// Read the metadata `prefix` of a closure archive's tar stream: every byte
+/// before the first payload's header.
+pub fn read_metadata(
+    prefix: &[u8],
+    release: &NixosRelease,
+    key: &VerifyingKey,
+) -> Result<Metadata> {
+    release.verify(key)?;
+    let stream = io::Cursor::new(prefix).chain(&[0u8; 1024][..]);
+    let mut tar = Counting::unhashed(stream, MAX_EXPANDED);
+    let read = read_tar(&mut tar, release, key, None, Payloads::None, &mut |_, _| {
+        Ok(())
+    })?;
+    Ok(Metadata {
+        manifest: read.manifest,
+        infos: read.infos,
+    })
+}
+
+/// A staged update's cache, verified and extracted by [`verify_staged`].
+pub struct StagedCache {
+    pub manifest: ClosureManifest,
+    /// The NAR bytes of the members the store lacks, which the import adds.
+    pub missing_nar_bytes: u64,
+}
+
+/// Root's one pass over a staged update (`members::stage`): an archive's
+/// tar stream as it is (no zstd frame), with the metadata and the payloads
+/// of exactly the members `present` lacks. Verified as the archive's own
+/// pass verifies it and extracted into the new private `output`; the
+/// members it leaves out are in the store with their signed NAR hash. The
+/// stream is read once, so each payload is verified as it is copied.
+/// `admit` runs as in [`verify_archive`], with the missing NAR bytes too.
+pub fn verify_staged(
+    stream: impl Read,
+    limit: u64,
+    release: &NixosRelease,
+    key: &VerifyingKey,
+    output: &Path,
+    present: &Present,
+    admit: impl FnOnce(&ClosureManifest, u64, u64) -> Result<()>,
+) -> Result<StagedCache> {
+    release.verify(key)?;
+    let missing = |manifest: &ClosureManifest| {
+        manifest
+            .store_paths
+            .iter()
+            .filter(|path| present.get(&path.path) != Some(&path.nar_hash))
+            .map(|path| path.nar_size)
+            .sum::<u64>()
+    };
+    let mut admit = Some(admit);
+    let mut tar = Counting::unhashed(io::BufReader::new(stream), limit);
+    let read = read_tar(
+        &mut tar,
+        release,
+        key,
+        Some(output),
+        Payloads::Missing(present),
+        &mut |manifest, bytes| {
+            admit
+                .take()
+                .map_or(Ok(()), |admit| admit(manifest, bytes, missing(manifest)))
+        },
+    )?;
+    Ok(StagedCache {
+        missing_nar_bytes: missing(&read.manifest),
+        manifest: read.manifest,
+    })
+}
+
+struct TarRead {
+    manifest: ClosureManifest,
+    cache_bytes: u64,
+    infos: BTreeMap<String, NarInfo>,
+}
+
+/// One pass over a closure's tar stream. Optional extraction targets only a
+/// new private root-owned cache directory.
+fn read_tar<R: Read>(
+    tar: &mut Counting<R>,
     release: &NixosRelease,
     key: &VerifyingKey,
     output: Option<&Path>,
     mode: Payloads,
     admit: &mut dyn FnMut(&ClosureManifest, u64) -> Result<()>,
-) -> Result<(ClosureManifest, u64)> {
+) -> Result<TarRead> {
     let mut block = [0u8; 64 * 1024];
     if let Some(root) = output {
         fs::create_dir(root)?;
         fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
     }
-    file.rewind()?;
-    let mut decoder = zstd::stream::read::Decoder::new(&mut *file)?.single_frame();
-    decoder.window_log_max(27)?;
-    let mut tar = Counting::unhashed(decoder, MAX_EXPANDED);
     let mut manifest: Option<ClosureManifest> = None;
     let mut paths = BTreeMap::new();
     let mut infos = BTreeMap::new();
@@ -631,7 +761,7 @@ fn read_cache(
             }
             continue;
         }
-        let mut entry = (&mut tar).take(length);
+        let mut entry = (&mut *tar).take(length);
         if name == "manifest.json" {
             ensure!(
                 members.len() == 1 && length <= MAX_MANIFEST,
@@ -697,20 +827,16 @@ fn read_cache(
             );
             if !payload_started {
                 payload_started = true;
-                for info in infos.values() {
-                    cache_bytes = cache_bytes
-                        .checked_add(info.file_size)
-                        .ok_or_else(|| anyhow!("cache size overflow"))?;
-                }
-                let verified = manifest
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("manifest missing"))?;
-                admit(verified, cache_bytes)?;
+                cache_bytes = start_payloads(&manifest, &infos, cache_bytes, mode, admit)?;
             }
             let info = infos
                 .get(&name)
                 .ok_or_else(|| anyhow!("unreferenced NAR payload"))?;
             ensure!(length == info.file_size, "compressed NAR size mismatch");
+            ensure!(
+                mode.carries(info),
+                "the stream carries a payload it must not"
+            );
             let destination = output.map(|root| root.join(&name));
             let target = destination
                 .as_ref()
@@ -733,7 +859,7 @@ fn read_cache(
                 .ok_or_else(|| anyhow!("manifest missing"))?;
             let (source_root, source_relative) = source_location(source)?;
             match (mode, target) {
-                (Payloads::Verify, target) => verify_nar(
+                (Payloads::Verify | Payloads::Missing(_), target) => verify_nar(
                     &mut entry,
                     info,
                     target,
@@ -750,6 +876,7 @@ fn read_cache(
                     );
                 }
                 (Payloads::Copy, None) => bail!("extraction needs a directory"),
+                (Payloads::None, _) => unreachable!("metadata carries no payload"),
             }
             payloads.insert(name);
         }
@@ -763,18 +890,44 @@ fn read_cache(
         );
     }
     ensure!(
-        payloads.len() == paths.len() && infos.len() == paths.len() && saw_cache,
+        infos.len() == paths.len() && saw_cache,
         "incomplete closure archive"
     );
-    let mut compressed = tar.inner.finish();
-    ensure!(
-        compressed.fill_buf()?.is_empty(),
-        "concatenated zstd frame or trailing compressed garbage"
-    );
-    Ok((
-        manifest.ok_or_else(|| anyhow!("missing closure manifest"))?,
+    if !payload_started && matches!(mode, Payloads::Missing(_)) {
+        // Every member is in the store already: admission still decides.
+        cache_bytes = start_payloads(&manifest, &infos, cache_bytes, mode, admit)?;
+    }
+    let carried = infos
+        .iter()
+        .filter(|(_, info)| mode.carries(info))
+        .map(|(name, _)| name);
+    ensure!(payloads.iter().eq(carried), "incomplete closure archive");
+    Ok(TarRead {
+        manifest: manifest.ok_or_else(|| anyhow!("missing closure manifest"))?,
         cache_bytes,
-    ))
+        infos,
+    })
+}
+
+/// Once every NARInfo is verified and before the first payload: the bytes
+/// the extracted cache takes with the payloads the stream carries, admitted.
+fn start_payloads(
+    manifest: &Option<ClosureManifest>,
+    infos: &BTreeMap<String, NarInfo>,
+    mut cache_bytes: u64,
+    mode: Payloads,
+    admit: &mut dyn FnMut(&ClosureManifest, u64) -> Result<()>,
+) -> Result<u64> {
+    for info in infos.values().filter(|info| mode.carries(info)) {
+        cache_bytes = cache_bytes
+            .checked_add(info.file_size)
+            .ok_or_else(|| anyhow!("cache size overflow"))?;
+    }
+    let verified = manifest
+        .as_ref()
+        .ok_or_else(|| anyhow!("manifest missing"))?;
+    admit(verified, cache_bytes)?;
+    Ok(cache_bytes)
 }
 
 struct Tee<R> {
@@ -958,7 +1111,7 @@ fn nar_node(
     }
     Ok(())
 }
-fn header(raw: &[u8; 512]) -> Result<(String, u64, bool, u64)> {
+pub(super) fn header(raw: &[u8; 512]) -> Result<(String, u64, bool, u64)> {
     ensure!(
         &raw[257..263] == b"ustar\0" && &raw[263..265] == b"00",
         "archive is not canonical USTAR"
@@ -1077,4 +1230,4 @@ mod tests {
 
 #[cfg(test)]
 #[path = "closure_tests.rs"]
-mod full_archive_tests;
+pub(super) mod full_archive_tests;

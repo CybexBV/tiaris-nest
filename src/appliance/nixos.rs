@@ -1,6 +1,6 @@
 //! NixOS daemon download and independent privileged update admission.
 use super::{
-    closure,
+    closure, members,
     release_v3::{self, NixosRelease, ReleaseDescriptor},
 };
 use anyhow::{Result, anyhow, bail, ensure};
@@ -137,7 +137,7 @@ async fn store(update: super::ManagedApplianceUpdate<NixosRelease>) -> Result<()
         is_nixos() && !update.attempt_id.is_nil(),
         "NixOS update requires installed NixOS"
     );
-    update
+    let key = update
         .release
         .verify_file(Path::new(super::RELEASE_PUBLIC_KEY_PATH))?;
     if let Some(status) =
@@ -173,7 +173,6 @@ async fn store(update: super::ManagedApplianceUpdate<NixosRelease>) -> Result<()
     }
     validate_directory(Path::new(UPDATE_CACHE_ROOT), 0, 0o755)?;
     validate_directory(Path::new(UPDATE_BUNDLE_ROOT), 985, 0o700)?;
-    let path = Path::new(UPDATE_BUNDLE_ROOT).join(format!("{}.tar.zst", update.attempt_id));
     let transport = update
         .qualification_package_transport_url
         .as_deref()
@@ -186,42 +185,22 @@ async fn store(update: super::ManagedApplianceUpdate<NixosRelease>) -> Result<()
         };
         super::validate_qualification_package_transport_url(transport, &artifact)?;
     }
-    // The download only has to fit, and only what it still misses: an
-    // earlier try may have left part of it. Whether the update itself fits
-    // is root's decision (`verify_update`): root can free space first, and
-    // its refusal reaches Tiaris with a reason. Retention restores the floor
-    // meanwhile.
-    let download_bytes = update
-        .release
-        .system_closure
-        .size_bytes
-        .saturating_sub(partial_bytes(&path, &update.release));
-    if let Err(error) = crate::disk::ensure_headroom(
-        Path::new(UPDATE_BUNDLE_ROOT),
-        download_bytes,
-        "Nest update download",
-    ) {
-        // Root never sees an update whose archive did not land, so it is
-        // asked for room: it frees space as it does for an update that does
-        // not fit. Tiaris hands the update again; then the download fits, or
-        // root has ended the attempt with `insufficient_store_space`. A
-        // staged older update goes first and makes its own room.
-        if prior.is_none() {
-            super::write_atomic_json(
-                Path::new(UPDATE_ROOM_REQUEST_PATH),
-                &room_request(&update, download_bytes),
-                0o600,
-            )?;
+    let allow_private = transport != update.release.system_closure.url;
+    let path = match by_store_path(&update, &key, transport, allow_private, prior.is_none()).await?
+    {
+        Some(path) => path,
+        None => {
+            let path = archive_bundle(update.attempt_id);
+            let download_bytes = update
+                .release
+                .system_closure
+                .size_bytes
+                .saturating_sub(partial_bytes(&path, &update.release));
+            download_room(&update, download_bytes, prior.is_none())?;
+            download(&update.release, transport, &path, allow_private).await?;
+            path
         }
-        return Err(error);
-    }
-    download(
-        &update.release,
-        transport,
-        &path,
-        transport != update.release.system_closure.url,
-    )
-    .await?;
+    };
     let stored = StoredUpdate {
         schema: "tiaris.nest.appliance-update-request.v3".into(),
         attempt_id: update.attempt_id,
@@ -238,6 +217,98 @@ async fn store(update: super::ManagedApplianceUpdate<NixosRelease>) -> Result<()
         let _ = fs::remove_file(&path);
     }
     replaced
+}
+
+/// The inbox names of an attempt's download: the archive, or the members
+/// the running system lacks (`members`).
+fn archive_bundle(attempt_id: Uuid) -> PathBuf {
+    Path::new(UPDATE_BUNDLE_ROOT).join(format!("{attempt_id}.tar.zst"))
+}
+fn members_bundle(attempt_id: Uuid) -> PathBuf {
+    Path::new(UPDATE_BUNDLE_ROOT).join(format!("{attempt_id}.members.tar"))
+}
+
+/// The download only has to fit, and only what it still misses: an earlier
+/// try may have left part of it. Whether the update itself fits is root's
+/// decision (`verify_update`): root can free space first, and its refusal
+/// reaches Tiaris with a reason. Retention restores the floor meanwhile.
+fn download_room(
+    update: &super::ManagedApplianceUpdate<NixosRelease>,
+    download_bytes: u64,
+    ask: bool,
+) -> Result<()> {
+    let Err(error) = crate::disk::ensure_headroom(
+        Path::new(UPDATE_BUNDLE_ROOT),
+        download_bytes,
+        "Nest update download",
+    ) else {
+        return Ok(());
+    };
+    // Root never sees an update whose download did not land, so it is asked
+    // for room: it frees space as it does for an update that does not fit.
+    // Tiaris hands the update again; then the download fits, or root has
+    // ended the attempt with `insufficient_store_space`. A staged older
+    // update goes first and makes its own room.
+    if ask {
+        super::write_atomic_json(
+            Path::new(UPDATE_ROOM_REQUEST_PATH),
+            &room_request(update, download_bytes),
+            0o600,
+        )?;
+    }
+    Err(error)
+}
+
+/// The update by store path (`members`): only the members the running
+/// system lacks. `None` takes the full archive: an archive packed another
+/// way, most of it new, or a server or bytes that do not allow it. A
+/// download that keeps dropping is an error: the next try continues it.
+async fn by_store_path(
+    update: &super::ManagedApplianceUpdate<NixosRelease>,
+    key: &ed25519_dalek::VerifyingKey,
+    transport: &str,
+    allow_private: bool,
+    ask_room: bool,
+) -> Result<Option<PathBuf>> {
+    let inbox = Path::new(UPDATE_BUNDLE_ROOT);
+    let fallback = |error: anyhow::Error| {
+        if error.is::<members::KeepTrying>() {
+            return Err(error);
+        }
+        tracing::warn!(error = %format!("{error:#}"), "Nest update takes the whole archive");
+        Ok(None)
+    };
+    let planned = match members::running_system_async().await {
+        Ok(present) => {
+            members::plan(
+                &update.release,
+                key,
+                transport,
+                allow_private,
+                inbox,
+                &present,
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    };
+    let plan = match planned {
+        Ok(Some(plan)) => plan,
+        Ok(None) => return Ok(None),
+        Err(error) => return fallback(error),
+    };
+    discard_other_partials(&members::partial_path(inbox, &update.release))?;
+    download_room(update, plan.remaining_bytes(), ask_room)?;
+    tracing::info!(
+        members = plan.members(),
+        bytes = plan.bytes,
+        "Nest update fetches only the store paths it lacks"
+    );
+    let target = members_bundle(update.attempt_id);
+    match members::stage(&plan, &target).await {
+        Ok(()) => Ok(Some(target)),
+        Err(error) => fallback(error),
+    }
 }
 
 /// What root needs to make room for a download and to report the attempt:
@@ -260,12 +331,24 @@ fn room_request(
 fn replace_waiting(prior: &StoredUpdate, stored: &StoredUpdate) -> Result<()> {
     let _lease = replaceable(prior)?;
     super::write_atomic_json(Path::new(super::UPDATE_REQUEST_PATH), stored, 0o600)?;
-    let bundle = Path::new(UPDATE_BUNDLE_ROOT).join(format!("{}.tar.zst", prior.attempt_id));
-    match fs::remove_file(&bundle) {
-        Ok(()) => super::sync_directory(Path::new(UPDATE_BUNDLE_ROOT)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
+    remove_bundles(prior.attempt_id)
+}
+
+/// Remove an attempt's download, whichever it is. Only the canonical
+/// basenames, never a caller path; unlink does not follow a symlink there.
+fn remove_bundles(attempt_id: Uuid) -> Result<()> {
+    let mut removed = false;
+    for bundle in [archive_bundle(attempt_id), members_bundle(attempt_id)] {
+        match fs::remove_file(&bundle) {
+            Ok(()) => removed = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error.into()),
+        }
     }
+    if removed {
+        super::sync_directory(Path::new(UPDATE_BUNDLE_ROOT))?;
+    }
+    Ok(())
 }
 
 /// The maintenance lock, held while the staged request is still `prior` and
@@ -459,8 +542,9 @@ fn open_partial(partial: &Path, total: u64) -> Result<(fs::File, u64, Sha256)> {
 }
 
 /// Partial downloads of other archives in the same private directory, and
-/// the temporary files of the downloader before partial files
-/// (`<name>.tar.<uuid>.tmp`), which a stopped download left behind.
+/// of members (`members::partial_path`), and the temporary files of the
+/// downloader before partial files (`<name>.tar.<uuid>.tmp`), which a
+/// stopped download left behind.
 fn discard_other_partials(partial: &Path) -> Result<()> {
     let directory = partial
         .parent()
@@ -474,9 +558,12 @@ fn discard_other_partials(partial: &Path) -> Result<()> {
         let Some(name) = name.to_str() else {
             continue;
         };
-        let other_partial = name.strip_suffix(".part").is_some_and(|hash| {
-            hash.len() == 64 && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-        });
+        let other_partial = name
+            .strip_suffix(".part")
+            .map(|stem| stem.strip_suffix(".members").unwrap_or(stem))
+            .is_some_and(|hash| {
+                hash.len() == 64 && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            });
         let old_temporary = name
             .strip_suffix(".tmp")
             .and_then(|stem| stem.rsplit_once('.'))
@@ -739,10 +826,11 @@ pub fn verify_update(floor: u64, space_freed: bool) -> Result<PathBuf> {
         validate_directory(Path::new(UPDATE_CACHE_ROOT), 0, 0o755)?;
         validate_directory(Path::new(UPDATE_BUNDLE_ROOT), 985, 0o700)?;
         validate_directory(Path::new(UPDATE_PRIVATE_ROOT), 0, 0o700)?;
-        let canonical =
-            Path::new(UPDATE_BUNDLE_ROOT).join(format!("{}.tar.zst", request.attempt_id));
+        let canonical = archive_bundle(request.attempt_id);
+        let staged = members_bundle(request.attempt_id);
+        let by_store_path = Path::new(&request.bundle_path) == staged;
         ensure!(
-            Path::new(&request.bundle_path) == canonical,
+            by_store_path || Path::new(&request.bundle_path) == canonical,
             "noncanonical update archive path"
         );
         fs::create_dir_all(super::UPDATE_ROOT)?;
@@ -775,45 +863,12 @@ pub fn verify_update(floor: u64, space_freed: bool) -> Result<PathBuf> {
             fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
         }
         let result = (|| {
-            let archive_bytes = request.release.system_closure.size_bytes;
-            let store = Path::new("/nix/store");
-            // The private copy first. What the update needs beyond it, its
-            // extracted cache and the store paths it misses, the archive's
-            // own manifest and NARInfos say: the verification pass admits
-            // it before it writes a payload.
-            ensure_update_space(&private, store, archive_bytes, 0, floor)?;
-            let archive = private.join("closure.tar.zst");
-            let pinned = super::pin_untrusted_bundle(&canonical, &archive, &request.release)?;
             let cache = private.join("cache");
-            let mut missing = 0u64;
-            let verified = closure::verify_archive(
-                pinned,
-                &request.release,
-                &key,
-                Some(&cache),
-                |manifest, cache_bytes| {
-                    missing = missing_nar_bytes(manifest)?;
-                    let staging = cache_bytes
-                        .checked_add(DATABASE_BACKUP_RESERVE)
-                        .ok_or_else(|| anyhow!("staging size overflow"))?;
-                    ensure_update_space(&private, store, staging, missing, floor).map_err(|error| {
-                        match error.downcast::<InsufficientSpace>() {
-                            // A new start copies the archive again.
-                            Ok(short) => InsufficientSpace {
-                                required_available_bytes: short
-                                    .required_available_bytes
-                                    .saturating_add(archive_bytes),
-                            }
-                            .into(),
-                            Err(error) => error,
-                        }
-                    })
-                },
-            )?;
-            let total_nar_bytes = verified.manifest.total_nar_bytes;
-            // The import reads the extracted cache; the private copy is done.
-            drop(verified);
-            fs::remove_file(&archive)?;
+            let (total_nar_bytes, missing) = if by_store_path {
+                verify_staged_update(&request.release, &key, &staged, &private, &cache, floor)?
+            } else {
+                verify_archive_update(&request.release, &key, &canonical, &private, &cache, floor)?
+            };
             let database_backup = snapshot_database(&private)?;
             super::write_atomic_json(
                 &receipt_directory.join("verified-update.json"),
@@ -869,12 +924,13 @@ pub fn verify_update(floor: u64, space_freed: bool) -> Result<PathBuf> {
                     tracing::error!(%write_error,"could not persist authenticated update verification failure")
                 }
                 Ok(()) => {
-                    let bundle = Path::new(UPDATE_BUNDLE_ROOT)
-                        .join(format!("{}.tar.zst", request.attempt_id));
                     if let Err(cleanup_error) = cleanup_failed_request(
                         Path::new(super::UPDATE_REQUEST_PATH),
                         &body,
-                        &bundle,
+                        &[
+                            archive_bundle(request.attempt_id),
+                            members_bundle(request.attempt_id),
+                        ],
                     ) {
                         tracing::error!(%cleanup_error,"could not clean terminal update request");
                     }
@@ -885,18 +941,109 @@ pub fn verify_update(floor: u64, space_freed: bool) -> Result<PathBuf> {
     verified_result
 }
 
-fn cleanup_failed_request(request: &Path, original: &[u8], bundle: &Path) -> Result<bool> {
+/// The archive's update: root's private copy, hashed while it is copied,
+/// then its one verification pass. Returns the closure's NAR bytes and the
+/// NAR bytes the store misses.
+fn verify_archive_update(
+    release: &NixosRelease,
+    key: &ed25519_dalek::VerifyingKey,
+    inbox: &Path,
+    private: &Path,
+    cache: &Path,
+    floor: u64,
+) -> Result<(u64, u64)> {
+    let archive_bytes = release.system_closure.size_bytes;
+    let store = Path::new("/nix/store");
+    // The private copy first. What the update needs beyond it, its
+    // extracted cache and the store paths it misses, the archive's own
+    // manifest and NARInfos say: the verification pass admits it before it
+    // writes a payload.
+    ensure_update_space(private, store, archive_bytes, 0, floor)?;
+    let archive = private.join("closure.tar.zst");
+    let pinned = super::pin_untrusted_bundle(inbox, &archive, release)?;
+    let mut missing = 0u64;
+    let verified = closure::verify_archive(
+        pinned,
+        release,
+        key,
+        Some(cache),
+        |manifest, cache_bytes| {
+            missing = missing_nar_bytes(manifest)?;
+            let staging = cache_bytes
+                .checked_add(DATABASE_BACKUP_RESERVE)
+                .ok_or_else(|| anyhow!("staging size overflow"))?;
+            ensure_update_space(private, store, staging, missing, floor).map_err(|error| {
+                match error.downcast::<InsufficientSpace>() {
+                    // A new start copies the archive again.
+                    Ok(short) => InsufficientSpace {
+                        required_available_bytes: short
+                            .required_available_bytes
+                            .saturating_add(archive_bytes),
+                    }
+                    .into(),
+                    Err(error) => error,
+                }
+            })
+        },
+    )?;
+    let total_nar_bytes = verified.manifest.total_nar_bytes;
+    // The import reads the extracted cache; the private copy is done.
+    drop(verified);
+    fs::remove_file(&archive)?;
+    Ok((total_nar_bytes, missing))
+}
+
+/// The update by store path (`members::stage`): the daemon's staged stream,
+/// read once from the inbox and verified as it is copied into the private
+/// cache. The members it leaves out are the running system's, each with its
+/// signed NAR hash; the import adds the others.
+fn verify_staged_update(
+    release: &NixosRelease,
+    key: &ed25519_dalek::VerifyingKey,
+    staged: &Path,
+    private: &Path,
+    cache: &Path,
+    floor: u64,
+) -> Result<(u64, u64)> {
+    let store = Path::new("/nix/store");
+    let present = members::running_system()?;
+    let (stream, limit) = members::open_staged(staged, release)?;
+    let verified = closure::verify_staged(
+        stream,
+        limit,
+        release,
+        key,
+        cache,
+        &present,
+        |_, cache_bytes, missing| {
+            let staging = cache_bytes
+                .checked_add(DATABASE_BACKUP_RESERVE)
+                .ok_or_else(|| anyhow!("staging size overflow"))?;
+            ensure_update_space(private, store, staging, missing, floor)
+        },
+    )?;
+    Ok((
+        verified.manifest.total_nar_bytes,
+        verified.missing_nar_bytes,
+    ))
+}
+
+fn cleanup_failed_request(request: &Path, original: &[u8], bundles: &[PathBuf]) -> Result<bool> {
     let current =
         crate::provisioning::read_bounded_nofollow(request, 256 * 1024, "terminal update request")?;
     if current != original {
         return Ok(false);
     }
-    // Only the canonical per-attempt basename is removed, never a caller path.
-    // Unlink does not follow an untrusted symlink at that basename.
-    match fs::remove_file(bundle) {
-        Ok(()) => super::sync_directory(bundle.parent().ok_or_else(|| anyhow!("bundle parent"))?)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-        Err(error) => return Err(error.into()),
+    // Only the canonical per-attempt basenames are removed, never a caller
+    // path. Unlink does not follow an untrusted symlink at that basename.
+    for bundle in bundles {
+        match fs::remove_file(bundle) {
+            Ok(()) => {
+                super::sync_directory(bundle.parent().ok_or_else(|| anyhow!("bundle parent"))?)?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error.into()),
+        }
     }
     fs::remove_file(request)?;
     super::sync_directory(request.parent().ok_or_else(|| anyhow!("request parent"))?)?;
@@ -1549,11 +1696,12 @@ mod tests {
         let bundle = directory.join("attempt.tar.zst");
         fs::write(&request, b"old authenticated request").unwrap();
         fs::write(&bundle, b"corrupt bytes").unwrap();
-        assert!(cleanup_failed_request(&request, b"old authenticated request", &bundle).unwrap());
+        let bundles = [bundle.clone()];
+        assert!(cleanup_failed_request(&request, b"old authenticated request", &bundles).unwrap());
         assert!(!request.exists() && !bundle.exists());
         fs::write(&request, b"corrected new request").unwrap();
         fs::write(&bundle, b"new bytes").unwrap();
-        assert!(!cleanup_failed_request(&request, b"old authenticated request", &bundle).unwrap());
+        assert!(!cleanup_failed_request(&request, b"old authenticated request", &bundles).unwrap());
         assert_eq!(fs::read(&request).unwrap(), b"corrected new request");
         assert_eq!(fs::read(&bundle).unwrap(), b"new bytes");
         fs::remove_dir_all(directory).unwrap();

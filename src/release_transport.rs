@@ -18,14 +18,40 @@ pub(crate) async fn get(
     timeout: Duration,
     range_offset: Option<u64>,
 ) -> Result<Response> {
+    let range = range_offset
+        .filter(|offset| *offset > 0)
+        .map(|offset| format!("bytes={offset}-"));
+    request(value, allow_private_urls, follow_redirects, timeout, range).await
+}
+
+/// [`get`] of the bytes `first..=last` only.
+pub(crate) async fn get_range(
+    value: &str,
+    allow_private_urls: bool,
+    follow_redirects: bool,
+    timeout: Duration,
+    first: u64,
+    last: u64,
+) -> Result<Response> {
+    let range = Some(format!("bytes={first}-{last}"));
+    request(value, allow_private_urls, follow_redirects, timeout, range).await
+}
+
+async fn request(
+    value: &str,
+    allow_private_urls: bool,
+    follow_redirects: bool,
+    timeout: Duration,
+    range: Option<String>,
+) -> Result<Response> {
     let mut url = Url::parse(value).context("parse signed release artifact URL")?;
     for redirects in 0..=MAX_REDIRECTS {
         let (client, pinned_url) = client_for_url(url, allow_private_urls, timeout).await?;
         let mut request = client
             .get(pinned_url.clone())
             .header(header::ACCEPT_ENCODING, "identity");
-        if let Some(offset) = range_offset.filter(|offset| *offset > 0) {
-            request = request.header(header::RANGE, format!("bytes={offset}-"));
+        if let Some(range) = &range {
+            request = request.header(header::RANGE, range);
         }
         let response = request
             .send()
