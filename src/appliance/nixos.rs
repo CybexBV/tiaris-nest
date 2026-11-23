@@ -222,6 +222,9 @@ async fn store(update: super::ManagedApplianceUpdate<NixosRelease>) -> Result<()
         transport != update.release.system_closure.url,
     )
     .await?;
+    // So the Nest serves this release's workstation runtime right after the
+    // restart (`netboot::prepare`).
+    crate::netboot::prepare::wait(&update.release.release_id).await;
     let stored = StoredUpdate {
         schema: "tiaris.nest.appliance-update-request.v3".into(),
         attempt_id: update.attempt_id,

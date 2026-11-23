@@ -22,7 +22,7 @@ use std::{
 };
 const GIB: u64 = 1024 * 1024 * 1024;
 const STAGING: &str = "/run/tiaris-appliance-closure";
-const ARCHIVE: &str = "/run/tiaris-appliance-closure/closure.tar.zst";
+pub(super) const ARCHIVE: &str = "/run/tiaris-appliance-closure/closure.tar.zst";
 pub(super) const TARGET: &str = "/mnt";
 
 fn release(plan: &SignedInstallPlan) -> Result<&NixosRelease> {
@@ -38,7 +38,7 @@ fn release(plan: &SignedInstallPlan) -> Result<&NixosRelease> {
     Ok(release)
 }
 
-fn validate_closure_transport(transport: &str, artifact: &SystemClosure) -> Result<()> {
+pub(super) fn validate_closure_transport(transport: &str, artifact: &SystemClosure) -> Result<()> {
     if transport == artifact.url {
         return Ok(());
     }
@@ -57,11 +57,14 @@ fn validate_closure_transport(transport: &str, artifact: &SystemClosure) -> Resu
 
 /// Download (or find) the signed closure in RAM and verify it: its one
 /// verification pass, before anything touches the disk. The verified
-/// archive stays open for [`install`] to extract onto the disk.
+/// archive stays open for [`install`] to extract onto the disk. `prefetched`
+/// is this release's archive, downloaded and hashed while the administrator
+/// reviewed the setup (`closure_prefetch`).
 pub(super) async fn stage_closure(
     plan: &SignedInstallPlan,
     key_path: &Path,
     status: &SetupStatusReporter,
+    prefetched: Option<closure::AuthenticatedArchive>,
 ) -> Result<closure::VerifiedArchive> {
     let release = release(plan)?;
     let key = release.verify_file(key_path)?;
@@ -70,27 +73,15 @@ pub(super) async fn stage_closure(
         .as_deref()
         .ok_or_else(|| anyhow!("plan missing transport"))?;
     validate_closure_transport(transport, &release.system_closure)?;
-    fs::create_dir_all(STAGING)?;
-    let metadata = fs::symlink_metadata(STAGING)?;
-    ensure!(
-        metadata.is_dir() && metadata.uid() == 0,
-        "unsafe RAM staging directory"
-    );
-    fs::set_permissions(STAGING, fs::Permissions::from_mode(0o700))?;
-    let raw = std::ffi::CString::new(STAGING)?;
-    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
-    ensure!(
-        unsafe { libc::statfs(raw.as_ptr(), &mut stat) } == 0 && stat.f_type == 0x01021994,
-        "closure staging must be RAM-backed tmpfs"
-    );
-    let memory = fs::read_to_string("/proc/meminfo")?;
-    let available = memory
-        .lines()
-        .find_map(|line| line.strip_prefix("MemAvailable:"))
-        .and_then(|v| v.split_whitespace().next())
-        .and_then(|v| v.parse::<u64>().ok())
-        .and_then(|v| v.checked_mul(1024))
-        .ok_or_else(|| anyhow!("MemAvailable unavailable"))?;
+    let available = ram_staging()?;
+    if let Some(prefetched) = prefetched {
+        ensure!(
+            prefetched.sha256() == release.system_closure.sha256,
+            "prefetched closure is not the approved release"
+        );
+        status.step(InstallStep::VerifyRelease);
+        return closure::verify_archive(prefetched, release, &key, None, |_, _| Ok(()));
+    }
     let archive = Path::new(ARCHIVE);
     // A previous run's archive is not a trust receipt. Hash and verify the
     // same open file's entire contents before reusing it, while charging
@@ -108,8 +99,48 @@ pub(super) async fn stage_closure(
         status.step(InstallStep::StageRelease);
         fs::remove_file(archive)?;
     }
+    ensure_ram_budget(release, available)?;
+    let downloaded = nixos::download_with_progress(
+        release,
+        transport,
+        archive,
+        transport != release.system_closure.url,
+        &mut |received, total| status.download_progress(received, total),
+    )
+    .await?;
+    status.step(InstallStep::VerifyRelease);
+    closure::verify_archive(downloaded, release, &key, None, |_, _| Ok(()))
+}
+
+/// Make the RAM staging directory safe and return the memory available now.
+pub(super) fn ram_staging() -> Result<u64> {
+    fs::create_dir_all(STAGING)?;
+    let metadata = fs::symlink_metadata(STAGING)?;
+    ensure!(
+        metadata.is_dir() && metadata.uid() == 0,
+        "unsafe RAM staging directory"
+    );
+    fs::set_permissions(STAGING, fs::Permissions::from_mode(0o700))?;
+    let raw = std::ffi::CString::new(STAGING)?;
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    ensure!(
+        unsafe { libc::statfs(raw.as_ptr(), &mut stat) } == 0 && stat.f_type == 0x01021994,
+        "closure staging must be RAM-backed tmpfs"
+    );
+    let memory = fs::read_to_string("/proc/meminfo")?;
+    memory
+        .lines()
+        .find_map(|line| line.strip_prefix("MemAvailable:"))
+        .and_then(|v| v.split_whitespace().next())
+        .and_then(|v| v.parse::<u64>().ok())
+        .and_then(|v| v.checked_mul(1024))
+        .ok_or_else(|| anyhow!("MemAvailable unavailable"))
+}
+
+/// Whether the archive's remaining bytes fit in RAM beside a bounded runtime.
+pub(super) fn ensure_ram_budget(release: &NixosRelease, available: u64) -> Result<()> {
     // What a dropped download of this archive left in RAM counts as its own.
-    let partial = nixos::partial_bytes(archive, release);
+    let partial = nixos::partial_bytes(Path::new(ARCHIVE), release);
     ensure!(
         available.saturating_add(partial)
             >= release
@@ -124,16 +155,12 @@ pub(super) async fn stage_closure(
             >= release.system_closure.size_bytes - partial,
         "insufficient tmpfs capacity"
     );
-    let downloaded = nixos::download_with_progress(
-        release,
-        transport,
-        archive,
-        transport != release.system_closure.url,
-        &mut |received, total| status.download_progress(received, total),
-    )
-    .await?;
-    status.step(InstallStep::VerifyRelease);
-    closure::verify_archive(downloaded, release, &key, None, |_, _| Ok(()))
+    Ok(())
+}
+
+/// Whether a finished archive already waits in RAM (`stage_closure` verifies it).
+pub(super) fn archive_staged() -> bool {
+    fs::symlink_metadata(ARCHIVE).is_ok()
 }
 
 pub(super) fn calculate_layout(sector: u64, total: u64) -> Result<([u64; 5], [u64; 5])> {

@@ -18,15 +18,25 @@ pub(super) fn validate_desired(
     key: &str,
     allow_private: bool,
 ) -> Result<()> {
+    validate_signed(
+        &desired.descriptor,
+        desired.bundle_transport_url.as_deref(),
+        key,
+        allow_private,
+    )
+}
+
+pub(super) fn validate_signed(
+    descriptor: &WorkstationNetbootDescriptor,
+    transport: Option<&str>,
+    key: &str,
+    allow_private: bool,
+) -> Result<()> {
     // The historical development flag skips signatures. It must never grant
     // authority to the separate unsigned qualification transport.
-    validate_descriptor_with_policy(
-        &desired.descriptor,
-        key,
-        allow_private && desired.bundle_transport_url.is_none(),
-    )?;
-    if let Some(value) = desired.bundle_transport_url.as_deref() {
-        validate_url(value, &desired.descriptor)?;
+    validate_descriptor_with_policy(descriptor, key, allow_private && transport.is_none())?;
+    if let Some(value) = transport {
+        validate_url(value, descriptor)?;
     }
     Ok(())
 }
