@@ -502,9 +502,10 @@ report Tiaris accepted in this boot, at most 90 seconds ago): stage
 `no_manage_contact`. The candidate must reach Tiaris to stay, so a Nest that is
 cut off would switch, go back and download the release again; it keeps what it
 prepared instead and switches when the link is back. At the switch
-root checks the closure again and looks whether the Nest still reaches Tiaris
-before anything changes, arms the next generation, looks once more (if not,
-it undoes the arming), seals the generation and selects it for one boot. An
+root looks whether the Nest still reaches Tiaris before anything changes (the
+closure it checked while preparing stays rooted, so it is not checked again),
+arms the next generation, looks once more (if not, it undoes the arming),
+seals the generation and selects it for one boot. An
 update that waits for Tiaris after it started keeps the status `preparing`
 (reports only move forward) with the stage `no_manage_contact`, and asks the
 policy again when the link is back: only a switch that a restart interrupted
