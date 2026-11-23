@@ -11,6 +11,12 @@
 //! The stick is generic: one image for every Nest, downloaded from Tiaris.
 //! It finds its Nest on the local network or from the Nest address file the
 //! administrator saves on it; this Nest does not serve or personalize it.
+//! Because whatever answers on the network could be taken for the Nest, the
+//! stick checks the release signature on the runtime itself: every runtime and
+//! launch answer carries `signed_runtime`, the descriptor as the release signed
+//! it and its manifest byte for byte. The stick carries the release key and the
+//! Tiaris address of the Nest release that built it (Tiaris
+//! `docs/design/usb-installer.md`, "Trust").
 
 use axum::{
     http::{HeaderMap, StatusCode, header},
@@ -18,7 +24,9 @@ use axum::{
 };
 use serde::Serialize;
 
-use crate::netboot::{ActiveRuntimeIdentity, BootSessionLaunch, ComponentDescriptors};
+use crate::netboot::{
+    ActiveRuntimeIdentity, BootSessionLaunch, ComponentDescriptors, SignedRuntime,
+};
 
 pub const PROTOCOL_SCHEMA: &str = "tiaris.nest.usb-installer.v1";
 /// The oldest stick protocol this Nest still answers. A stick reports its
@@ -33,6 +41,9 @@ pub const PROTOCOL_SCHEMA: &str = "tiaris.nest.usb-installer.v1";
 /// Protocol 3 sticks hold no clock against a launch. A boot session lasts a
 /// day now, and a protocol 2 stick refuses every launch that does not end
 /// within eleven minutes, so it is told to be made again too.
+///
+/// Protocol 4 sticks check `signed_runtime` and refuse a launch without it;
+/// this Nest still answers protocol 3 sticks, which ignore the field.
 pub const MINIMUM_STICK_PROTOCOL: u32 = 3;
 const STICK_USER_AGENT_PREFIX: &str = "tiaris-usb-installer/";
 
@@ -44,13 +55,15 @@ pub const ERROR_SESSION_UNAVAILABLE: &str = "session_unavailable";
 pub const ERROR_INTERNAL: &str = "internal_error";
 
 /// The existing `tiaris.nest.kexec.v1` launch plus the identity of the runtime
-/// it starts, so the stick can verify the kernel and initrd it downloads.
+/// it starts, so the stick can verify the kernel and initrd it downloads, and
+/// the release's signature on that identity (stick protocol 4 checks it).
 #[derive(Clone, Debug, Serialize)]
 pub struct UsbLaunch {
     #[serde(flatten)]
     pub session: BootSessionLaunch,
     pub runtime_version: String,
     pub components: ComponentDescriptors,
+    pub signed_runtime: SignedRuntime,
 }
 
 impl UsbLaunch {
@@ -59,6 +72,7 @@ impl UsbLaunch {
             session,
             runtime_version: runtime.runtime_version,
             components: runtime.components,
+            signed_runtime: runtime.signed_runtime,
         }
     }
 }

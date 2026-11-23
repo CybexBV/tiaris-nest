@@ -2019,12 +2019,32 @@ pub struct ActiveRuntimeIdentity {
     pub kernel_url: String,
     pub initrd_url: String,
     pub squashfs_url: String,
+    pub signed_runtime: SignedRuntime,
+}
+
+/// The runtime's descriptor as the release signed it and its manifest byte
+/// for byte, so a loader that does not trust the network it boots on (the
+/// USB installer stick) checks the release signature itself.
+#[derive(Clone, Debug, Serialize)]
+pub struct SignedRuntime {
+    pub descriptor: WorkstationNetbootDescriptor,
+    pub manifest: String,
 }
 
 struct ActiveRuntime {
     bundle_sha256: String,
     descriptor: WorkstationNetbootDescriptor,
     manifest: WorkstationNetbootManifest,
+    manifest_body: String,
+}
+
+impl ActiveRuntime {
+    fn signed_runtime(&self) -> SignedRuntime {
+        SignedRuntime {
+            descriptor: self.descriptor.clone(),
+            manifest: self.manifest_body.clone(),
+        }
+    }
 }
 
 /// Import state describes reconciliation of the newest desired candidate; it
@@ -2057,10 +2077,13 @@ async fn load_active_runtime(state: &AppState) -> Result<ActiveRuntime> {
     }
     let manifest = parse_canonical_manifest(&manifest_body)?;
     validate_manifest(&manifest, &descriptor)?;
+    let manifest_body = String::from_utf8(manifest_body)
+        .context("active workstation netboot manifest is not UTF-8")?;
     Ok(ActiveRuntime {
         bundle_sha256,
         descriptor,
         manifest,
+        manifest_body,
     })
 }
 
@@ -2076,7 +2099,9 @@ pub async fn active_runtime_identity(state: &AppState) -> Result<ActiveRuntimeId
     let runtime = load_active_runtime(state).await?;
     let (kernel_url, initrd_url, squashfs_url) =
         component_urls(state.config.public_base_url(), &runtime.bundle_sha256);
+    let signed_runtime = runtime.signed_runtime();
     Ok(ActiveRuntimeIdentity {
+        signed_runtime,
         bundle_sha256: runtime.bundle_sha256,
         runtime_version: runtime.descriptor.runtime_version,
         components: runtime.manifest.components,
@@ -2131,11 +2156,14 @@ pub async fn create_boot_session_for_runtime(
         .context("boot session organization identity is invalid")?;
     validate_organization_slug(&state.config.manage.organization_slug)?;
 
+    let active = load_active_runtime(state).await?;
+    let signed_runtime = active.signed_runtime();
     let ActiveRuntime {
         bundle_sha256,
         descriptor,
         manifest,
-    } = load_active_runtime(state).await?;
+        ..
+    } = active;
 
     let identity = crate::manage::nest_boot_identity(&state.config)?;
     if !is_safe_control_plane_id(&identity.device_id) {
@@ -2235,6 +2263,7 @@ pub async fn create_boot_session_for_runtime(
         .kernel_cmdline_template
         .replace("{squashfs_url}", &squashfs_url);
     let identity = ActiveRuntimeIdentity {
+        signed_runtime,
         bundle_sha256: bundle_sha256.clone(),
         runtime_version: descriptor.runtime_version.clone(),
         components: manifest.components.clone(),

@@ -109,6 +109,31 @@ mod usb_installer_routes {
         descriptor
     }
 
+    /// What a stick of protocol 4 checks with the release key built into it:
+    /// the descriptor as the release signed it, and the manifest byte for byte
+    /// under its signed digest.
+    fn assert_signed_runtime(
+        state: &AppState,
+        signed: &Value,
+        descriptor: &WorkstationNetbootDescriptor,
+    ) -> String {
+        let sent: WorkstationNetbootDescriptor =
+            serde_json::from_value(signed["descriptor"].clone()).unwrap();
+        assert_eq!(&sent, descriptor);
+        crate::netboot::validate_descriptor(&sent, &state.config.update.trusted_public_key)
+            .expect("the release signature verifies");
+        let manifest = signed["manifest"].as_str().unwrap();
+        assert_eq!(
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(manifest.as_bytes())),
+            descriptor.manifest_sha256
+        );
+        let manifest: Value = serde_json::from_str(manifest).unwrap();
+        manifest["kernel_cmdline_template"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
     /// The context the launch names, exactly as iPXE would fetch it.
     async fn launch_context(app: Router, launch: &Value) -> Value {
         let url = launch["context_url"].as_str().unwrap();
@@ -163,6 +188,13 @@ mod usb_installer_routes {
                 .matches(launch["squashfs_url"].as_str().unwrap())
                 .count(),
             1
+        );
+        let template =
+            assert_signed_runtime(&fixture.state, &launch["signed_runtime"], &descriptor);
+        assert_eq!(
+            command_line,
+            template.replace("{squashfs_url}", launch["squashfs_url"].as_str().unwrap()),
+            "the stick compares the command line with the signed template"
         );
 
         let context = launch_context(app, launch).await;
@@ -384,6 +416,11 @@ mod usb_installer_routes {
         assert_eq!(
             body["runtime"]["components"],
             serde_json::to_value(&descriptor.components).unwrap()
+        );
+        assert_signed_runtime(
+            &fixture.state,
+            &body["runtime"]["signed_runtime"],
+            &descriptor,
         );
         let sessions: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM nest_boot_sessions")
             .fetch_one(&fixture.state.db)
