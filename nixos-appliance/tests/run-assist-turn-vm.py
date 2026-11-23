@@ -29,7 +29,7 @@ def run_phase(command, work, env, deadline):
         process.wait()
 
 
-def boot(preflight, work, arguments, report):
+def boot(preflight, work, runtime, arguments, report):
     work = Path(work)
     (work / "tmp").mkdir()
     (work / "out").mkdir()
@@ -37,15 +37,16 @@ def boot(preflight, work, arguments, report):
     run_phase(["nix-build", str(TEST), *preflight.nix_args(arguments), "-A", "driver",
                "--out-link", str(work / "driver")], work, env, 3600)
     preflight.memory_gate(report)
-    # Unix socket names have a 108-byte limit. A procfs name keeps the
-    # driver and QEMU paths short while the actual files stay on the lease.
-    fd = os.open(work, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        env["XDG_RUNTIME_DIR"] = f"/proc/{os.getpid()}/fd/{fd}"
-        run_phase([str(work / "driver/bin/nixos-test-driver"), "--output_directory", str(work / "out")],
-                  work, env, 480)
-    finally:
-        os.close(fd)
+    # The driver needs short Unix socket paths, and QEMU aborts when its
+    # shared directory traverses a procfs fd. Use a short real runtime
+    # directory and keep the disk images in the leased workspace.
+    for node in NODES:
+        state = work / f"vm-state-{node}"
+        state.mkdir()
+        (Path(runtime) / state.name).symlink_to(state)
+    env["XDG_RUNTIME_DIR"] = runtime
+    run_phase([str(work / "driver/bin/nixos-test-driver"), "--keep-machine-state",
+               "--output_directory", str(work / "out")], work, env, 480)
 
 
 def main():
@@ -70,8 +71,9 @@ def main():
         preflight.evaluate(TEST, arguments, mode, receipt["preflight"],
                            script=[TEST.with_name("assist-turn-fixture.py")])
         if preflight.boots(mode):
-            with tempfile.TemporaryDirectory(prefix="turn.", dir=preflight.work_root()) as work:
-                boot(preflight, work, arguments, receipt["preflight"])
+            with (tempfile.TemporaryDirectory(prefix="turn.", dir=preflight.work_root()) as work,
+                  tempfile.TemporaryDirectory(prefix="p4.", dir="/tmp") as runtime):
+                boot(preflight, work, runtime, arguments, receipt["preflight"])
         receipt["result"] = preflight.result_for(mode, True)
         exit_code = 0
     except preflight.NotRun as error:
