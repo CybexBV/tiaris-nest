@@ -293,6 +293,30 @@ exactly its own items; a missing or altered document fails that grant.
   pending|uploading|uploaded|failed|expired, paths_total, paths_uploaded,
   items_failed, bytes_uploaded, error?, updated_at}`.
 
+## Compact reports
+
+Each sync ends with a report to Manage (`nest/report`). To a Manage whose
+configuration says `compact_report_supported`, the Nest sends only what Manage
+does not hold yet (`src/manage/compact_report.rs`):
+
+- **Cache inventory.** Manage answers `cache_inventory_acknowledged` once it
+  holds the complete inventory. While the inventory stays that one, the cache
+  lane goes empty at that identity. When it changed, each artifact Manage
+  acknowledged unchanged goes without its closure manifest (1.7 MB each on
+  development) and names the manifest digest instead, so the whole inventory
+  fits one report. When Manage does not hold what an entry names
+  (`cache_evidence_required`), or does not acknowledge an empty lane, the Nest
+  starts again with every manifest.
+- **Build results.** A terminal result Manage lists in `build_jobs_settled` is
+  not sent again until the job changes, so new results of running installs and
+  rollouts go in the next report.
+- **Generation.** The report names the inventory generation at which the
+  listed artifacts (id and last change) last changed, for every Manage: the
+  daily integrity check alone no longer restarts a traversal.
+
+On development this took a report from 14.5 MiB every 30 seconds to a few KiB
+plus the software update findings. An older Manage gets full reports.
+
 ## What a network boot starts
 
 A computer that is not installed gets the installer every time it starts
