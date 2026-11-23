@@ -62,6 +62,10 @@ in import (nixpkgs + "/nixos/tests/make-test-python.nix") ({ pkgs, ... }: {
         machine.succeed(f"test $(stat -c %U:%G:%a /var/cache/tiaris-nest/agent/{directory}) = tiaris-nest:tiaris-nest:700")
         machine.succeed(f"runuser -u tiaris-nest -- touch /var/cache/tiaris-nest/agent/{directory}/write-probe")
     machine.fail("runuser -u tiaris-nest -- touch /var/cache/tiaris-nest/root-write-probe")
+    # nginx sends the cache members as its own user: any other account enters the cache root.
+    machine.succeed("test $(stat -c %U:%G:%a /var/cache/tiaris-nest/www/cache) = tiaris-nest:tiaris-nest:755")
+    machine.succeed("runuser -u nobody -- test -x /var/cache/tiaris-nest/www/cache")
+    machine.succeed("test $(stat -c %a /var/cache/tiaris-nest/build) = 750")
 
     machine.succeed("install -d -m0755 /usr/share/tiaris-nest")
     machine.succeed("umask 077; ${pkgs.python3}/bin/python3 ${../runtime/source-copy.py} ${common.sourceArchive} /usr/share/tiaris-nest/manage-source")
