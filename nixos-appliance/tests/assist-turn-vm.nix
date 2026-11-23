@@ -6,6 +6,7 @@
 }:
 import (nixpkgs + "/nixos/tests/make-test-python.nix") ({ pkgs, ... }: {
   name = "tiaris-nest-assist-turn${if smoke then "-smoke" else ""}";
+  defaults.virtualisation.qemu.options = [ "-no-user-config" ];
   nodes = {
     appliance = { lib, ... }:
       let
