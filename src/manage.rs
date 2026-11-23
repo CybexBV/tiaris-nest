@@ -26,7 +26,6 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{FromRow, Sqlite, SqlitePool, Transaction};
-use tokio::time::sleep;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -248,6 +247,9 @@ struct AgentNestConfigResponse {
     /// Manage accepts `appliance_update_replace_v1`, the same way.
     #[serde(default)]
     appliance_update_replace_supported: bool,
+    /// Manage answers `nest/build-work`; an older Manage does not have it.
+    #[serde(default)]
+    build_work_probe_supported: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -759,6 +761,20 @@ static SYNC_HEALTH: std::sync::Mutex<SyncHealth> = std::sync::Mutex::new(SyncHea
 });
 static CYCLE_FAILURE: std::sync::Mutex<Option<&'static str>> = std::sync::Mutex::new(None);
 
+/// Manage's last configuration said it answers `nest/build-work`.
+static BUILD_WORK_PROBE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// How often an idle Nest asks Manage whether a build job waits for it. A
+/// job Manage queues right after a sync no longer waits for the next one.
+const BUILD_WORK_PROBE_INTERVAL: Duration = Duration::from_secs(5);
+/// Wakes the sync loop: a build ended, so Manage hears of it at once.
+static SYNC_NOW: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Sync with Manage now instead of at the next interval. A request while a
+/// sync runs makes the next one start right after it.
+pub fn request_sync() {
+    SYNC_NOW.notify_one();
+}
+
 pub fn sync_health() -> SyncHealth {
     SYNC_HEALTH
         .lock()
@@ -788,6 +804,10 @@ pub fn spawn(state: AppState, _: crate::software_updates::OlderNestsCommitsTaken
         loop {
             let outcome = sync_once_with_outcome(&state).await;
             record_sync_cycle(outcome.is_ok());
+            // Only after a sync that took every listed job: a job Manage
+            // names is then one that was queued since.
+            let probe =
+                outcome.is_ok() && BUILD_WORK_PROBE.load(std::sync::atomic::Ordering::Relaxed);
             let interval = match outcome {
                 Ok(report) => {
                     consecutive_failures = 0;
@@ -816,9 +836,81 @@ pub fn spawn(state: AppState, _: crate::software_updates::OlderNestsCommitsTaken
                     interval
                 }
             };
-            sleep(Duration::from_secs(interval)).await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(interval);
+            wait_for_next_sync(deadline, probe, &SYNC_NOW, || new_build_work(&state)).await;
         }
     });
+}
+
+/// Waits until `deadline`, until `wake` (`request_sync`), or, with `probe`,
+/// until Manage names a queued build job this Nest does not have, asking
+/// every `BUILD_WORK_PROBE_INTERVAL`.
+async fn wait_for_next_sync<F, Fut>(
+    deadline: tokio::time::Instant,
+    probe: bool,
+    wake: &tokio::sync::Notify,
+    mut new_work: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    loop {
+        let next = if probe {
+            (tokio::time::Instant::now() + BUILD_WORK_PROBE_INTERVAL).min(deadline)
+        } else {
+            deadline
+        };
+        tokio::select! {
+            () = wake.notified() => return,
+            () = tokio::time::sleep_until(next) => {}
+        }
+        if tokio::time::Instant::now() >= deadline || new_work().await {
+            return;
+        }
+    }
+}
+
+/// Whether Manage names a queued build job this Nest does not have yet. An
+/// unanswered question is no work: the regular sync still comes.
+async fn new_build_work(state: &AppState) -> bool {
+    // A question that hangs never holds back the regular sync for long.
+    let queued =
+        match tokio::time::timeout(BUILD_WORK_PROBE_INTERVAL, probe_build_work(state)).await {
+            Ok(Ok(queued)) => queued,
+            Ok(Err(error)) => {
+                debug!(error = %safe_error(&error), "could not ask Tiaris for queued build work");
+                return false;
+            }
+            Err(_) => return false,
+        };
+    match db::has_unknown_managed_build_job(&state.db, &queued).await {
+        Ok(unknown) => unknown,
+        Err(error) => {
+            warn!(error = %error, "could not compare queued build work with this Nest's builds");
+            false
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BuildWorkResponse {
+    queued_build_job_ids: Vec<String>,
+}
+
+async fn probe_build_work(state: &AppState) -> Result<Vec<String>> {
+    let managed = load_managed_state(state)?;
+    let device_id = managed_device_id(&managed)?;
+    let path = format!("/v1/agent/devices/{device_id}/nest/build-work");
+    let response = signed_request(state, &managed, Method::GET, &path, Vec::new())
+        .await?
+        .send()
+        .await
+        .context("ask for queued build work request failed")?;
+    let work: BuildWorkResponse = parse_success_json(response, "ask for queued build work").await?;
+    if work.queued_build_job_ids.len() > MAX_MANAGED_BUILD_JOBS {
+        bail!("Tiaris named more than {MAX_MANAGED_BUILD_JOBS} queued build jobs");
+    }
+    Ok(work.queued_build_job_ids)
 }
 
 pub async fn sync_once(state: &AppState) -> Result<SyncOnceReport> {
@@ -1129,6 +1221,10 @@ async fn sync_nest_foundation(
     let mut first_failure = None;
     let peer = match fetch_nest_config(state, managed).await {
         Ok(desired) => {
+            BUILD_WORK_PROBE.store(
+                desired.build_work_probe_supported,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             let peer = PeerContract {
                 supports_scheduling: desired.update_schedule_supported,
                 accepts_uploads: desired.software_cache_upload_supported,
@@ -4002,6 +4098,36 @@ mod tests {
         assert_eq!(failed_sync_interval_seconds(&config, 3), 20);
         assert_eq!(failed_sync_interval_seconds(&config, 4), 30);
         assert_eq!(failed_sync_interval_seconds(&config, 100), 30);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_nest_syncs_as_soon_as_manage_names_new_build_work() {
+        let wake = tokio::sync::Notify::new();
+        let asked = std::cell::Cell::new(0);
+        let interval = Duration::from_secs(30);
+        // Manage names a job new to this Nest at the second question.
+        let started = tokio::time::Instant::now();
+        wait_for_next_sync(started + interval, true, &wake, || {
+            asked.set(asked.get() + 1);
+            let new = asked.get() == 2;
+            async move { new }
+        })
+        .await;
+        assert_eq!(started.elapsed(), 2 * BUILD_WORK_PROBE_INTERVAL);
+        // An older Manage is never asked: the Nest waits for its interval.
+        let started = tokio::time::Instant::now();
+        wait_for_next_sync(started + interval, false, &wake, || {
+            asked.set(asked.get() + 1);
+            async { true }
+        })
+        .await;
+        assert_eq!(started.elapsed(), interval);
+        assert_eq!(asked.get(), 2);
+        // A build that ended starts the sync at once.
+        wake.notify_one();
+        let started = tokio::time::Instant::now();
+        wait_for_next_sync(started + interval, true, &wake, || async { false }).await;
+        assert_eq!(started.elapsed(), Duration::ZERO);
     }
 
     #[test]
