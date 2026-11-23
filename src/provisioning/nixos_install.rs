@@ -190,12 +190,15 @@ pub(super) async fn stage_members(
         Ok(None) => return Ok(None),
         Err(error) => return whole(error),
     };
-    // The staged members and their extracted cache, beside a bounded runtime.
+    // Members and their cache take twice their bytes in RAM; when they do
+    // not fit, the whole archive (once in RAM, extracted onto the disk) may.
     let staged = plan.bytes - plan.remaining_bytes();
-    ensure!(
-        available.saturating_add(staged) >= plan.bytes.saturating_mul(2).saturating_add(2 * GIB),
-        "insufficient available memory for the closure members plus bounded runtime"
-    );
+    let tmpfs = crate::disk::stats(Path::new(STAGING)).map_or(0, |stats| stats.available_bytes);
+    if !members_fit(plan.bytes, staged, available, tmpfs) {
+        return whole(anyhow!(
+            "insufficient available memory for the closure members plus bounded runtime"
+        ));
+    }
     tracing::info!(
         members = plan.members(),
         bytes = plan.bytes,
@@ -206,6 +209,15 @@ pub(super) async fn stage_members(
         Ok(()) => Ok(Some(plan)),
         Err(error) => whole(error),
     }
+}
+
+/// Whether `bytes` of staged members (`staged` of them there already) and
+/// their extracted cache fit: in memory beside a bounded runtime, and in the
+/// tmpfs that holds them (`/run`, often smaller than the memory).
+fn members_fit(bytes: u64, staged: u64, available: u64, tmpfs_available: u64) -> bool {
+    let needed = bytes.saturating_mul(2);
+    available.saturating_add(staged) >= needed.saturating_add(2 * GIB)
+        && tmpfs_available.saturating_add(staged) >= needed
 }
 
 /// The staged members' one verification pass, extracting their binary cache
@@ -1026,6 +1038,17 @@ fn reboot_installed() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Members that do not fit take the whole archive instead of ending the
+    /// setup; the tmpfs that holds them counts as well as the memory.
+    #[test]
+    fn members_fit_in_memory_and_in_the_tmpfs_that_holds_them() {
+        assert!(members_fit(GIB, 0, 4 * GIB, 2 * GIB));
+        assert!(!members_fit(GIB, 0, 3 * GIB, 8 * GIB));
+        assert!(!members_fit(GIB, 0, 8 * GIB, GIB));
+        // What an earlier try staged is there already.
+        assert!(members_fit(GIB, GIB / 2, 8 * GIB, 3 * GIB / 2));
+    }
 
     fn closure_artifact() -> SystemClosure {
         SystemClosure {

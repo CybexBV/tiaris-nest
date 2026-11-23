@@ -161,16 +161,20 @@ struct Source {
 enum Transfer {
     /// The connection or the server failed: the bytes so far stand.
     Dropped(anyhow::Error),
-    /// The server answered with the whole archive. A proxy does that now
-    /// and then (Cloudflare before development, once); a server that
-    /// always does cannot serve members.
+    /// The server answered a range that does not start at the archive's
+    /// start with the whole archive. A proxy does that now and then; a
+    /// server that always does cannot serve members.
     Whole,
     /// The answer is not the archive's bytes: take the archive whole.
     Refused(anyhow::Error),
 }
 
-/// Whole-archive answers to a range taken as passing before giving up.
-const WHOLE_ANSWERS: u32 = 2;
+/// Whole-archive answers to a range taken as passing before giving up, each
+/// after a longer pause: a Cloudflare edge answers its first range request
+/// for a new file with the whole file and later ones with the range, and a
+/// school's requests reach more than one edge (release 2 of 23 November
+/// 2026 took the whole archive after three such answers).
+const WHOLE_ANSWERS: u32 = 5;
 
 impl Source {
     /// Fetch tar bytes `*got..end` through `out`, advancing `got`; after a
@@ -190,6 +194,11 @@ impl Source {
                 Err(Transfer::Dropped(error)) => error,
                 Err(Transfer::Whole) if whole < WHOLE_ANSWERS => {
                     whole += 1;
+                    tracing::info!(
+                        whole,
+                        "the server answered a range with the whole archive; asking again"
+                    );
+                    tokio::time::sleep(self.pause * whole).await;
                     continue;
                 }
                 Err(Transfer::Whole) => bail!("the server does not serve parts of the archive"),
@@ -234,19 +243,28 @@ impl Source {
                 "closure range answered {status}"
             )));
         }
-        if status == StatusCode::OK {
+        // A range from the archive's start is the start of a whole answer:
+        // read as far as the range goes.
+        let whole = status == StatusCode::OK;
+        if whole
+            && (first != 0
+                || response
+                    .content_length()
+                    .is_some_and(|length| length != self.archive_bytes))
+        {
             return Err(Transfer::Whole);
         }
         let expected = format!("bytes {first}-{last}/{}", self.archive_bytes);
-        if status != StatusCode::PARTIAL_CONTENT
-            || response
-                .headers()
-                .get(header::CONTENT_RANGE)
-                .and_then(|value| value.to_str().ok())
-                != Some(expected.as_str())
-            || response
-                .content_length()
-                .is_some_and(|length| length != last - first + 1)
+        if !whole
+            && (status != StatusCode::PARTIAL_CONTENT
+                || response
+                    .headers()
+                    .get(header::CONTENT_RANGE)
+                    .and_then(|value| value.to_str().ok())
+                    != Some(expected.as_str())
+                || response
+                    .content_length()
+                    .is_some_and(|length| length != last - first + 1))
         {
             return Err(refused("the server does not serve this range"));
         }
@@ -257,13 +275,19 @@ impl Source {
         {
             return Err(refused("encoded body"));
         }
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|error| Transfer::Dropped(error.into()))?
-        {
+        let mut left = last - first + 1;
+        while left > 0 {
+            let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|error| Transfer::Dropped(error.into()))?
+            else {
+                break;
+            };
+            let chunk = &chunk[..chunk.len().min(usize::try_from(left).unwrap_or(usize::MAX))];
+            left -= chunk.len() as u64;
             deblock
-                .push(&chunk, &mut |bytes| {
+                .push(chunk, &mut |bytes| {
                     out(bytes)?;
                     *got += bytes.len() as u64;
                     Ok(())
@@ -394,7 +418,8 @@ fn metadata_want(prefix: &[u8]) -> Option<u64> {
         let nar_size = path["nar_size"].as_u64()?;
         let mut references = 0;
         for (index, reference) in path["references"].as_array()?.iter().enumerate() {
-            references += usize::from(index > 0) + reference.as_str()?.len() - "/nix/store/".len();
+            let base = reference.as_str()?.len().checked_sub("/nix/store/".len())?;
+            references += usize::from(index > 0) + base;
         }
         let body = line("StorePath", store_path.len())
             + line("URL", "nar/".len() + 32 + ".nar.zst".len())
@@ -408,6 +433,17 @@ fn metadata_want(prefix: &[u8]) -> Option<u64> {
         end += 512 + padded(body);
     }
     Some(end + 512 + 512)
+}
+
+/// The end of the next metadata request once `want` was not enough: as far
+/// as the manifest says, else a step further. Never past the archive or
+/// [`MAX_METADATA`]: the headers it goes by are not verified yet.
+fn next_metadata_want(prefix: &[u8], want: u64, tar_bytes: u64) -> u64 {
+    metadata_want(prefix)
+        .filter(|next| *next > want)
+        .unwrap_or(want + METADATA_STEP)
+        .min(tar_bytes)
+        .min(MAX_METADATA)
 }
 
 struct Wanted {
@@ -546,10 +582,7 @@ async fn plan_from(
             want < layout.tar_bytes && want < MAX_METADATA,
             "the closure metadata is unbounded"
         );
-        want = metadata_want(&prefix)
-            .filter(|next| *next > want)
-            .unwrap_or(want + METADATA_STEP)
-            .min(layout.tar_bytes);
+        want = next_metadata_want(&prefix, want, layout.tar_bytes);
     };
     prefix.truncate(end);
     let metadata = closure::read_metadata(&prefix, release, key)?;
@@ -648,7 +681,14 @@ pub async fn stage(plan: &Plan, target: &Path) -> Result<()> {
         })
         .collect();
     let mut keep_trying = None;
-    for result in at_most(AT_ONCE, fetches).await {
+    // A member that does not verify, or a server that does not serve
+    // ranges, ends this way: no further member starts.
+    let ends = |result: &Result<()>| {
+        result
+            .as_ref()
+            .is_err_and(|error| !error.is::<KeepTrying>())
+    };
+    for result in at_most(AT_ONCE, fetches, ends).await {
         match result {
             Ok(()) => {}
             // What verified stays; the next try fetches the rest.
@@ -694,14 +734,17 @@ async fn fetch_member(plan: &Plan, file: &File, wanted: &Wanted, at: u64) -> Res
 }
 
 /// Run `tasks` on this task, at most `limit` at once; their results in
-/// their order.
+/// their order. Once a result `ends` it, no further task starts and those
+/// still running are dropped: only the finished ones' results come back.
 async fn at_most<'a, T>(
     limit: usize,
     tasks: Vec<Pin<Box<dyn Future<Output = T> + Send + 'a>>>,
+    ends: impl Fn(&T) -> bool,
 ) -> Vec<T> {
     let mut results: Vec<Option<T>> = tasks.iter().map(|_| None).collect();
     let mut waiting = tasks.into_iter().enumerate();
     let mut running = Vec::new();
+    let mut ended = false;
     std::future::poll_fn(|context| {
         loop {
             while running.len() < limit {
@@ -714,11 +757,16 @@ async fn at_most<'a, T>(
             let before = running.len();
             running.retain_mut(|(index, task)| match task.as_mut().poll(context) {
                 Poll::Ready(result) => {
+                    ended |= ends(&result);
                     results[*index] = Some(result);
                     false
                 }
                 Poll::Pending => true,
             });
+            if ended {
+                running.clear();
+                return Poll::Ready(());
+            }
             if running.len() == before {
                 return Poll::Pending;
             }

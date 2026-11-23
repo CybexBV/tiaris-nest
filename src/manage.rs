@@ -4,7 +4,7 @@ use std::os::{
     unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
 };
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     ffi::OsString,
     fs,
     io::{self, Write},
@@ -124,9 +124,6 @@ struct ManagedState {
     nest_cache_content: Option<compact_report::CacheInventoryContent>,
     /// The cache inventory Manage last acknowledged complete.
     nest_cache_acknowledged: Option<compact_report::CacheInventoryContent>,
-    /// Terminal build jobs whose result Manage settled: local id to the
-    /// `updated_at` it settled.
-    nest_build_jobs_settled: BTreeMap<i64, String>,
 }
 
 /// How long a confirmed contract outlives failing configuration fetches. Long enough for a Manage deploy or outage,
@@ -1664,7 +1661,7 @@ async fn report_nest_state(
         managed.nest_rejection_report_cursor,
         managed.nest_terminal_report_cursor,
         managed.nest_report_rotation_round,
-        &compact_report::settled_build_jobs(managed),
+        &compact_report::settled_build_jobs(),
         MAX_REPORT_BUILD_JOBS,
         MAX_NEST_REPORT_BODY_BYTES,
     )

@@ -6,8 +6,8 @@
 //! every member for every export and for every root's daily check read the
 //! same bytes many times a day. A member hashed within [`MAX_AGE`] is not
 //! read again while its file keeps the same device, inode, size and
-//! modification and change times. Once that day has passed it is hashed
-//! again, so every member's bytes are still checked at least daily.
+//! modification and change times. After that it is hashed again, so every
+//! member's bytes are still checked at least daily.
 //!
 //! The record only ever confirms the expected FileHash: a mismatch is always
 //! decided by reading the file again. It lives in memory, so after a restart
@@ -25,8 +25,15 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-/// How long a member's hash is reused: the cadence of the cache scrub.
-pub(crate) const MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+/// The cadence of the cache scrub: a root is due a day after its oldest
+/// member hash (`db::cache_artifacts_due_for_verification`).
+pub(crate) const SCRUB_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
+/// How long a member's hash is reused: an hour less than [`SCRUB_EVERY`], so
+/// a root's check hashes again every member that would come due within the
+/// hour, and the root is not due again for at least an hour. Reused for the
+/// whole day, members hashed minutes apart came due one by one, and each
+/// made the next sync walk the whole closure (some 2,000 members) again.
+pub(crate) const MAX_AGE: Duration = Duration::from_secs(SCRUB_EVERY.as_secs() - 60 * 60);
 const SETTLE: Duration = Duration::from_secs(2);
 /// Far above the members of a full cache; reached only by churn.
 const MAX_ENTRIES: usize = 1 << 18;
@@ -154,6 +161,29 @@ impl MemberHashes {
                 hashed_at: started,
             },
         );
+    }
+
+    /// Remember that the file of `metadata` was hashed to `sha256` at
+    /// `hashed_at`.
+    #[cfg(test)]
+    pub(crate) fn remember_at(
+        &self,
+        metadata: &fs::Metadata,
+        sha256: [u8; 32],
+        hashed_at: SystemTime,
+    ) {
+        let (identity, version) = FileVersion::of(metadata);
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                identity,
+                Entry {
+                    version,
+                    sha256,
+                    hashed_at,
+                },
+            );
     }
 }
 
