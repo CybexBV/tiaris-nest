@@ -208,6 +208,11 @@ retained jobs from before the upgrade remain retryable; current Tiaris issues
 only v3 and refuses to prepare installations on a Nest without it
 (`nest_installer_closure_unsupported`). Deploy Nest before Tiaris.
 
+Nest keeps the active, previous and desired workstation runtime bundles,
+those a boot session of the last day names, and of the others only the newest,
+for at most seven days; hourly maintenance removes the rest (each tree is
+about 1.4 GB).
+
 Runtime integrity maintenance rechecks retained bundles every 12 hours and
 renews the active runtime's reported verification time only after a successful
 check. This keeps healthy nodes within Tiaris's 24-hour verification window.
