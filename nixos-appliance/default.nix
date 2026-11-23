@@ -68,11 +68,19 @@ let
   # (Tiaris docs/design/usb-installer.md), built from the same pinned Tiaris
   # source. Every release publishes it beside the template ISO and names it
   # in its signed manifest; the Nest itself does not carry or serve it.
-  usbInstaller = import (builtins.toPath manageRepo + "/deploy/nixos/tiaris-usb-installer.nix") {
-    inherit nixpkgs pkgs system;
-    repoRoot = builtins.toPath manageRepo;
-    sourceRevision = manageSourceRevision;
-  };
+  # The stick checks the runtime's signature with this release's key and
+  # installs only for this release's Manage. Tiaris sources from before the
+  # stick took them do not accept the two arguments, so pass only what the
+  # pinned source's function names.
+  usbInstaller =
+    let
+      build = import (builtins.toPath manageRepo + "/deploy/nixos/tiaris-usb-installer.nix");
+    in
+    build (builtins.intersectAttrs (builtins.functionArgs build) {
+      inherit nixpkgs pkgs system releasePublicKey manageOrigin;
+      repoRoot = builtins.toPath manageRepo;
+      sourceRevision = manageSourceRevision;
+    });
   common = {
     inherit package sourceArchive migrations workstationAgent workstationCacheSeeds installerKiosk sourceRevision manageSourceRevision manageOrigin sourceDateEpoch releasePublicKey;
     sourceArchiveFile = archiveInput;
