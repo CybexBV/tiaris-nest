@@ -75,12 +75,14 @@ fn raw_blocks_put_every_tar_byte_where_the_layout_says() {
 }
 
 /// Serves `archive` at a loopback URL: byte ranges, or the whole file when
-/// `ranges` is false. With `drop_once`, the first range not at the start
-/// ends halfway. Records the requested ranges.
+/// `ranges` is false and for the first `whole_first` requests (a Cloudflare
+/// edge and a file new to it). With `drop_once`, the first range not at the
+/// start ends halfway. Records the requested ranges.
 async fn serve(
     archive: Vec<u8>,
     ranges: bool,
     drop_once: bool,
+    mut whole_first: usize,
 ) -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!(
@@ -96,7 +98,7 @@ async fn serve(
             let range = requested_range(&mut stream).await;
             log.lock().unwrap().push(range.clone());
             let response = match range.split_once('-') {
-                Some((first, last)) if ranges => {
+                Some((first, last)) if ranges && whole_first == 0 => {
                     let (first, last): (usize, usize) =
                         (first.parse().unwrap(), last.parse().unwrap());
                     let length = last + 1 - first;
@@ -107,6 +109,7 @@ async fn serve(
                     }
                 }
                 _ => {
+                    whole_first = whole_first.saturating_sub(1);
                     let mut head = format!(
                         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         archive.len()
@@ -170,7 +173,7 @@ async fn an_update_fetches_and_stages_only_what_the_running_system_lacks() {
     // The running system holds the source; the new system is missing.
     let (source, system) = (&manifest.store_paths[1], &manifest.store_paths[0]);
     let present = Present::from([(source.path.clone(), source.nar_hash.clone())]);
-    let (url, seen, server) = serve(archive.clone(), true, true).await;
+    let (url, seen, server) = serve(archive.clone(), true, true, 0).await;
     let inbox = temporary("tiaris-members-inbox");
     let mut plan = plan(&fixture.release, &key, &url, true, &inbox, &present)
         .await
@@ -251,18 +254,28 @@ async fn an_older_archive_or_a_server_without_ranges_takes_the_whole_archive() {
     let present = Present::new();
     let compressed = zstd::stream::encode_all(&fixture.tar()[..], 3).unwrap();
     fixture.bind(&compressed);
-    let (url, _, server) = serve(compressed, true, false).await;
+    let (url, _, server) = serve(compressed, true, false, 0).await;
     let planned = plan(&fixture.release, &key, &url, true, &inbox, &present).await;
     server.abort();
     assert!(planned.unwrap().is_none());
 
+    // The metadata comes from the start of a whole answer; a member cannot.
     let archive = raw_frame(&fixture.tar());
     fixture.bind(&archive);
-    let (url, _, server) = serve(archive, false, false).await;
-    let planned = plan(&fixture.release, &key, &url, true, &inbox, &present).await;
+    let source = &fixture.verify(&archive).unwrap().store_paths[1];
+    let present = Present::from([(source.path.clone(), source.nar_hash.clone())]);
+    let (url, seen, server) = serve(archive, false, false, 0).await;
+    let mut plan = plan(&fixture.release, &key, &url, true, &inbox, &present)
+        .await
+        .unwrap()
+        .unwrap();
+    plan.source.pause = Duration::ZERO;
+    let error = stage(&plan, &inbox.join("attempt.members.tar"))
+        .await
+        .unwrap_err();
     server.abort();
-    let error = planned.err().unwrap();
     assert!(!error.is::<KeepTrying>());
+    assert_eq!(seen.lock().unwrap().len(), 2 + WHOLE_ANSWERS as usize);
     fs::remove_dir_all(inbox).unwrap();
 }
 
@@ -326,8 +339,30 @@ async fn members_are_fetched_a_few_at_a_time() {
             }) as Pin<Box<dyn Future<Output = usize> + Send>>
         })
         .collect();
-    assert_eq!(at_most(AT_ONCE, tasks).await, (0..10).collect::<Vec<_>>());
+    assert_eq!(
+        at_most(AT_ONCE, tasks, |_| false).await,
+        (0..10).collect::<Vec<_>>()
+    );
     assert_eq!(most.load(Ordering::SeqCst), AT_ONCE);
+
+    // A result that ends the fetch (a member that does not verify) starts
+    // no further task.
+    let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let tasks: Vec<Pin<Box<dyn Future<Output = usize> + Send>>> = (0..10usize)
+        .map(|index| {
+            let started = started.clone();
+            Box::pin(async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+                index
+            }) as Pin<Box<dyn Future<Output = usize> + Send>>
+        })
+        .collect();
+    assert_eq!(
+        at_most(AT_ONCE, tasks, |index| *index == 1).await,
+        (0..AT_ONCE).collect::<Vec<_>>()
+    );
+    assert_eq!(started.load(Ordering::SeqCst), AT_ONCE);
 }
 
 /// Serves ranges of `archive` like [`serve`], but holds the first `wave`
@@ -363,6 +398,90 @@ async fn serve_last_first(archive: Vec<u8>, wave: usize) -> (String, tokio::task
     (url, server)
 }
 
+/// Incompressible bytes.
+fn noise(state: &mut u64, bytes: usize) -> Vec<u8> {
+    (0..bytes)
+        .map(|_| {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state as u8
+        })
+        .collect()
+}
+
+/// A Cloudflare edge answers its first range request for a new file with
+/// the whole file and later ones with the range; a school's requests reach
+/// more than one edge (release 2 of 23 November 2026 took the whole archive
+/// after three such answers). The metadata is read from the start of a
+/// whole answer; a member asks again, after a pause, until the range comes.
+#[tokio::test]
+async fn whole_answers_to_ranges_are_waited_out() {
+    // More than the first metadata request, so a whole answer is cut short.
+    let path = format!("/nix/store/{}-member", "2".repeat(32));
+    let mut fixture = Fixture::with(&[(path.as_str(), noise(&mut 7, 1_200_000))]);
+    let archive = raw_frame(&fixture.tar());
+    fixture.bind(&archive);
+    assert!(archive.len() as u64 > METADATA_STEP);
+    let key = fixture.key.verifying_key();
+    let manifest = fixture.verify(&archive).unwrap();
+    // Only the system is missing.
+    let present: Present = manifest.store_paths[1..]
+        .iter()
+        .map(|path| (path.path.clone(), path.nar_hash.clone()))
+        .collect();
+    let (url, seen, server) = serve(archive, true, false, 4).await;
+    let inbox = temporary("tiaris-members-whole-answers");
+    let mut plan = plan(&fixture.release, &key, &url, true, &inbox, &present)
+        .await
+        .unwrap()
+        .unwrap();
+    plan.source.pause = Duration::ZERO;
+    assert_eq!(plan.members(), 1);
+    stage(&plan, &inbox.join("attempt.members.tar"))
+        .await
+        .unwrap();
+    server.abort();
+    // The metadata from the first whole answer, the member after three.
+    assert_eq!(seen.lock().unwrap().len(), 5);
+    fs::remove_dir_all(inbox).unwrap();
+}
+
+/// The headers that size the next metadata request are not verified yet: a
+/// manifest header that claims gigabytes asks for at most `MAX_METADATA`,
+/// and a reference too short for a store path ends the estimate.
+#[test]
+fn unverified_metadata_never_sizes_a_request_past_its_bound() {
+    let header = |size: u64| {
+        let mut header = tar::Header::new_ustar();
+        header.set_path("manifest.json").unwrap();
+        header.set_size(size);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mode(0o644);
+        header.set_mtime(0);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_cksum();
+        header.as_bytes().to_vec()
+    };
+    let claimed = 4 << 30;
+    assert_eq!(metadata_want(&header(claimed)), Some(512 + claimed));
+    assert_eq!(
+        next_metadata_want(&header(claimed), METADATA_STEP, 8 << 30),
+        MAX_METADATA
+    );
+    let manifest = serde_json::json!({"store_paths": [{
+        "path": "/nix/store/00000000000000000000000000000000-system",
+        "nar_hash": "sha256:x",
+        "nar_size": 1,
+        "references": ["short"],
+    }]})
+    .to_string();
+    let mut prefix = header(manifest.len() as u64);
+    prefix.extend(manifest.as_bytes());
+    assert_eq!(metadata_want(&prefix), None);
+}
+
 /// Members fetched at once each land in their own place, whatever order
 /// their bytes arrive in (0.2.183-dev.2: the staged stream was opened to
 /// append, so they landed in the order they arrived and the update took the
@@ -372,16 +491,7 @@ async fn serve_last_first(archive: Vec<u8>, wave: usize) -> (String, tokio::task
 async fn members_fetched_at_once_land_in_their_places() {
     // Incompressible, so each payload crosses a block.
     let mut state = 0x2545_f491_4f6c_dd1d_u64;
-    let mut noise = |bytes: usize| -> Vec<u8> {
-        (0..bytes)
-            .map(|_| {
-                state ^= state << 13;
-                state ^= state >> 7;
-                state ^= state << 17;
-                state as u8
-            })
-            .collect()
-    };
+    let mut noise = |bytes: usize| noise(&mut state, bytes);
     let paths: Vec<String> = (2..8)
         .map(|digit| format!("/nix/store/{}-member", digit.to_string().repeat(32)))
         .collect();
@@ -404,7 +514,7 @@ async fn members_fetched_at_once_land_in_their_places() {
         .step_by(2)
         .map(|path| (path.path.clone(), path.nar_hash.clone()))
         .collect();
-    let (url, _, server) = serve(archive.clone(), true, false).await;
+    let (url, _, server) = serve(archive.clone(), true, false, 0).await;
     let inbox = temporary("tiaris-members-at-once");
     let mut plan = plan(&fixture.release, &key, &url, true, &inbox, &present)
         .await
