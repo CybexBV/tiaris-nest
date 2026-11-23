@@ -477,7 +477,9 @@ a status older than 90 seconds as stale attention.
 ## Services and network
 
 The NixOS module provides unprivileged Nest, sandboxed Nix daemon, nginx IPv4
-listener, immutable TFTP root, dnsmasq ProxyDHCP supervisor,
+listener (`nginx.nix`: it sends the cache and workstation runtime files the
+daemon checked and handed over, and passes everything else to the daemon),
+immutable TFTP root, dnsmasq ProxyDHCP supervisor,
 certificate-only OpenSSH, atomic management-CIDR SSH nftables policy, watchdog,
 time synchronization, bounded journald and coordinated daily GC. Nest has private
 HOME/XDG/TMP leaves and no Linux capabilities or Nix trusted-user status.

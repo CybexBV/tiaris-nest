@@ -1,6 +1,6 @@
 use std::{
     io::SeekFrom,
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Component, Path, PathBuf},
 };
 
@@ -135,11 +135,21 @@ pub async fn serve_file_from_root(
     }
 }
 
-/// Serve only the file layout emitted by a Nix static binary cache. This
+/// Where nginx sends the files the daemon hands over: internal locations that
+/// only an `X-Accel-Redirect` reaches (`nixos-appliance/nginx.nix`).
+const HANDOFF_PREFIX: &str = "/_tiaris";
+pub(crate) const X_ACCEL_REDIRECT: &str = "x-accel-redirect";
+
+/// The body bytes nginx sends for a handed-over file: all of it or the
+/// requested range. The cache's egress totals count them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HandedBytes(pub u64);
+
+/// Hand a member of the Nix static binary cache layout to nginx. This
 /// endpoint is intentionally unauthenticated, so unrelated files must remain
 /// unreachable even if an operator accidentally places them below the cache
 /// document root.
-pub async fn serve_binary_cache_member_from_root(
+pub async fn hand_binary_cache_member(
     root: &Path,
     requested_path: &str,
     headers: &HeaderMap,
@@ -147,12 +157,103 @@ pub async fn serve_binary_cache_member_from_root(
     if !is_binary_cache_member_path(requested_path) {
         return Err(AppError::NotFound);
     }
-    let mut response = serve_file_from_root(root, requested_path, headers).await?;
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        axum::http::HeaderValue::from_static(binary_cache_member_cache_control(requested_path)),
-    );
+    let content_type = mime_guess::from_path(requested_path).first_or_octet_stream();
+    hand_file(
+        root,
+        requested_path,
+        &format!("cache/{requested_path}"),
+        headers,
+        content_type.as_ref(),
+        binary_cache_member_cache_control(requested_path),
+    )
+    .await
+}
+
+/// Check the request for the regular file `relative` below `root` (no
+/// symbolic link on the way, a satisfiable range), then hand it to nginx with
+/// `X-Accel-Redirect` to `{HANDOFF_PREFIX}/{location}`. nginx sends it with
+/// sendfile at the client's pace and applies the range; the daemon is done
+/// once it answered. nginx reads the file as its own user, so a member the
+/// daemon once wrote private under its UMask 0077 (`nix-cache-info` before
+/// D14) is made readable first: every file handed over here is public on the
+/// LAN already.
+pub(crate) async fn hand_file(
+    root: &Path,
+    relative: &str,
+    location: &str,
+    headers: &HeaderMap,
+    content_type: &str,
+    cache_control: &str,
+) -> AppResult<Response> {
+    let relative = sanitize_relative_path(relative)?;
+    let root = root.to_path_buf();
+    let file_len = tokio::task::spawn_blocking(move || readable_regular_file(&root, &relative))
+        .await
+        .map_err(|err| AppError::Config(err.to_string()))??;
+    let range = headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok());
+    let bytes = match parse_byte_range(range, file_len) {
+        Ok(Some((start, end))) => end - start + 1,
+        Ok(None) => file_len,
+        Err(()) => return range_not_satisfiable_response(file_len),
+    };
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .header(X_ACCEL_REDIRECT, format!("{HANDOFF_PREFIX}/{location}"))
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CACHE_CONTROL, cache_control)
+        .body(Body::empty())
+        .map_err(|err| AppError::Config(err.to_string()))?;
+    response.extensions_mut().insert(HandedBytes(bytes));
     Ok(response)
+}
+
+/// The length of the regular file `relative` below `root`, readable for
+/// nginx. No component may be a symbolic link; nginx refuses those as well
+/// (`disable_symlinks on`).
+fn readable_regular_file(root: &Path, relative: &Path) -> AppResult<u64> {
+    let mut path = root.to_path_buf();
+    let mut found = None;
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            return Err(AppError::UnsafePath);
+        };
+        path.push(part);
+        let metadata = std::fs::symlink_metadata(&path).map_err(not_found_or_io)?;
+        if metadata.file_type().is_symlink() {
+            return Err(AppError::UnsafePath);
+        }
+        found = Some(metadata);
+    }
+    let metadata = found.ok_or(AppError::UnsafePath)?;
+    if !metadata.is_file() {
+        return Err(AppError::NotFound);
+    }
+    let mode = metadata.permissions().mode();
+    if mode & 0o044 != 0o044 {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)
+            .map_err(not_found_or_io)?;
+        let opened = file.metadata()?;
+        if opened.ino() != metadata.ino() || opened.dev() != metadata.dev() {
+            return Err(AppError::NotFound);
+        }
+        file.set_permissions(std::fs::Permissions::from_mode((mode & 0o7777) | 0o044))?;
+    }
+    Ok(metadata.len())
+}
+
+fn not_found_or_io(err: std::io::Error) -> AppError {
+    if err.raw_os_error() == Some(libc::ELOOP) {
+        AppError::UnsafePath
+    } else if err.kind() == std::io::ErrorKind::NotFound {
+        AppError::NotFound
+    } else {
+        AppError::Io(err)
+    }
 }
 
 /// NAR members are content-addressed by their file hash, so any intermediate
@@ -313,13 +414,13 @@ pub fn redirect_to(location: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::{
-        asset_url, is_binary_cache_member_path, parse_byte_range, sanitize_relative_path,
-        serve_binary_cache_member_from_root, serve_file_from_root,
+        HandedBytes, asset_url, hand_binary_cache_member, is_binary_cache_member_path,
+        parse_byte_range, sanitize_relative_path, serve_file_from_root,
     };
     use axum::http::{HeaderMap, StatusCode};
     use std::{
         fs,
-        os::unix::fs::symlink,
+        os::unix::fs::{PermissionsExt, symlink},
         sync::atomic::{AtomicU64, Ordering},
     };
 
@@ -374,7 +475,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn binary_cache_server_refuses_existing_non_cache_files() {
+    async fn binary_cache_members_are_handed_to_nginx_and_nothing_else() {
         let root = temp_asset_root();
         let nar_dir = root.join("nar");
         fs::create_dir(&nar_dir).unwrap();
@@ -390,16 +491,50 @@ mod tests {
             format!("{store_hash}.narinfo"),
             format!("nar/{file_hash}.nar.zst"),
         ] {
-            let response = serve_binary_cache_member_from_root(&root, &path, &HeaderMap::new())
+            let response = hand_binary_cache_member(&root, &path, &HeaderMap::new())
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers()["x-accel-redirect"],
+                format!("/_tiaris/cache/{path}").as_str()
+            );
         }
+        let error = hand_binary_cache_member(&root, "cache-priv-key.pem", &HeaderMap::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "not_found");
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Nests have `nix-cache-info` 0600 from before D14; nginx reads members
+    /// as its own user. A symbolic link is never handed over.
+    #[tokio::test]
+    async fn a_private_member_is_made_readable_and_a_link_is_refused() {
+        let root = temp_asset_root();
+        let store_hash = "2".repeat(32);
+        let member = root.join(format!("{store_hash}.narinfo"));
+        fs::write(&member, b"narinfo").unwrap();
+        fs::set_permissions(&member, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let path = format!("{store_hash}.narinfo");
+        let response = hand_binary_cache_member(&root, &path, &HeaderMap::new())
+            .await
+            .unwrap();
+        assert_eq!(response.extensions().get(), Some(&HandedBytes(7)));
+        assert_eq!(
+            fs::metadata(&member).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+
+        let linked = "3".repeat(32);
+        symlink(&member, root.join(format!("{linked}.narinfo"))).unwrap();
         let error =
-            serve_binary_cache_member_from_root(&root, "cache-priv-key.pem", &HeaderMap::new())
+            hand_binary_cache_member(&root, &format!("{linked}.narinfo"), &HeaderMap::new())
                 .await
                 .unwrap_err();
-        assert_eq!(error.code(), "not_found");
+        assert_eq!(error.code(), "unsafe_path");
 
         fs::remove_dir_all(&root).unwrap();
     }

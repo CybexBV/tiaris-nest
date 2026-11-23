@@ -1,15 +1,22 @@
 //! Whether computers depend on this Nest right now.
 //!
 //! A Nest installs a prepared update once it served no computer and ran no
-//! build for a quiet period (and in the night at the latest). The daemon
-//! serves every boot, netboot, install and cache request, so it alone can
-//! tell. Requests the Nest makes to itself, such as its readiness check, serve
-//! no computer and do not count. It publishes `/run/tiaris-nest/activity.json`;
-//! the root updater (`tiaris-nest-appliance-update-window`) reads it and decides.
+//! build for a quiet period (and in the night at the latest). Every boot,
+//! netboot, install and cache request passes the daemon, so it alone can
+//! tell. A cache or runtime file it hands to nginx (`assets::hand_file`)
+//! counts until the client's connection to nginx closes, as nginx sends the
+//! file after the daemon answered. Requests the Nest makes to itself, such as
+//! its readiness check, serve no computer and do not count. It publishes
+//! `/run/tiaris-nest/activity.json`; the root updater
+//! (`tiaris-nest-appliance-update-window`) reads it and decides.
 use std::{
-    net::SocketAddr,
+    collections::{BTreeSet, HashSet},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
-    sync::atomic::{AtomicI64, AtomicUsize, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -32,11 +39,18 @@ const SCHEMA: &str = "tiaris.nest.activity.v1";
 const REFRESH: Duration = Duration::from_secs(20);
 const MAX_BYTES: usize = 4 * 1024;
 
+/// nginx's port (`nixos-appliance/nginx.nix`).
+const NGINX_PORT: u16 = 80;
+
 /// What the HTTP routes are serving right now.
 pub struct Counter {
     in_flight: AtomicUsize,
     /// Unix seconds of the last moment a computer request was being served.
     last_served: AtomicI64,
+    /// Client connections nginx is sending a handed-over file on, while the
+    /// activity report follows them (only then are they ever let go).
+    handed: Mutex<BTreeSet<SocketAddr>>,
+    following: AtomicBool,
 }
 
 impl Counter {
@@ -44,12 +58,42 @@ impl Counter {
         Self {
             in_flight: AtomicUsize::new(0),
             last_served: AtomicI64::new(0),
+            handed: Mutex::new(BTreeSet::new()),
+            following: AtomicBool::new(false),
         }
     }
 
     fn touch(&self) {
         self.last_served
             .fetch_max(Utc::now().timestamp(), Ordering::SeqCst);
+    }
+
+    fn handed(&self) -> std::sync::MutexGuard<'_, BTreeSet<SocketAddr>> {
+        self.handed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn hand(&self, client: SocketAddr) {
+        if self.following.load(Ordering::SeqCst) {
+            self.handed().insert(client);
+        }
+    }
+
+    /// Whether nginx may still be sending a handed-over file: its client's
+    /// connection is open. A closed one ends its download now, never earlier
+    /// than it did; one kept alive counts until nginx closes it (75 s idle at
+    /// most). Without the list of open connections all of them still count.
+    fn sending(&self, open: Option<&HashSet<SocketAddr>>) -> bool {
+        let mut handed = self.handed();
+        if let Some(open) = open {
+            let before = handed.len();
+            handed.retain(|client| open.contains(client));
+            if handed.len() < before {
+                self.touch();
+            }
+        }
+        !handed.is_empty()
     }
 }
 
@@ -134,8 +178,22 @@ async fn track_with(counter: &'static Counter, request: Request, next: Next) -> 
     if !serves_a_computer(&request) {
         return next.run(request).await;
     }
+    let client = crate::routes::forwarded_connection(
+        request.headers(),
+        request
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|value| value.0),
+    );
     let served = Served::start(counter);
     let response = next.run(request).await;
+    if let Some(client) = client.filter(|_| {
+        response
+            .headers()
+            .contains_key(crate::assets::X_ACCEL_REDIRECT)
+    }) {
+        counter.hand(client);
+    }
     let (parts, body) = response.into_parts();
     Response::from_parts(
         parts,
@@ -171,9 +229,59 @@ fn timestamp(seconds: i64) -> String {
         .to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
+/// The client ends of established TCP connections to nginx, from
+/// `/proc/net/tcp` and `/proc/net/tcp6`.
+fn nginx_clients() -> std::io::Result<HashSet<SocketAddr>> {
+    let mut clients = HashSet::new();
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        match std::fs::read_to_string(table) {
+            Ok(text) => clients.extend(established_clients(&text, NGINX_PORT)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(clients)
+}
+
+/// Remote ends of the established connections to `local_port` in one
+/// `/proc/net/tcp*` table (addresses in hex, each 32-bit word in host order).
+fn established_clients(table: &str, local_port: u16) -> impl Iterator<Item = SocketAddr> + '_ {
+    const ESTABLISHED: &str = "01";
+    table.lines().skip(1).filter_map(move |line| {
+        let mut fields = line.split_whitespace().skip(1);
+        let local = proc_endpoint(fields.next()?)?;
+        let remote = proc_endpoint(fields.next()?)?;
+        (fields.next()? == ESTABLISHED && local.port() == local_port).then_some(remote)
+    })
+}
+
+fn proc_endpoint(value: &str) -> Option<SocketAddr> {
+    let (address, port) = value.split_once(':')?;
+    let word = |hex: &str| u32::from_str_radix(hex, 16).ok().map(u32::to_ne_bytes);
+    let ip = match address.len() {
+        8 => IpAddr::V4(Ipv4Addr::from(word(address)?)),
+        32 => {
+            let mut bytes = [0_u8; 16];
+            for (chunk, hex) in bytes.chunks_mut(4).zip(address.as_bytes().chunks(4 * 2)) {
+                chunk.copy_from_slice(&word(std::str::from_utf8(hex).ok()?)?);
+            }
+            IpAddr::V6(Ipv6Addr::from(bytes))
+        }
+        _ => return None,
+    };
+    Some(SocketAddr::new(
+        ip.to_canonical(),
+        u16::from_str_radix(port, 16).ok()?,
+    ))
+}
+
 async fn busy_reasons(state: &AppState, now: DateTime<Utc>) -> Vec<&'static str> {
     let mut busy = Vec::new();
-    if SERVED.in_flight.load(Ordering::SeqCst) > 0 {
+    let open = nginx_clients();
+    if let Err(error) = &open {
+        warn!(error = %error, "could not list nginx's connections; handed-over downloads still count");
+    }
+    if SERVED.in_flight.load(Ordering::SeqCst) > 0 || SERVED.sending(open.as_ref().ok()) {
         busy.push("serving_computers");
     }
     // Boot grants live ten minutes from a computer's start or install.
@@ -200,6 +308,14 @@ fn write(report: &Report) -> Result<()> {
 pub fn spawn(state: AppState) {
     if !crate::appliance::nixos::is_nixos() {
         return;
+    }
+    // nginx went on sending what the daemon handed over before it stopped:
+    // every computer connected to nginx now counts until it disconnects.
+    SERVED.following.store(true, Ordering::SeqCst);
+    if let Ok(open) = nginx_clients() {
+        SERVED
+            .handed()
+            .extend(open.into_iter().filter(|client| !client.ip().is_loopback()));
     }
     tokio::spawn(async move {
         // A daemon that just started has not seen the computers that were
@@ -289,6 +405,72 @@ mod tests {
         drop(response);
         assert!(COUNTER.last_served.load(Ordering::SeqCst) > 0);
         assert_eq!(COUNTER.in_flight.load(Ordering::SeqCst), 0);
+    }
+
+    /// nginx sends a handed-over file after the daemon answered: it counts
+    /// until the client's connection to nginx closes. The Nest's own requests
+    /// are never followed.
+    #[tokio::test]
+    async fn a_handed_over_download_counts_until_its_connection_closes() {
+        static COUNTER: Counter = Counter::new();
+        COUNTER.following.store(true, Ordering::SeqCst);
+        let app = Router::new()
+            .route(
+                "/cache/x",
+                get(|| async { ([("x-accel-redirect", "/_tiaris/cache/x")], "") }),
+            )
+            .layer(axum::middleware::from_fn(|request, next| {
+                track_with(&COUNTER, request, next)
+            }));
+        let request = |client: &str| {
+            let mut request = Request::get("/cache/x")
+                .header("x-forwarded-for", client)
+                .header("x-tiaris-client-port", "51000")
+                .body(Body::empty())
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 50200))));
+            request
+        };
+        drop(app.clone().oneshot(request("127.0.0.1")).await.unwrap());
+        drop(app.oneshot(request("192.0.2.55")).await.unwrap());
+        assert_eq!(COUNTER.in_flight.load(Ordering::SeqCst), 0);
+        let client: SocketAddr = "192.0.2.55:51000".parse().unwrap();
+        assert_eq!(*COUNTER.handed(), BTreeSet::from([client]));
+
+        assert!(COUNTER.sending(Some(&HashSet::from([client]))));
+        assert!(COUNTER.sending(None), "unknown connections still count");
+        COUNTER.last_served.store(0, Ordering::SeqCst);
+        assert!(!COUNTER.sending(Some(&HashSet::new())));
+        assert!(COUNTER.last_served.load(Ordering::SeqCst) > 0);
+    }
+
+    /// A listener, two clients of nginx (one of them on an IPv6 socket), a
+    /// closing connection and a connection to another port, as the x86 kernel
+    /// prints them.
+    #[test]
+    fn nginx_clients_are_the_established_remote_ends_on_its_port() {
+        let tcp = "  sl  local_address rem_address   st tx_queue rx_queue
+   0: 00000000:0050 00000000:0000 0A 00000000:00000000
+   1: 2A0200C0:0050 370200C0:C738 01 00000000:00000000
+   2: 2A0200C0:0050 390200C0:C73A 08 00000000:00000000
+   3: 0100007F:1F90 0100007F:C73B 01 00000000:00000000
+";
+        let tcp6 =
+            "  sl  local_address                         remote_address                        st
+   0: 0000000000000000FFFF00002A0200C0:0050 0000000000000000FFFF0000380200C0:C739 01
+";
+        let clients: HashSet<SocketAddr> = established_clients(tcp, NGINX_PORT)
+            .chain(established_clients(tcp6, NGINX_PORT))
+            .collect();
+        assert_eq!(
+            clients,
+            HashSet::from([
+                "192.0.2.55:51000".parse().unwrap(),
+                "192.0.2.56:51001".parse().unwrap(),
+            ])
+        );
     }
 
     /// The readiness check asks for `/boot.ipxe?tiaris_check=1` through nginx

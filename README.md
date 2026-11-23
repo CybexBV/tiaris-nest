@@ -590,6 +590,10 @@ computer that started the installer in the last ten minutes and no queued or
 running build. Health probes and the Nest's own requests do not count: nginx
 passes each client's address to the daemon, and a request from the Nest's own
 loopback address (its readiness check of the boot URL) serves no computer.
+nginx sends the cache and workstation runtime files itself, after the daemon
+checked the request and handed the file over (`X-Accel-Redirect`,
+`nixos-appliance/nginx.nix`); such a download counts until the computer's
+connection to nginx closes, which the daemon reads from `/proc/net/tcp`.
 The daemon writes this to `/run/tiaris-nest/activity.json`
 every 20 seconds (`src/activity.rs`). A missing or stale report counts as busy
 until the Nest has been up for 30 minutes: then the daemon serves nothing.
