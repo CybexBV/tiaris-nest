@@ -316,3 +316,32 @@ async fn members_are_fetched_a_few_at_a_time() {
     assert_eq!(at_most(AT_ONCE, tasks).await, (0..10).collect::<Vec<_>>());
     assert_eq!(most.load(Ordering::SeqCst), AT_ONCE);
 }
+
+/// An install leaves out only members whose whole closure it leaves out:
+/// a member the ISO carries whose reference must be fetched is fetched too,
+/// so every left out member can be copied over with its closure.
+#[test]
+fn an_install_leaves_out_only_members_whose_closure_it_holds() {
+    let mut fixture = Fixture::new();
+    let archive = raw_frame(&fixture.tar());
+    fixture.bind(&archive);
+    let manifest = fixture.verify(&archive).unwrap();
+    let (system, source) = (&manifest.store_paths[0], &manifest.store_paths[1]);
+    assert_eq!(system.references, vec![source.path.clone()]);
+    let carries = |paths: &[&closure::StorePath]| -> Present {
+        paths
+            .iter()
+            .map(|path| (path.path.clone(), path.nar_hash.clone()))
+            .collect()
+    };
+    let system_only = carries(&[system]);
+    // An update keeps what the running system holds.
+    assert_eq!(held(&manifest, &system_only, false), system_only);
+    assert!(held(&manifest, &system_only, true).is_empty());
+    let both = carries(&[system, source]);
+    assert_eq!(held(&manifest, &both, true), both);
+    // A member with another NAR hash is not held.
+    let mut changed = both.clone();
+    changed.insert(source.path.clone(), system.nar_hash.clone());
+    assert!(held(&manifest, &changed, true).is_empty());
+}

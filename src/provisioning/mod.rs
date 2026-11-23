@@ -626,7 +626,7 @@ async fn prepare_approved_plan(
 ) -> std::result::Result<
     (
         NestProvisioningInventory,
-        crate::appliance::closure::VerifiedArchive,
+        nixos_install::StagedClosure,
     ),
     PreDestructiveFailure,
 > {

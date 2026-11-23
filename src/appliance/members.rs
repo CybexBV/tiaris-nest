@@ -289,16 +289,27 @@ pub fn running_system() -> Result<Present> {
 }
 
 pub async fn running_system_async() -> Result<Present> {
+    store_paths_async(&["--recursive", "/run/current-system"]).await
+}
+
+/// Every valid path of this system's store with its NAR hash: on the setup
+/// ISO, what the ISO itself carries.
+pub async fn local_store_async() -> Result<Present> {
+    store_paths_async(&["--all"]).await
+}
+
+async fn store_paths_async(selection: &[&str]) -> Result<Present> {
     let mut command = crate::nix_command::tokio_command("nix");
     command
-        .args(["path-info", "--json", "--recursive", "/run/current-system"])
+        .args(["path-info", "--json"])
+        .args(selection)
         .env("LC_ALL", "C");
     let output = crate::subprocess::run_bounded_command(
         command,
         Duration::from_secs(600),
         64 * 1024 * 1024,
         64 * 1024,
-        "query the running system's store paths",
+        "query the local store paths",
     )
     .await?;
     present(&output.stdout)
@@ -412,6 +423,8 @@ pub struct Plan {
     prefix: Vec<u8>,
     metadata: Metadata,
     wanted: Vec<Wanted>,
+    /// The members it leaves out, each with its signed NAR hash.
+    present: Present,
     partial: PathBuf,
     /// The staged stream's size once complete.
     pub bytes: u64,
@@ -443,6 +456,12 @@ impl Plan {
         self.wanted.len()
     }
 
+    /// The members the plan leaves out: the store holds each with its signed
+    /// NAR hash.
+    pub fn present(&self) -> &Present {
+        &self.present
+    }
+
     fn info(&self, wanted: &Wanted) -> Result<&NarInfo> {
         self.metadata
             .infos
@@ -467,6 +486,33 @@ pub async fn plan(
     allow_private: bool,
     inbox: &Path,
     present: &Present,
+) -> Result<Option<Plan>> {
+    plan_from(release, key, url, allow_private, inbox, present, false).await
+}
+
+/// [`plan`] for an install into an empty store from `present`, another
+/// store ([`local_store_async`] on the setup ISO): it leaves out only the
+/// members whose every reference it leaves out too, so each left out member
+/// can be copied over with its whole closure.
+pub async fn plan_install(
+    release: &NixosRelease,
+    key: &VerifyingKey,
+    url: &str,
+    allow_private: bool,
+    inbox: &Path,
+    present: &Present,
+) -> Result<Option<Plan>> {
+    plan_from(release, key, url, allow_private, inbox, present, true).await
+}
+
+async fn plan_from(
+    release: &NixosRelease,
+    key: &VerifyingKey,
+    url: &str,
+    allow_private: bool,
+    inbox: &Path,
+    present: &Present,
+    closed: bool,
 ) -> Result<Option<Plan>> {
     let archive_bytes = release.system_closure.size_bytes;
     let Some(layout) = Layout::of(archive_bytes) else {
@@ -507,12 +553,13 @@ pub async fn plan(
     };
     prefix.truncate(end);
     let metadata = closure::read_metadata(&prefix, release, key)?;
+    let present = held(&metadata.manifest, present, closed);
     let mut offset = end as u64;
     let mut wanted = Vec::new();
     let mut bytes = offset + 1024;
     for (name, info) in &metadata.infos {
         let entry = 512 + info.file_size.div_ceil(512) * 512;
-        if present.get(&info.entry.path) != Some(&info.entry.nar_hash) {
+        if !present.contains_key(&info.entry.path) {
             wanted.push(Wanted {
                 name: name.clone(),
                 offset,
@@ -525,9 +572,11 @@ pub async fn plan(
         offset + 1024 <= layout.tar_bytes && layout.tar_bytes - offset - 1024 < 10240,
         "the closure's payloads do not fill its archive"
     );
-    // Most members new (a new NixOS): one request each would cost more than
-    // the few bytes it saves; one stream of the whole archive is cheaper.
-    if wanted.len() * 2 > metadata.infos.len() {
+    // Most members and most bytes new (a new NixOS): one request each would
+    // cost more than the few bytes it saves; one stream of the whole
+    // archive is cheaper. The setup ISO carries half the members, but 69 %
+    // of the bytes.
+    if wanted.len() * 2 > metadata.infos.len() && bytes * 2 > layout.tar_bytes {
         return Ok(None);
     }
     Ok(Some(Plan {
@@ -535,9 +584,43 @@ pub async fn plan(
         prefix,
         metadata,
         wanted,
+        present,
         partial: partial_path(inbox, release),
         bytes,
     }))
+}
+
+/// The closure's members `present` holds with their signed NAR hash; with
+/// `closed`, only those whose references (the manifest's verified graph) it
+/// keeps too.
+fn held(manifest: &closure::ClosureManifest, present: &Present, closed: bool) -> Present {
+    let mut held: Present = manifest
+        .store_paths
+        .iter()
+        .filter(|path| present.get(&path.path) == Some(&path.nar_hash))
+        .map(|path| (path.path.clone(), path.nar_hash.clone()))
+        .collect();
+    while closed {
+        let open: Vec<String> = manifest
+            .store_paths
+            .iter()
+            .filter(|path| {
+                held.contains_key(&path.path)
+                    && path
+                        .references
+                        .iter()
+                        .any(|reference| !held.contains_key(reference))
+            })
+            .map(|path| path.path.clone())
+            .collect();
+        if open.is_empty() {
+            break;
+        }
+        for path in open {
+            held.remove(&path);
+        }
+    }
+    held
 }
 
 /// Fetch what `plan` wants into its partial stream and complete it as

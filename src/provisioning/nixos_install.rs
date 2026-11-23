@@ -5,7 +5,7 @@ use super::{
     storage::{self, PreparedStorage},
 };
 use crate::appliance::{
-    ApplianceRepositorySnapshot, closure, nixos,
+    ApplianceRepositorySnapshot, closure, members, nixos,
     release_v3::{NixosRelease, SystemClosure},
     validate_qualification_package_transport_url,
 };
@@ -17,13 +17,39 @@ use std::{
         ffi::OsStrExt,
         fs::{MetadataExt, PermissionsExt},
     },
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
 };
 const GIB: u64 = 1024 * 1024 * 1024;
 const STAGING: &str = "/run/tiaris-appliance-closure";
 pub(super) const ARCHIVE: &str = "/run/tiaris-appliance-closure/closure.tar.zst";
+/// The members the ISO lacks (`members::stage`), and their verified cache.
+const STAGED_MEMBERS: &str = "/run/tiaris-appliance-closure/closure.members.tar";
+const MEMBERS_CACHE: &str = "/run/tiaris-appliance-closure/cache";
 pub(super) const TARGET: &str = "/mnt";
+
+/// The approved closure, verified before anything touches the disk.
+pub(super) enum StagedClosure {
+    /// The whole archive, extracted onto the disk at install.
+    Archive(closure::VerifiedArchive),
+    /// The members the ISO's own store lacks, verified and extracted into
+    /// RAM, and the members the ISO carries with their signed NAR hash
+    /// (`members::plan_install`: 571 of 1149, 1,186 of 1,727 MiB for
+    /// 0.2.182-dev.1), copied from it with their closures.
+    Members {
+        manifest: closure::ClosureManifest,
+        iso: closure::Present,
+    },
+}
+
+/// What the ISO fetched while the administrator reviewed the setup
+/// (`closure_prefetch`).
+pub(super) enum Prefetched {
+    /// The whole archive, hashed while it downloaded.
+    Archive(closure::AuthenticatedArchive),
+    /// The members the ISO lacks, staged ([`stage_members`]).
+    Members(members::Plan),
+}
 
 fn release(plan: &SignedInstallPlan) -> Result<&NixosRelease> {
     let release = plan
@@ -56,16 +82,17 @@ pub(super) fn validate_closure_transport(transport: &str, artifact: &SystemClosu
 }
 
 /// Download (or find) the signed closure in RAM and verify it: its one
-/// verification pass, before anything touches the disk. The verified
-/// archive stays open for [`install`] to extract onto the disk. `prefetched`
-/// is this release's archive, downloaded and hashed while the administrator
-/// reviewed the setup (`closure_prefetch`).
+/// verification pass, before anything touches the disk. Only the members the
+/// ISO's own store lacks when the archive allows it ([`stage_members`]),
+/// else the whole archive, which stays open for [`install`] to extract onto
+/// the disk. `prefetched` is what the ISO fetched for this release while
+/// the administrator reviewed the setup (`closure_prefetch`).
 pub(super) async fn stage_closure(
     plan: &SignedInstallPlan,
     key_path: &Path,
     status: &SetupStatusReporter,
-    prefetched: Option<closure::AuthenticatedArchive>,
-) -> Result<closure::VerifiedArchive> {
+    prefetched: Option<Prefetched>,
+) -> Result<StagedClosure> {
     let release = release(plan)?;
     let key = release.verify_file(key_path)?;
     let transport = plan
@@ -74,13 +101,21 @@ pub(super) async fn stage_closure(
         .ok_or_else(|| anyhow!("plan missing transport"))?;
     validate_closure_transport(transport, &release.system_closure)?;
     let available = ram_staging()?;
-    if let Some(prefetched) = prefetched {
-        ensure!(
-            prefetched.sha256() == release.system_closure.sha256,
-            "prefetched closure is not the approved release"
-        );
-        status.step(InstallStep::VerifyRelease);
-        return closure::verify_archive(prefetched, release, &key, None, |_, _| Ok(()));
+    match prefetched {
+        Some(Prefetched::Archive(prefetched)) => {
+            ensure!(
+                prefetched.sha256() == release.system_closure.sha256,
+                "prefetched closure is not the approved release"
+            );
+            status.step(InstallStep::VerifyRelease);
+            return closure::verify_archive(prefetched, release, &key, None, |_, _| Ok(()))
+                .map(StagedClosure::Archive);
+        }
+        Some(Prefetched::Members(members)) => {
+            status.step(InstallStep::VerifyRelease);
+            return verify_members(release, &key, &members);
+        }
+        None => {}
     }
     let archive = Path::new(ARCHIVE);
     // A previous run's archive is not a trust receipt. Hash and verify the
@@ -93,11 +128,15 @@ pub(super) async fn stage_closure(
                 closure::verify_archive(found, release, &key, None, |_, _| Ok(()))
             });
             if let Ok(verified) = found {
-                return Ok(verified);
+                return Ok(StagedClosure::Archive(verified));
             }
         }
         status.step(InstallStep::StageRelease);
         fs::remove_file(archive)?;
+    }
+    if let Some(members) = stage_members(release, &key, transport, available).await? {
+        status.step(InstallStep::VerifyRelease);
+        return verify_members(release, &key, &members);
     }
     ensure_ram_budget(release, available)?;
     let downloaded = nixos::download_with_progress(
@@ -110,6 +149,121 @@ pub(super) async fn stage_closure(
     .await?;
     status.step(InstallStep::VerifyRelease);
     closure::verify_archive(downloaded, release, &key, None, |_, _| Ok(()))
+        .map(StagedClosure::Archive)
+}
+
+/// Fetch into RAM only the members the ISO's own store lacks, when the
+/// archive is stored in raw blocks and the server answers ranges. `None`
+/// takes the whole archive; a download that keeps dropping is an error
+/// (the next try continues it).
+pub(super) async fn stage_members(
+    release: &NixosRelease,
+    key: &ed25519_dalek::VerifyingKey,
+    transport: &str,
+    available: u64,
+) -> Result<Option<members::Plan>> {
+    let whole = |error: anyhow::Error| {
+        if error.is::<members::KeepTrying>() {
+            return Err(error);
+        }
+        tracing::warn!(error = %format!("{error:#}"), "setup takes the whole closure archive");
+        // Its RAM goes to the archive.
+        let _ = fs::remove_file(members::partial_path(Path::new(STAGING), release));
+        Ok(None)
+    };
+    let present = match members::local_store_async().await {
+        Ok(present) => present,
+        Err(error) => return whole(error),
+    };
+    let allow_private = transport != release.system_closure.url;
+    let plan = match members::plan_install(
+        release,
+        key,
+        transport,
+        allow_private,
+        Path::new(STAGING),
+        &present,
+    )
+    .await
+    {
+        Ok(Some(plan)) => plan,
+        Ok(None) => return Ok(None),
+        Err(error) => return whole(error),
+    };
+    // The staged members and their extracted cache, beside a bounded runtime.
+    let staged = plan.bytes - plan.remaining_bytes();
+    ensure!(
+        available.saturating_add(staged) >= plan.bytes.saturating_mul(2).saturating_add(2 * GIB),
+        "insufficient available memory for the closure members plus bounded runtime"
+    );
+    tracing::info!(
+        members = plan.members(),
+        bytes = plan.bytes,
+        reused = plan.present().len(),
+        "setup fetches only the closure members this ISO does not carry"
+    );
+    match members::stage(&plan, Path::new(STAGED_MEMBERS)).await {
+        Ok(()) => Ok(Some(plan)),
+        Err(error) => whole(error),
+    }
+}
+
+/// The staged members' one verification pass, extracting their binary cache
+/// into RAM; the members it leaves out are the ISO's, each with its signed
+/// NAR hash. The staged stream goes either way.
+fn verify_members(
+    release: &NixosRelease,
+    key: &ed25519_dalek::VerifyingKey,
+    members: &members::Plan,
+) -> Result<StagedClosure> {
+    let cache = Path::new(MEMBERS_CACHE);
+    if fs::symlink_metadata(cache).is_ok() {
+        fs::remove_dir_all(cache)?;
+    }
+    let verified = members::open_staged(Path::new(STAGED_MEMBERS), release).and_then(
+        |(stream, limit)| {
+            closure::verify_staged(
+                stream,
+                limit,
+                release,
+                key,
+                cache,
+                members.present(),
+                |_, _, _| Ok(()),
+            )
+        },
+    );
+    let _ = fs::remove_file(STAGED_MEMBERS);
+    Ok(StagedClosure::Members {
+        manifest: verified?.manifest,
+        iso: members.present().clone(),
+    })
+}
+
+/// Copy the ISO's own members of the closure, with their closures (all
+/// left out too: `members::plan_install`), into the target store. Each
+/// member's NARInfo signature was checked with the metadata and its signed
+/// NAR hash matched the one the ISO's store records; Nix hashes every NAR as
+/// it copies it and refuses one that differs from that record. The ISO's
+/// store carries no release signature, so Nix is not asked for one here.
+async fn copy_iso_members(iso: &closure::Present) -> Result<()> {
+    if iso.is_empty() {
+        return Ok(());
+    }
+    let target = format!("local?root={TARGET}");
+    let mut arguments = vec![
+        "--extra-experimental-features",
+        "nix-command",
+        "--option",
+        "substituters",
+        "",
+        "copy",
+        "--no-check-sigs",
+        "--to",
+        &target,
+    ];
+    arguments.extend(iso.keys().map(String::as_str));
+    storage::run_checked("nix", &arguments).await
 }
 
 /// Make the RAM staging directory safe and return the memory available now.
@@ -325,12 +479,12 @@ async fn mount(source: &Path, target: &Path, options: &str) -> Result<()> {
     );
     Ok(())
 }
-/// Install the archive [`stage_closure`] verified onto the prepared disk.
+/// Install the closure [`stage_closure`] verified onto the prepared disk.
 pub(super) async fn install(
     prepared: &PreparedStorage,
     key_path: &Path,
     status: &SetupStatusReporter,
-    staged: &mut closure::VerifiedArchive,
+    staged: &mut StagedClosure,
 ) -> Result<()> {
     let mut state = storage::load_durable_state(&prepared.state_mount)?;
     ensure!(state.identity_active, "permanent identity not yet active");
@@ -348,28 +502,38 @@ pub(super) async fn install(
     mount(&prepared.state_mount, &target_state, "bind,nodev,nosuid").await?;
     let target_nix = target.join("var/cache/tiaris-nest/nix");
     mount(&target_nix, &target.join("nix"), "bind,nodev,nosuid,exec").await?;
-    nixos::ensure_space(
-        target,
-        staged
-            .manifest
-            .total_nar_bytes
-            .checked_add(staged.cache_bytes)
-            .ok_or_else(|| anyhow!("install space overflow"))?,
-    )?;
-    let cache = target.join(format!("var/cache/tiaris-nest/.install-{}", state.plan.id));
-    if cache.exists() {
-        let old = fs::symlink_metadata(&cache)?;
-        ensure!(
-            old.is_dir() && old.uid() == 0,
-            "unsafe interrupted installation cache"
-        );
-        fs::remove_dir_all(&cache)?;
-    }
-    staged.extract(&release, &key, &cache)?;
     let trust = format!(
         "tiaris-nest-appliance-1:{}",
         super::protocol::standard_base64(key.as_bytes())
     );
+    let cache = match staged {
+        StagedClosure::Archive(staged) => {
+            nixos::ensure_space(
+                target,
+                staged
+                    .manifest
+                    .total_nar_bytes
+                    .checked_add(staged.cache_bytes)
+                    .ok_or_else(|| anyhow!("install space overflow"))?,
+            )?;
+            let cache = target.join(format!("var/cache/tiaris-nest/.install-{}", state.plan.id));
+            if cache.exists() {
+                let old = fs::symlink_metadata(&cache)?;
+                ensure!(
+                    old.is_dir() && old.uid() == 0,
+                    "unsafe interrupted installation cache"
+                );
+                fs::remove_dir_all(&cache)?;
+            }
+            staged.extract(&release, &key, &cache)?;
+            cache
+        }
+        StagedClosure::Members { manifest, iso } => {
+            nixos::ensure_space(target, manifest.total_nar_bytes)?;
+            copy_iso_members(iso).await?;
+            PathBuf::from(MEMBERS_CACHE)
+        }
+    };
     storage::run_checked(
         "nix",
         &[
