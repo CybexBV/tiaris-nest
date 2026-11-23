@@ -515,6 +515,21 @@ impl ClaimContext<'_> {
     async fn wait(&self, ticks: u32) {
         tokio::time::sleep(self.tick * ticks).await;
     }
+
+    /// The wait before a failed request is tried again. The ISO starts
+    /// before network time: a request that failed on a clock network time
+    /// had not set yet is tried again as soon as it has.
+    async fn wait_to_retry(&self, ticks: u32) {
+        if !crate::site_check::clock_not_synchronized() {
+            return self.wait(ticks).await;
+        }
+        for _ in 0..ticks {
+            self.wait(1).await;
+            if !crate::site_check::clock_not_synchronized() {
+                return;
+            }
+        }
+    }
 }
 
 /// Register (or continue this boot's registration) and poll until claimed.
@@ -626,7 +641,12 @@ pub(super) async fn claim(context: &ClaimContext<'_>) -> Result<Claimed> {
                     context.show(ClaimState::Connecting, url.as_deref());
                 }
                 registration = Some(current);
-                context.wait(retry_ticks(failures, rate_limited)).await;
+                let ticks = retry_ticks(failures, rate_limited);
+                if rate_limited {
+                    context.wait(ticks).await;
+                } else {
+                    context.wait_to_retry(ticks).await;
+                }
             }
         }
     }

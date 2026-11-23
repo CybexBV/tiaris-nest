@@ -53,12 +53,9 @@ in {
   systemd.network.enable = true;
   systemd.network.networks."20-tiaris-installer" = { matchConfig.Name = "en* eth*"; networkConfig = { DHCP = "ipv4"; IPv6AcceptRA = false; }; };
   services.resolved.enable = true;
+  # The bootstrap does not wait for network time: until timesyncd sets the
+  # clock, Tiaris's verified HTTPS answers do (src/provisioning/clock.rs).
   services.timesyncd.enable = true;
-  # timesyncd does not include its optional wait unit in this nixpkgs pin.
-  # Give NTP a bounded opportunity before HTTPS; an offline clock must not
-  # prevent the setup screen or bootstrap retry loop from starting forever.
-  systemd.additionalUpstreamSystemUnits = [ "systemd-time-wait-sync.service" ];
-  systemd.services.systemd-time-wait-sync.serviceConfig.TimeoutStartSec = "60s";
   services.openssh.enable = lib.mkForce false;
   services.getty.autologinUser = lib.mkForce null;
   # The installer profile gives root and "nixos" empty passwords and the
@@ -74,7 +71,7 @@ in {
   environment.systemPackages = [ a.package pkgs.nix pkgs.nixos-install-tools pkgs.iputils pkgs.iproute2 pkgs.gptfdisk pkgs.e2fsprogs pkgs.dosfstools pkgs.util-linux pkgs.curl pkgs.jq pkgs.zstd pkgs.python3 ];
   nix.settings = { experimental-features = [ "nix-command" ]; substituters = lib.mkForce []; trusted-public-keys = lib.mkForce [ "tiaris-nest-appliance-1:${a.releasePublicKey}" ]; };
   systemd.services.tiaris-nest-bootstrap = {
-    wantedBy = [ "multi-user.target" ]; after = [ "network-online.target" "systemd-time-wait-sync.service" ]; wants = [ "network-online.target" "systemd-time-wait-sync.service" ];
+    wantedBy = [ "multi-user.target" ]; after = [ "network-online.target" ]; wants = [ "network-online.target" ];
     path = config.environment.systemPackages;
     preStart = ''
       mkdir -p /cdrom
