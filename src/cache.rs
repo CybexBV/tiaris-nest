@@ -3490,6 +3490,41 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// A root checked when due is not due again within the hour: a member
+    /// another root's check hashed 23.5 hours ago is hashed again with it.
+    #[test]
+    fn a_checked_closure_is_not_due_again_within_the_hour() {
+        let root = test_temp_dir("closure-manifest-hash-lookahead");
+        let root_store = test_store_path('d', "root");
+        let shared = test_store_path('c', "shared");
+        let (_, shared_nar) = write_manifest_cache_member(&root, &shared, b"shared-nar", &[]);
+        write_manifest_cache_member(
+            &root,
+            &root_store,
+            b"root-nar",
+            std::slice::from_ref(&shared),
+        );
+        let hashes = MemberHashes::new(member_hashes::MAX_AGE, Duration::ZERO);
+        let checked_at = SystemTime::now();
+        hashes.remember_at(
+            &fs::metadata(&shared_nar).unwrap(),
+            Sha256::digest(fs::read(&shared_nar).unwrap()).into(),
+            checked_at - Duration::from_secs(23 * 60 * 60 + 30 * 60),
+        );
+        let manifest = build_closure_manifest_with(
+            &root,
+            &root_store,
+            None,
+            &test_public_key(),
+            &mut Vec::new(),
+            &hashes,
+        )
+        .unwrap();
+        let due = manifest.oldest_member_hash + member_hashes::SCRUB_EVERY;
+        assert!(due >= checked_at + Duration::from_secs(60 * 60));
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn closure_manifest_uses_null_for_unknown_derivation() {
         let root = test_temp_dir("closure-manifest-no-deriver");
