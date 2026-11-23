@@ -152,8 +152,8 @@ import (nixpkgs + "/nixos/tests/make-test-python.nix") ({ pkgs, ... }: {
             appliance.succeed(f"jq -e '.secret_ids == [\"20261123-00000002\"]' {status}")
         with subtest("re-render after DHCP assigns a new address"):
             appliance.succeed("systemctl stop tiaris-nest-network-runtime.timer")
-            peer.succeed("systemd-run --unit=turn-test-dhcp $(command -v dnsmasq) --no-daemon --port=0 --interface=eth1 --bind-interfaces --dhcp-range=100.64.50.11,100.64.50.11,255.255.255.0,5m --dhcp-option=option:router --dhcp-option=option:dns-server")
-            peer.wait_for_unit("turn-test-dhcp.service")
+            peer.succeed("systemd-run --unit=turn-test-dhcp $(command -v dnsmasq) --no-daemon --port=0 --interface=eth1 --bind-interfaces --dhcp-authoritative --log-dhcp --dhcp-leasefile=/run/turn-test-dhcp.leases --dhcp-range=100.64.50.11,100.64.50.11,255.255.255.0,5m --dhcp-option=option:router --dhcp-option=option:dns-server")
+            peer.wait_until_succeeds("ss -H -4lunp 'sport = :67' | grep -F dnsmasq", timeout=10)
             appliance.succeed("install -d /run/systemd/network/40-eth1.network.d; printf '[Network]\nDHCP=ipv4\n' > /run/systemd/network/40-eth1.network.d/turn-dhcp.conf; networkctl reload; networkctl reconfigure eth1")
             appliance.wait_until_succeeds("ip -4 addr show dev eth1 dynamic | grep -F '100.64.50.11/24'", timeout=30)
             appliance.succeed("systemctl start tiaris-nest-network-runtime.service")
