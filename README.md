@@ -37,7 +37,10 @@ install plan also binds the canonical organization UUID and slug; both are
 validated and written to the installed managed configuration so Nest can
 issue organization-scoped workstation boot grants immediately. There is no
 Proxmox/LXC path. Use x86-64 UEFI with Secure Boot turned off, four cores, at
-least 16 GiB RAM and a 160 GiB fixed disk.
+least 16 GiB RAM, a 160 GiB fixed disk and wired Ethernet at 1 Gbit/s or
+faster. Every computer fetches its system from the Nest, so a school that
+installs whole classrooms at once should give the Nest and its switch port
+2.5 Gbit/s (2.5GbE).
 
 **Generic ISO with a claim code.** The release's ISO template as built (its
 8192-byte slot `/TIARIS_PROVISIONING.BIN` all zeros) is a generic Nest ISO
