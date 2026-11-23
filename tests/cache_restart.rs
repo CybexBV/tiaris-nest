@@ -34,10 +34,12 @@ async fn cache_http_totals_and_report_epoch_survive_two_database_reopens() {
     let app = routes::router(state.clone());
     for (path, range, status) in [
         (format!("/cache/{member}"), None, StatusCode::OK),
+        // The daemon hands the file to nginx, which applies the range (206);
+        // the egress totals count the range's bytes.
         (
             format!("/cache/{member}"),
             Some("bytes=100-299"),
-            StatusCode::PARTIAL_CONTENT,
+            StatusCode::OK,
         ),
         (
             format!("/cache/{}.narinfo", "b".repeat(32)),
