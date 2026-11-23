@@ -12,10 +12,10 @@ use crate::appliance::{
 use anyhow::{Result, anyhow, ensure};
 use serde_json::json;
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     os::unix::{
         ffi::OsStrExt,
-        fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+        fs::{MetadataExt, PermissionsExt},
     },
     path::Path,
     process::Command,
@@ -55,11 +55,14 @@ fn validate_closure_transport(transport: &str, artifact: &SystemClosure) -> Resu
     )
 }
 
+/// Download (or find) the signed closure in RAM and verify it: its one
+/// verification pass, before anything touches the disk. The verified
+/// archive stays open for [`install`] to extract onto the disk.
 pub(super) async fn stage_closure(
     plan: &SignedInstallPlan,
     key_path: &Path,
     status: &SetupStatusReporter,
-) -> Result<()> {
+) -> Result<closure::VerifiedArchive> {
     let release = release(plan)?;
     let key = release.verify_file(key_path)?;
     let transport = plan
@@ -89,22 +92,26 @@ pub(super) async fn stage_closure(
         .and_then(|v| v.checked_mul(1024))
         .ok_or_else(|| anyhow!("MemAvailable unavailable"))?;
     let archive = Path::new(ARCHIVE);
-    // A previous interrupted download is not a trust receipt. Re-verify the same
-    // open file's entire contents before reusing it, while charging resident RAM.
-    if let Ok(mut file) = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(archive)
-    {
+    // A previous run's archive is not a trust receipt. Hash and verify the
+    // same open file's entire contents before reusing it, while charging
+    // resident RAM.
+    if fs::symlink_metadata(archive).is_ok() {
         status.step(InstallStep::VerifyRelease);
-        if available >= 2 * GIB && closure::verify_archive(&mut file, release, &key, None).is_ok() {
-            return Ok(());
+        if available >= 2 * GIB {
+            let found = closure::AuthenticatedArchive::open(archive, release).and_then(|found| {
+                closure::verify_archive(found, release, &key, None, |_, _| Ok(()))
+            });
+            if let Ok(verified) = found {
+                return Ok(verified);
+            }
         }
         status.step(InstallStep::StageRelease);
         fs::remove_file(archive)?;
     }
+    // What a dropped download of this archive left in RAM counts as its own.
+    let partial = nixos::partial_bytes(archive, release);
     ensure!(
-        available
+        available.saturating_add(partial)
             >= release
                 .system_closure
                 .size_bytes
@@ -114,10 +121,10 @@ pub(super) async fn stage_closure(
     );
     ensure!(
         crate::disk::stats(Path::new(STAGING))?.available_bytes
-            >= release.system_closure.size_bytes,
+            >= release.system_closure.size_bytes - partial,
         "insufficient tmpfs capacity"
     );
-    nixos::download_with_progress(
+    let downloaded = nixos::download_with_progress(
         release,
         transport,
         archive,
@@ -126,12 +133,7 @@ pub(super) async fn stage_closure(
     )
     .await?;
     status.step(InstallStep::VerifyRelease);
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(archive)?;
-    closure::verify_archive(&mut file, release, &key, None)?;
-    Ok(())
+    closure::verify_archive(downloaded, release, &key, None, |_, _| Ok(()))
 }
 
 pub(super) fn calculate_layout(sector: u64, total: u64) -> Result<([u64; 5], [u64; 5])> {
@@ -296,10 +298,12 @@ async fn mount(source: &Path, target: &Path, options: &str) -> Result<()> {
     );
     Ok(())
 }
+/// Install the archive [`stage_closure`] verified onto the prepared disk.
 pub(super) async fn install(
     prepared: &PreparedStorage,
     key_path: &Path,
     status: &SetupStatusReporter,
+    staged: &mut closure::VerifiedArchive,
 ) -> Result<()> {
     let mut state = storage::load_durable_state(&prepared.state_mount)?;
     ensure!(state.identity_active, "permanent identity not yet active");
@@ -317,16 +321,12 @@ pub(super) async fn install(
     mount(&prepared.state_mount, &target_state, "bind,nodev,nosuid").await?;
     let target_nix = target.join("var/cache/tiaris-nest/nix");
     mount(&target_nix, &target.join("nix"), "bind,nodev,nosuid,exec").await?;
-    let mut archive = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(ARCHIVE)?;
-    let manifest = closure::verify_archive(&mut archive, &release, &key, None)?;
     nixos::ensure_space(
         target,
-        manifest
+        staged
+            .manifest
             .total_nar_bytes
-            .checked_add(closure::MAX_EXPANDED)
+            .checked_add(staged.cache_bytes)
             .ok_or_else(|| anyhow!("install space overflow"))?,
     )?;
     let cache = target.join(format!("var/cache/tiaris-nest/.install-{}", state.plan.id));
@@ -338,7 +338,7 @@ pub(super) async fn install(
         );
         fs::remove_dir_all(&cache)?;
     }
-    closure::verify_archive(&mut archive, &release, &key, Some(&cache))?;
+    staged.extract(&release, &key, &cache)?;
     let trust = format!(
         "tiaris-nest-appliance-1:{}",
         super::protocol::standard_base64(key.as_bytes())

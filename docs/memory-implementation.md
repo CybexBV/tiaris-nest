@@ -4,9 +4,12 @@ The host RSS of an Incus QEMU process includes resident guest pages and is not
 Nest's heap. The 2026-09-30 investigation found unbounded log framing and NARInfo
 response collection, not a demonstrated persistent idle heap leak.
 
-The implementation keeps the two build workers and four cores per build. New
-admission uses available RAM, parent cgroup limits, outstanding reservations and
-memory PSI. A waiting worker leaves its job queued. Default reservations are
+Builds use four cores each. The number of build workers follows the host
+(`max_concurrent_builds = 0`, the default): one per two CPUs and per 4 GiB
+reservation above the 2 GiB serving reserve, at least two (the earlier fixed
+number) and at most eight; a positive value sets it. Admission still uses
+available RAM, parent cgroup limits, outstanding reservations and memory PSI
+for every build. A waiting worker leaves its job queued. Default reservations are
 4 GiB per build plus 2 GiB for serving; they are admission estimates, not kernel
 limits. `max_nix_jobs = 0` explicitly selects NixOS's `auto` concurrency. Positive
 values cap Nix jobs independently of cores. Existing installer RAM and signed

@@ -470,11 +470,12 @@ def make_download_room():
 def verified_cache():
     """The private cache the root verifier extracts from the staged update.
     Short of disk space the verifier changes nothing and says how many bytes
-    must be free (exit 75). Make room and ask again: once for what is known
-    before the archive is read, once for the store paths it turns out to
-    miss. The store's garbage goes once: nothing becomes garbage between the
-    two. Told that space was freed, the verifier ends the attempt itself,
-    with the reason `insufficient_store_space`."""
+    must be free (exit 75). Make room and ask again: once for its private
+    copy of the archive, once for what the archive's manifest says the
+    update needs (its extracted cache and the store paths it misses). The
+    store's garbage goes once: nothing becomes garbage between the two. Told
+    that space was freed, the verifier ends the attempt itself, with the
+    reason `insufficient_store_space`."""
     collect = True
     for space_freed in (False, False, True):
         command = [*VERIFY, '--space-freed'] if space_freed else list(VERIFY)
@@ -514,8 +515,10 @@ def waiting_for():
 
 def prepared_update():
     """The prepared receipt of the exact current request on the exact running
-    system, with its imported closure still rooted; else None. Activation
-    checks the imported closure against the signed release again."""
+    system, with its imported closure still rooted; else None. `prepare`
+    checked that closure against the signed release after rooting it, and
+    the root keeps every member as it was checked: activation does not
+    check it again."""
     try:
         body = read(REQUEST, owner=UID, maximum=256 * 1024)
         attempt = safe_attempt(json.loads(body)['attempt_id'])
@@ -620,17 +623,15 @@ def report_contact_wait(prepared):
 
 
 def activate(prepared):
-    """The short part: recheck the rooted closure, then arm the candidate as
-    a one-shot boot and restart into it. The source stays the default. The
-    Nest must still reach Tiaris before anything changes and again before
-    the restart (`stage` looked first)."""
+    """The short part: arm the prepared candidate as a one-shot boot and
+    restart into it. The source stays the default. The Nest must still
+    reach Tiaris before anything changes and again before the restart
+    (`stage` looked first)."""
     attempt = safe_attempt(prepared['attempt_id'])
-    cache = Path(prepared['cache_path'])
     receipt = {key: value for key, value in prepared.items() if key not in ('retire_generations', 'prepared_at')}
     receipt['schema'] = 'tiaris.nest.verified-appliance-update.v3'
     try:
         emit_status(receipt, 'preparing', 'activating')
-        verify_store_closure(cache, receipt['system_toplevel'])
         boot_space()
         if not contact_fresh():
             # Nothing is changed yet: without Tiaris the candidate could not

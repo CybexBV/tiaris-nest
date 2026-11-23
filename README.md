@@ -37,7 +37,10 @@ install plan also binds the canonical organization UUID and slug; both are
 validated and written to the installed managed configuration so Nest can
 issue organization-scoped workstation boot grants immediately. There is no
 Proxmox/LXC path. Use x86-64 UEFI with Secure Boot turned off, four cores, at
-least 16 GiB RAM and a 160 GiB fixed disk.
+least 16 GiB RAM, a 160 GiB fixed disk and wired Ethernet at 1 Gbit/s or
+faster. Every computer fetches its system from the Nest, so a school that
+installs whole classrooms at once should give the Nest and its switch port
+2.5 Gbit/s (2.5GbE).
 
 **Generic ISO with a claim code.** The release's ISO template as built (its
 8192-byte slot `/TIARIS_PROVISIONING.BIN` all zeros) is a generic Nest ISO
@@ -213,6 +216,11 @@ every workstation in the same hardware cohort. Nest also still advertises
 retained jobs from before the upgrade remain retryable; current Tiaris issues
 only v3 and refuses to prepare installations on a Nest without it
 (`nest_installer_closure_unsupported`). Deploy Nest before Tiaris.
+
+Nest keeps the active, previous and desired workstation runtime bundles,
+those a boot session of the last day names, and of the others only the newest,
+for at most seven days; hourly maintenance removes the rest (each tree is
+about 1.4 GB).
 
 Runtime integrity maintenance rechecks retained bundles every 12 hours and
 renews the active runtime's reported verification time only after a successful
@@ -493,7 +501,9 @@ signing step. The private deploy key is available only inside that protected env
 ### Managed appliance updates
 
 The Nest prepares an update as soon as it arrives, while the running release
-keeps serving: root independently verifies the bounded archive and the live
+keeps serving. A dropped download continues where it stopped (HTTP Range), also
+on a later try of the same release; only bytes of the signed size and hash are
+kept. Root independently verifies the bounded archive and the live
 SQLite migration inventory, imports and roots its closure, checks it against the
 release and rehearses the database (status `waiting_window`, stage
 `preparing_ahead`). An update that does not fit on the disk first makes room
@@ -508,9 +518,10 @@ report Tiaris accepted in this boot, at most 90 seconds ago): stage
 `no_manage_contact`. The candidate must reach Tiaris to stay, so a Nest that is
 cut off would switch, go back and download the release again; it keeps what it
 prepared instead and switches when the link is back. At the switch
-root checks the closure again and looks whether the Nest still reaches Tiaris
-before anything changes, arms the next generation, looks once more (if not,
-it undoes the arming), seals the generation and selects it for one boot. An
+root looks whether the Nest still reaches Tiaris before anything changes (the
+closure it checked while preparing stays rooted, so it is not checked again),
+arms the next generation, looks once more (if not, it undoes the arming),
+seals the generation and selects it for one boot. An
 update that waits for Tiaris after it started keeps the status `preparing`
 (reports only move forward) with the stage `no_manage_contact`, and asks the
 policy again when the link is back: only a switch that a restart interrupted

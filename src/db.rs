@@ -2205,13 +2205,19 @@ pub async fn cache_artifacts_due_for_verification(
     cache_artifact_rows_to_models(rows)
 }
 
-pub async fn mark_cache_artifact_verified(pool: &SqlitePool, id: i64) -> AppResult<()> {
+/// Record that every member of the artifact's closure was hashed at or after
+/// `verified_at` (RFC 3339) and matched.
+pub async fn mark_cache_artifact_verified(
+    pool: &SqlitePool,
+    id: i64,
+    verified_at: &str,
+) -> AppResult<()> {
     sqlx::query(
         "UPDATE nest_cache_artifacts
          SET verification_status = 'ready', last_verified_at = ?, updated_at = updated_at
          WHERE id = ?",
     )
-    .bind(now_rfc3339())
+    .bind(verified_at)
     .bind(id)
     .execute(pool)
     .await?;
@@ -5384,7 +5390,7 @@ mod tests {
                 .len(),
             1
         );
-        mark_cache_artifact_verified(&pool, artifact.id)
+        mark_cache_artifact_verified(&pool, artifact.id, &now_rfc3339())
             .await
             .unwrap();
         assert!(

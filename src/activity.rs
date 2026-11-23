@@ -54,6 +54,19 @@ impl Counter {
 }
 
 static SERVED: Counter = Counter::new();
+/// Unix seconds since when nothing kept the Nest busy, as last published;
+/// 0 while something does or before the first report.
+static IDLE_SINCE: AtomicI64 = AtomicI64::new(0);
+
+/// How long nothing has kept the Nest busy, as of its last activity report
+/// (at most `REFRESH` old). `None` while busy, and always on a Nest that does
+/// not track its activity (not the NixOS appliance).
+pub fn quiet_for(now: DateTime<Utc>) -> Option<chrono::Duration> {
+    match IDLE_SINCE.load(Ordering::SeqCst) {
+        0 => None,
+        since => Some(chrono::Duration::seconds((now.timestamp() - since).max(0))),
+    }
+}
 
 /// Counts one request from its first byte until its body is finished or
 /// dropped, so a long SquashFS or cache download keeps the Nest busy.
@@ -202,6 +215,7 @@ pub fn spawn(state: AppState) {
                 now.timestamp(),
                 SERVED.last_served.load(Ordering::SeqCst),
             );
+            IDLE_SINCE.store(idle_since.unwrap_or(0), Ordering::SeqCst);
             let report = Report {
                 schema: SCHEMA,
                 written_at: timestamp(now.timestamp()),

@@ -1,3 +1,4 @@
+mod member_hashes;
 pub mod seeds;
 
 use std::{
@@ -11,7 +12,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Command, Output},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -27,6 +28,7 @@ use crate::{
     cache_egress::CacheEgressSnapshot, config::AppConfig, db, models::BuildJob, protected_material,
     redact::redact_sensitive_key_values,
 };
+use member_hashes::MemberHashes;
 
 const CACHE_MUTATION_LOCK_FILENAME: &str = ".tiaris-cache-mutation.lock";
 const CLOSURE_MANIFEST_SCHEMA: &str = "tiaris.nest.closure-manifest.v1";
@@ -162,10 +164,23 @@ pub struct CachedNixArtifact {
     pub compression: String,
     pub references: Vec<String>,
     pub metadata: Value,
+    pub timings: ExportTimings,
     // Exported files are not reachable from the SQLite inventory until
     // `record_cached_artifact` finishes. Carry the lease in the returned value
     // so no deletion/sweep can enter during that publication gap.
     _mutation_lock: CacheMutationLock,
+}
+
+/// How long putting a closure into the cache took.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ExportTimings {
+    /// `nix copy` into the cache, or the download from a sibling Nest.
+    pub copy: Duration,
+    /// Building and checking the closure manifest.
+    pub manifest: Duration,
+    /// Compressed bytes the manifest read and hashed.
+    pub hashed_file_size_bytes: u64,
+    pub total_file_size_bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -203,6 +218,11 @@ struct VerifiedClosureManifest {
     root_narinfo_path: PathBuf,
     root_nar_path: PathBuf,
     total_file_size_bytes: u64,
+    /// Compressed bytes read and hashed for this manifest; the rest were
+    /// confirmed by a hash of the unchanged file taken in the last day.
+    hashed_file_size_bytes: u64,
+    /// When the least recently hashed member was hashed.
+    oldest_member_hash: SystemTime,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -362,6 +382,7 @@ pub async fn export_output(
             .with_context(|| format!("create cache directory {}", cache_dir.display()))?;
         prepare_quarantine_root(&cache_dir, &quarantine_dir)?;
         let destination = export_destination(&cache_dir, &private_key_path);
+        let copy_started = Instant::now();
         copy_store_path_to_cache_controlled(
             &nix_binary,
             &destination,
@@ -373,7 +394,9 @@ pub async fn export_output(
             &cancellation,
         )?;
         cancellation_check(&cancellation)?;
+        let copy = copy_started.elapsed();
         let cache_info = read_nix_cache_info(&cache_dir)?;
+        let manifest_started = Instant::now();
         let verified = build_or_quarantine_closure_manifest(
             &cache_dir,
             &quarantine_dir,
@@ -381,6 +404,12 @@ pub async fn export_output(
             evaluated_derivation.as_deref(),
             &public_key,
         )?;
+        let timings = ExportTimings {
+            copy,
+            manifest: manifest_started.elapsed(),
+            hashed_file_size_bytes: verified.hashed_file_size_bytes,
+            total_file_size_bytes: verified.total_file_size_bytes,
+        };
         let closure_file_size_bytes = i64::try_from(verified.total_file_size_bytes)
             .context("verified closure compressed size exceeded reporting range")?;
         let nar_len = u64::try_from(verified.root_narinfo.file_size)
@@ -421,6 +450,7 @@ pub async fn export_output(
             compression: narinfo.compression,
             references: narinfo.references,
             metadata,
+            timings,
             _mutation_lock: mutation_lock,
         })
     })
@@ -492,6 +522,7 @@ pub async fn import_replica_closure(
         .build()
         .context("build replica HTTP client")?;
 
+    let copy_started = Instant::now();
     let mut queue = VecDeque::from([source.toplevel_store_path.to_string()]);
     let mut visited = HashSet::new();
     let mut members = Vec::new();
@@ -534,12 +565,14 @@ pub async fn import_replica_closure(
         if file_size > config.build.max_artifact_size_bytes {
             bail!("origin NAR member exceeds max_artifact_size_bytes");
         }
-        let already_present = match hash_safe_cache_member(&cache_dir, &narinfo.url) {
-            Ok((_, actual_size, actual_hash)) => {
-                actual_size == file_size && actual_hash == expected_file_hash
-            }
-            Err(_) => false,
-        };
+        let already_present = check_cache_member(
+            &cache_dir,
+            &narinfo.url,
+            file_size,
+            &expected_file_hash,
+            MemberHashes::global(),
+        )
+        .is_ok_and(|member| member.size == file_size && member.sha256 == expected_file_hash);
         if !already_present {
             crate::disk::ensure_headroom(&cache_dir, file_size, "Nest replica copy")?;
             fetch_replica_nar(
@@ -589,6 +622,8 @@ pub async fn import_replica_closure(
     let toplevel = source.toplevel_store_path.to_string();
     let evaluated_derivation = source.evaluated_derivation.map(str::to_string);
     let public_key_for_verify = public_key.clone();
+    let copy = copy_started.elapsed();
+    let manifest_started = Instant::now();
     let verified = task::spawn_blocking(move || {
         build_or_quarantine_closure_manifest(
             &cache_dir_for_verify,
@@ -600,6 +635,12 @@ pub async fn import_replica_closure(
     })
     .await
     .context("join replica verification task")??;
+    let timings = ExportTimings {
+        copy,
+        manifest: manifest_started.elapsed(),
+        hashed_file_size_bytes: verified.hashed_file_size_bytes,
+        total_file_size_bytes: verified.total_file_size_bytes,
+    };
     let cache_info = read_nix_cache_info(&cache_dir)?;
     let closure_file_size_bytes = i64::try_from(verified.total_file_size_bytes)
         .context("verified closure compressed size exceeded reporting range")?;
@@ -655,6 +696,7 @@ pub async fn import_replica_closure(
             compression: narinfo.compression,
             references: narinfo.references,
             metadata,
+            timings,
             _mutation_lock: mutation_lock,
         },
         summary,
@@ -1106,6 +1148,24 @@ fn build_closure_manifest(
     trusted_public_key: &str,
     inspected_narinfos: &mut Vec<PathBuf>,
 ) -> Result<VerifiedClosureManifest> {
+    build_closure_manifest_with(
+        cache_root,
+        root_store_path,
+        evaluated_derivation,
+        trusted_public_key,
+        inspected_narinfos,
+        MemberHashes::global(),
+    )
+}
+
+fn build_closure_manifest_with(
+    cache_root: &Path,
+    root_store_path: &str,
+    evaluated_derivation: Option<&str>,
+    trusted_public_key: &str,
+    inspected_narinfos: &mut Vec<PathBuf>,
+    member_hashes: &MemberHashes,
+) -> Result<VerifiedClosureManifest> {
     validate_store_path(root_store_path).context("validate closure root store path")?;
     let evaluated_derivation = evaluated_derivation
         .map(|path| {
@@ -1122,6 +1182,8 @@ fn build_closure_manifest(
     let mut artifacts = Vec::new();
     let mut total_file_size_bytes = 0u64;
     let mut total_nar_size_bytes = 0u64;
+    let mut hashed_file_size_bytes = 0u64;
+    let mut oldest_member_hash: Option<SystemTime> = None;
     let mut root_narinfo = None;
     let mut root_narinfo_path = None;
     let mut root_nar_path = None;
@@ -1176,8 +1238,15 @@ fn build_closure_manifest(
             }
         }
 
+        let member = check_cache_member(
+            cache_root,
+            &narinfo.url,
+            file_size,
+            &expected_file_hash,
+            member_hashes,
+        )?;
         let (nar_path, actual_file_size, actual_file_hash) =
-            hash_safe_cache_member(cache_root, &narinfo.url)?;
+            (member.path, member.size, member.sha256);
         if actual_file_size != file_size || actual_file_hash != expected_file_hash {
             let filename = validate_nar_url(&narinfo.url)?;
             // The payload's name must independently agree with FileHash.
@@ -1202,6 +1271,12 @@ fn build_closure_manifest(
         total_nar_size_bytes = total_nar_size_bytes
             .checked_add(nar_size)
             .ok_or_else(|| anyhow!("closure NarSize total overflowed"))?;
+        if !member.reused {
+            hashed_file_size_bytes = hashed_file_size_bytes.saturating_add(file_size);
+        }
+        oldest_member_hash = Some(
+            oldest_member_hash.map_or(member.hashed_at, |oldest| oldest.min(member.hashed_at)),
+        );
 
         if narinfo.store_path == root_store_path {
             root_narinfo = Some(narinfo.clone());
@@ -1250,6 +1325,8 @@ fn build_closure_manifest(
             .ok_or_else(|| anyhow!("closure omitted its root NARInfo path"))?,
         root_nar_path: root_nar_path.ok_or_else(|| anyhow!("closure omitted its root NAR path"))?,
         total_file_size_bytes,
+        hashed_file_size_bytes,
+        oldest_member_hash: oldest_member_hash.unwrap_or_else(SystemTime::now),
     })
 }
 
@@ -1337,7 +1414,25 @@ pub(crate) fn sha256_digest(value: &str) -> Result<[u8; 32]> {
     parse_strong_sha256(value, "hash")
 }
 
-fn hash_safe_cache_member(cache_root: &Path, relative: &str) -> Result<(PathBuf, u64, [u8; 32])> {
+/// A cache NAR file checked for a closure manifest.
+struct CheckedMember {
+    path: PathBuf,
+    size: u64,
+    sha256: [u8; 32],
+    /// When these bytes were hashed: now, or by a remembered earlier hash.
+    hashed_at: SystemTime,
+    reused: bool,
+}
+
+/// Hash the NAR file at `relative`, unless `member_hashes` confirms that the
+/// unchanged file was hashed to the expected size and SHA-256 in the last day.
+fn check_cache_member(
+    cache_root: &Path,
+    relative: &str,
+    expected_size: u64,
+    expected_sha256: &[u8; 32],
+    member_hashes: &MemberHashes,
+) -> Result<CheckedMember> {
     let filename = validate_nar_url(relative)?;
     let path = cache_root.join("nar").join(filename);
     let mut file = open_nar_member_at(cache_root, filename)
@@ -1348,6 +1443,18 @@ fn hash_safe_cache_member(cache_root: &Path, relative: &str) -> Result<(PathBuf,
     if !metadata.file_type().is_file() {
         bail!("generated NAR was not a regular file");
     }
+    if metadata.len() == expected_size {
+        if let Some(hashed_at) = member_hashes.confirmed(&metadata, expected_sha256) {
+            return Ok(CheckedMember {
+                path,
+                size: expected_size,
+                sha256: *expected_sha256,
+                hashed_at,
+                reused: true,
+            });
+        }
+    }
+    let started = SystemTime::now();
     crate::verification_io::sequential(&file);
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 128 * 1024];
@@ -1364,15 +1471,21 @@ fn hash_safe_cache_member(cache_root: &Path, relative: &str) -> Result<(PathBuf,
             .ok_or_else(|| anyhow!("generated NAR size overflowed"))?;
         hasher.update(&buffer[..read]);
     }
-    if file
+    let after = file
         .metadata()
-        .with_context(|| format!("reinspect generated NAR {}", path.display()))?
-        .len()
-        != bytes_read
-    {
+        .with_context(|| format!("reinspect generated NAR {}", path.display()))?;
+    if after.len() != bytes_read {
         bail!("generated NAR changed while it was being verified");
     }
-    Ok((path, bytes_read, hasher.finalize().into()))
+    let sha256 = hasher.finalize().into();
+    member_hashes.remember(&metadata, &after, sha256, started);
+    Ok(CheckedMember {
+        path,
+        size: bytes_read,
+        sha256,
+        hashed_at: started,
+        reused: false,
+    })
 }
 
 fn validate_nar_url(relative: &str) -> Result<&str> {
@@ -2234,8 +2347,12 @@ async fn scrub_cache_artifact(
     public_key: &str,
 ) -> Result<bool> {
     let verification = verify_cache_artifact(config, artifact, public_key).await;
-    if matches!(verification, Ok(true)) {
-        db::mark_cache_artifact_verified(pool, artifact.id).await?;
+    if let Ok(Some(oldest_member_hash)) = verification {
+        // The root counts as verified when its least recently hashed member
+        // was hashed, so it is due again a day after that, not a day after
+        // this walk: reused member hashes never stretch the daily check.
+        let verified_at = chrono::DateTime::<chrono::Utc>::from(oldest_member_hash).to_rfc3339();
+        db::mark_cache_artifact_verified(pool, artifact.id, &verified_at).await?;
         return Ok(false);
     }
 
@@ -2260,11 +2377,13 @@ async fn scrub_cache_artifact(
     Ok(true)
 }
 
+/// When the artifact's closure was last fully hashed, or `None` when its
+/// inventory row does not match the verified closure.
 async fn verify_cache_artifact(
     config: &AppConfig,
     artifact: &crate::models::CacheArtifact,
     public_key: &str,
-) -> Result<bool> {
+) -> Result<Option<SystemTime>> {
     let cache_root = config.cache.root_dir.clone();
     let quarantine_root = config.paths.data_dir.join("cache-quarantine");
     let artifact = artifact.clone();
@@ -2281,7 +2400,7 @@ fn verify_cache_artifact_blocking(
     quarantine_root: &Path,
     artifact: &crate::models::CacheArtifact,
     public_key: &str,
-) -> Result<bool> {
+) -> Result<Option<SystemTime>> {
     let evaluated_derivation = artifact
         .cache_metadata
         .pointer("/closure_manifest/evaluated_derivation")
@@ -2331,8 +2450,9 @@ fn verify_cache_artifact_blocking(
 
     if !inventory_matches {
         quarantine_narinfo_records(cache_root, quarantine_root, &[verified.root_narinfo_path])?;
+        return Ok(None);
     }
-    Ok(inventory_matches)
+    Ok(Some(verified.oldest_member_hash))
 }
 
 async fn quarantine_cache_artifact_root(
@@ -3088,6 +3208,7 @@ mod tests {
             compression: "xz".to_string(),
             references: Vec::new(),
             metadata: json!({}),
+            timings: ExportTimings::default(),
             _mutation_lock: acquire_cache_mutation_lock_blocking(&cache_root).unwrap(),
         };
         let lock_metadata = fs::metadata(cache_root.join(CACHE_MUTATION_LOCK_FILENAME)).unwrap();
@@ -3323,6 +3444,46 @@ mod tests {
         assert_eq!(second.manifest, first.manifest);
         assert_eq!(second.manifest_sha256, first.manifest_sha256);
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn closure_manifest_reads_only_members_not_hashed_in_the_last_day() {
+        let root = test_temp_dir("closure-manifest-member-hashes");
+        let root_store = test_store_path('d', "root");
+        let shared = test_store_path('c', "shared");
+        let (_, shared_nar) = write_manifest_cache_member(&root, &shared, b"shared-nar", &[]);
+        write_manifest_cache_member(
+            &root,
+            &root_store,
+            b"root-nar",
+            std::slice::from_ref(&shared),
+        );
+        let hashes = MemberHashes::new(member_hashes::MAX_AGE, Duration::ZERO);
+        let manifest = || {
+            build_closure_manifest_with(
+                &root,
+                &root_store,
+                None,
+                &test_public_key(),
+                &mut Vec::new(),
+                &hashes,
+            )
+        };
+
+        let first = manifest().unwrap();
+        assert_eq!(first.hashed_file_size_bytes, first.total_file_size_bytes);
+        let second = manifest().unwrap();
+        assert_eq!(second.hashed_file_size_bytes, 0);
+        assert_eq!(second.manifest, first.manifest);
+        assert_eq!(second.oldest_member_hash, first.oldest_member_hash);
+
+        // Other bytes of the same size under the same name are read again.
+        let replacement = shared_nar.with_extension("replacement");
+        fs::write(&replacement, b"SHARED-NAR").unwrap();
+        fs::rename(&replacement, &shared_nar).unwrap();
+        let error = manifest().err().unwrap();
+        assert!(format!("{error:#}").contains("FileHash"), "{error:#}");
         let _ = fs::remove_dir_all(root);
     }
 

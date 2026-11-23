@@ -1,5 +1,15 @@
 //! Bounded offline closure verification. No extraction, import, or disk mutation
 //! is needed to authenticate the full archive and every inner NAR.
+//!
+//! An archive is read twice at most, and verified once:
+//! - its one SHA-256 pass is taken where the bytes arrive
+//!   ([`AuthenticatedArchive`]): while they are downloaded, while root pins
+//!   its private copy, or when an archive found on disk is opened;
+//! - its one verification pass ([`verify_archive`]) checks the manifest,
+//!   every NARInfo signature and every NAR, and extracts the binary cache
+//!   when it is given somewhere to put it (an update);
+//! - setup verifies before it touches the disk and extracts onto the disk
+//!   later ([`VerifiedArchive::extract`]), copying the payloads it verified.
 use super::release_v3::{NixosRelease, canonical_base64, store_path, strict_json};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -14,6 +24,8 @@ use std::{
     path::Path,
 };
 
+/// The parser's bound on the expanded tar stream. It is not a size estimate:
+/// space admission uses the archive's own sizes ([`VerifiedArchive::cache_bytes`]).
 pub const MAX_EXPANDED: u64 = 8 * 1024 * 1024 * 1024;
 pub const MAX_NAR_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const MAX_MEMBERS: usize = 65536;
@@ -309,7 +321,9 @@ struct Counting<R> {
     inner: R,
     bytes: u64,
     limit: u64,
-    hash: Sha256,
+    /// Only where a signed hash is compared; the tar stream itself is
+    /// authenticated by the archive's hash.
+    hash: Option<Sha256>,
 }
 impl<R: Read> Read for Counting<R> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
@@ -321,7 +335,9 @@ impl<R: Read> Read for Counting<R> {
         if self.bytes > self.limit {
             return Err(io::Error::other("stream exceeded verified limit"));
         }
-        self.hash.update(&out[..n]);
+        if let Some(hash) = &mut self.hash {
+            hash.update(&out[..n]);
+        }
         Ok(n)
     }
 }
@@ -331,43 +347,223 @@ impl<R> Counting<R> {
             inner,
             bytes: 0,
             limit,
-            hash: Sha256::new(),
+            hash: Some(Sha256::new()),
         }
+    }
+    fn unhashed(inner: R, limit: u64) -> Self {
+        Self {
+            hash: None,
+            ..Self::new(inner, limit)
+        }
+    }
+    fn digest(&mut self) -> String {
+        nix_hash(&self.hash.take().unwrap_or_default().finalize())
     }
 }
 
-/// The same file descriptor stays open throughout byte, tar and NAR validation.
-/// Optional extraction targets only a new private root-owned cache directory.
+/// What identifies the open archive file between its hash and its reads.
+#[derive(Debug, PartialEq, Eq)]
+struct FileState {
+    device: u64,
+    inode: u64,
+    len: u64,
+    modified: (i64, i64),
+}
+impl FileState {
+    fn of(file: &File) -> Result<Self> {
+        let meta = file.metadata()?;
+        ensure!(
+            meta.is_file() && meta.nlink() == 1,
+            "archive is not one ordinary file"
+        );
+        Ok(Self {
+            device: meta.dev(),
+            inode: meta.ino(),
+            len: meta.len(),
+            modified: (meta.mtime(), meta.mtime_nsec()),
+        })
+    }
+}
+
+/// An open closure archive whose bytes are exactly the signed size and
+/// SHA-256. This is the archive's one hash pass, taken where the bytes
+/// arrive: while they are downloaded (`nixos::download_with_progress`),
+/// while root pins its private copy (`appliance::pin_untrusted_bundle`), or
+/// by [`Self::open`] for an archive found on disk. Only its owner can write
+/// where it lives, and every later read is of this same open file, refused
+/// once the file changed.
+#[derive(Debug)]
+pub struct AuthenticatedArchive {
+    file: File,
+    sha256: String,
+    state: FileState,
+}
+impl AuthenticatedArchive {
+    /// Hash an archive found on disk, for example one an earlier run left.
+    pub fn open(path: &Path, release: &NixosRelease) -> Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?;
+        ensure!(
+            FileState::of(&file)?.len == release.system_closure.size_bytes,
+            "archive is not the exact ordinary signed file"
+        );
+        let mut hash = Sha256::new();
+        let size = io::copy(
+            &mut (&file).take(release.system_closure.size_bytes + 1),
+            &mut hash,
+        )?;
+        Self::hashed(file, hash, size, release)
+    }
+
+    /// `hash` and `size` cover every byte of `file`, taken as the caller
+    /// wrote or copied them.
+    pub(crate) fn hashed(
+        file: File,
+        hash: Sha256,
+        size: u64,
+        release: &NixosRelease,
+    ) -> Result<Self> {
+        let sha256 = hex::encode(hash.finalize());
+        ensure!(
+            size == release.system_closure.size_bytes && sha256 == release.system_closure.sha256,
+            "archive signed size/hash mismatch"
+        );
+        let state = FileState::of(&file)?;
+        ensure!(state.len == size, "archive changed while it was hashed");
+        Ok(Self {
+            file,
+            sha256,
+            state,
+        })
+    }
+
+    fn unchanged(&self) -> Result<()> {
+        ensure!(
+            FileState::of(&self.file)? == self.state,
+            "archive changed during verification"
+        );
+        Ok(())
+    }
+}
+
+/// An archive that passed [`verify_archive`], still open.
+#[derive(Debug)]
+pub struct VerifiedArchive {
+    archive: AuthenticatedArchive,
+    pub manifest: ClosureManifest,
+    /// The bytes its binary cache takes once extracted (its files).
+    pub cache_bytes: u64,
+}
+impl VerifiedArchive {
+    /// The signed archive this is.
+    pub fn sha256(&self) -> &str {
+        &self.archive.sha256
+    }
+
+    /// Extract the binary cache of an archive verified without extracting:
+    /// setup verifies before it touches the disk and extracts onto the disk
+    /// later. This reads the same open file, unchanged since its
+    /// verification, and checks its structure, manifest and NARInfo
+    /// signatures as that pass did. Each NAR payload is copied at its signed
+    /// size, not decompressed and hashed again: that pass did so for these
+    /// bytes, and Nix checks every NAR against its signed NARInfo when it
+    /// imports it.
+    pub fn extract(
+        &mut self,
+        release: &NixosRelease,
+        key: &VerifyingKey,
+        output: &Path,
+    ) -> Result<()> {
+        let (manifest, cache_bytes) = walk(
+            &mut self.archive,
+            release,
+            key,
+            Some(output),
+            Payloads::Copy,
+            &mut |_, _| Ok(()),
+        )?;
+        ensure!(
+            cache_bytes == self.cache_bytes
+                && manifest.total_nar_bytes == self.manifest.total_nar_bytes,
+            "archive differs from its verification"
+        );
+        Ok(())
+    }
+}
+
+/// The archive's one verification pass: the manifest against the signed
+/// descriptor, every NARInfo's signature, every NAR's compressed and
+/// uncompressed size and hash, the embedded Tiaris source and the exact
+/// reference graph. With `output`, it extracts the binary cache as it goes
+/// into a new private directory.
+///
+/// `admit` runs once, after the manifest and every NARInfo are verified and
+/// before the first payload is read: with the manifest and the bytes the
+/// extracted cache takes (manifest, NARInfos and payloads). Space admission
+/// belongs there; its error ends the pass.
 pub fn verify_archive(
+    mut archive: AuthenticatedArchive,
+    release: &NixosRelease,
+    key: &VerifyingKey,
+    output: Option<&Path>,
+    admit: impl FnOnce(&ClosureManifest, u64) -> Result<()>,
+) -> Result<VerifiedArchive> {
+    let mut admit = Some(admit);
+    let (manifest, cache_bytes) = walk(
+        &mut archive,
+        release,
+        key,
+        output,
+        Payloads::Verify,
+        &mut |manifest, bytes| admit.take().map_or(Ok(()), |admit| admit(manifest, bytes)),
+    )?;
+    Ok(VerifiedArchive {
+        archive,
+        manifest,
+        cache_bytes,
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Payloads {
+    Verify,
+    /// Only [`VerifiedArchive::extract`]: the same file passed `Verify`.
+    Copy,
+}
+
+fn walk(
+    archive: &mut AuthenticatedArchive,
+    release: &NixosRelease,
+    key: &VerifyingKey,
+    output: Option<&Path>,
+    mode: Payloads,
+    admit: &mut dyn FnMut(&ClosureManifest, u64) -> Result<()>,
+) -> Result<(ClosureManifest, u64)> {
+    release.verify(key)?;
+    ensure!(
+        archive.sha256 == release.system_closure.sha256
+            && archive.state.len == release.system_closure.size_bytes,
+        "archive is not the exact ordinary signed file"
+    );
+    archive.unchanged()?;
+    let read = read_cache(&mut archive.file, release, key, output, mode, admit)?;
+    archive.unchanged()?;
+    Ok(read)
+}
+
+/// The same file descriptor stays open throughout tar and NAR validation.
+/// Optional extraction targets only a new private root-owned cache directory.
+fn read_cache(
     file: &mut File,
     release: &NixosRelease,
     key: &VerifyingKey,
     output: Option<&Path>,
-) -> Result<ClosureManifest> {
-    release.verify(key)?;
-    let meta = file.metadata()?;
-    ensure!(
-        meta.is_file() && meta.nlink() == 1 && meta.len() == release.system_closure.size_bytes,
-        "archive is not the exact ordinary signed file"
-    );
-    file.rewind()?;
-    let mut hash = Sha256::new();
+    mode: Payloads,
+    admit: &mut dyn FnMut(&ClosureManifest, u64) -> Result<()>,
+) -> Result<(ClosureManifest, u64)> {
     let mut block = [0u8; 64 * 1024];
-    let mut size = 0;
-    loop {
-        let n = file.read(&mut block)?;
-        if n == 0 {
-            break;
-        }
-        size += n as u64;
-        ensure!(size <= release.system_closure.size_bytes, "archive grew");
-        hash.update(&block[..n]);
-    }
-    ensure!(
-        size == release.system_closure.size_bytes
-            && hex::encode(hash.finalize()) == release.system_closure.sha256,
-        "archive signed size/hash mismatch"
-    );
     if let Some(root) = output {
         fs::create_dir(root)?;
         fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
@@ -375,7 +571,7 @@ pub fn verify_archive(
     file.rewind()?;
     let mut decoder = zstd::stream::read::Decoder::new(&mut *file)?.single_frame();
     decoder.window_log_max(27)?;
-    let mut tar = Counting::new(decoder, MAX_EXPANDED);
+    let mut tar = Counting::unhashed(decoder, MAX_EXPANDED);
     let mut manifest: Option<ClosureManifest> = None;
     let mut paths = BTreeMap::new();
     let mut infos = BTreeMap::new();
@@ -383,6 +579,9 @@ pub fn verify_archive(
     let mut payloads = BTreeSet::new();
     let mut saw_cache = false;
     let mut payload_started = false;
+    // The extracted cache: its metadata files as they come, then every
+    // payload's signed size once all are known.
+    let mut cache_bytes = 0u64;
     let mut timestamp = None;
     loop {
         let mut raw = [0u8; 512];
@@ -449,6 +648,7 @@ pub fn verify_archive(
             );
             let m: ClosureManifest = serde_json::from_value(value)?;
             m.validate(release, key)?;
+            cache_bytes += length;
             for p in &m.store_paths {
                 paths.insert(p.narinfo.clone(), p.clone());
             }
@@ -469,6 +669,7 @@ pub fn verify_archive(
                     || text == "StoreDir: /nix/store\n",
                 "unexpected Nix cache metadata"
             );
+            cache_bytes += length;
             if let Some(root) = output {
                 write_new(&root.join(&name), &bytes)?;
             }
@@ -485,15 +686,27 @@ pub fn verify_archive(
                 infos.insert(url, info).is_none(),
                 "duplicate NAR payload identity"
             );
+            cache_bytes += length;
             if let Some(root) = output {
                 write_new(&root.join(&name), &bytes)?;
             }
         } else {
-            payload_started = true;
             ensure!(
                 infos.len() == paths.len() && saw_cache,
                 "payload before complete metadata"
             );
+            if !payload_started {
+                payload_started = true;
+                for info in infos.values() {
+                    cache_bytes = cache_bytes
+                        .checked_add(info.file_size)
+                        .ok_or_else(|| anyhow!("cache size overflow"))?;
+                }
+                let verified = manifest
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("manifest missing"))?;
+                admit(verified, cache_bytes)?;
+            }
             let info = infos
                 .get(&name)
                 .ok_or_else(|| anyhow!("unreferenced NAR payload"))?;
@@ -519,16 +732,25 @@ pub fn verify_archive(
                 .map(|m| &m.manage_source)
                 .ok_or_else(|| anyhow!("manifest missing"))?;
             let (source_root, source_relative) = source_location(source)?;
-            verify_nar(
-                &mut entry,
-                info,
-                target,
-                if info.entry.path == source_root {
-                    Some((source_relative, source))
-                } else {
-                    None
-                },
-            )?;
+            match (mode, target) {
+                (Payloads::Verify, target) => verify_nar(
+                    &mut entry,
+                    info,
+                    target,
+                    if info.entry.path == source_root {
+                        Some((source_relative, source))
+                    } else {
+                        None
+                    },
+                )?,
+                (Payloads::Copy, Some(mut target)) => {
+                    ensure!(
+                        io::copy(&mut entry, &mut target)? == length,
+                        "short archive member"
+                    );
+                }
+                (Payloads::Copy, None) => bail!("extraction needs a directory"),
+            }
             payloads.insert(name);
         }
         ensure!(entry.limit() == 0, "short archive member");
@@ -549,14 +771,10 @@ pub fn verify_archive(
         compressed.fill_buf()?.is_empty(),
         "concatenated zstd frame or trailing compressed garbage"
     );
-    let after = file.metadata()?;
-    ensure!(
-        after.len() == meta.len()
-            && after.mtime() == meta.mtime()
-            && after.mtime_nsec() == meta.mtime_nsec(),
-        "archive changed during verification"
-    );
-    manifest.ok_or_else(|| anyhow!("missing closure manifest"))
+    Ok((
+        manifest.ok_or_else(|| anyhow!("missing closure manifest"))?,
+        cache_bytes,
+    ))
 }
 
 struct Tee<R> {
@@ -607,7 +825,7 @@ fn verify_nar(
     let mut one = [0];
     ensure!(nar.read(&mut one)? == 0, "trailing NAR bytes");
     ensure!(
-        nar.bytes == info.entry.nar_size && nix_hash(&nar.hash.finalize()) == info.entry.nar_hash,
+        nar.bytes == info.entry.nar_size && nar.digest() == info.entry.nar_hash,
         "NAR size/hash mismatch"
     );
     let mut buffered = nar.inner.finish();
@@ -615,15 +833,11 @@ fn verify_nar(
         buffered.fill_buf()?.is_empty(),
         "trailing or concatenated NAR frame"
     );
-    let compressed = buffered.into_inner();
+    let mut compressed = buffered.into_inner();
     ensure!(
-        compressed.bytes == info.file_size
-            && nix_hash(&compressed.hash.finalize()) == info.file_hash,
+        compressed.bytes == info.file_size && compressed.digest() == info.file_hash,
         "compressed NAR hash/size mismatch"
     );
-    if let Some(file) = compressed.inner.output {
-        file.sync_all()?;
-    }
     Ok(())
 }
 fn nar_string(reader: &mut impl Read, max: u64) -> Result<Vec<u8>> {
@@ -807,6 +1021,8 @@ fn octal(bytes: &[u8]) -> Result<u64> {
     );
     Ok(u64::from_str_radix(text, 8)?)
 }
+/// Extracted files are not synced one by one: nothing reads an extraction
+/// after an interruption. Setup and the updater remove it and extract again.
 fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = OpenOptions::new()
         .write(true)
@@ -815,7 +1031,6 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)?;
     file.write_all(bytes)?;
-    file.sync_all()?;
     Ok(())
 }
 

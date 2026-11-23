@@ -126,6 +126,7 @@ pub struct BootConfig {
 #[serde(default)]
 pub struct BuildConfig {
     pub enabled: bool,
+    /// Builds at once; zero follows the host (see `concurrent_builds`).
     pub max_concurrent_builds: usize,
     pub max_build_cores: usize,
     /// Zero preserves NixOS auto job concurrency; positive values explicitly cap it.
@@ -383,7 +384,7 @@ impl AppConfig {
         self.boot.bootloader_filename =
             normalize_bootloader_filename(&self.boot.bootloader_filename)?;
         validate_menu_timeout_ms(self.boot.menu_timeout_ms)?;
-        self.build.max_concurrent_builds = self.build.max_concurrent_builds.clamp(1, 16);
+        self.build.max_concurrent_builds = self.build.max_concurrent_builds.min(16);
         self.build.max_build_cores = self.build.max_build_cores.clamp(1, 128);
         self.build.max_nix_jobs = self.build.max_nix_jobs.min(128);
         self.build.memory_per_build_bytes = self
@@ -966,11 +967,47 @@ impl Default for BootConfig {
     }
 }
 
+impl BuildConfig {
+    /// Builds at once: the configured number, or for zero one that follows
+    /// this host. `resources::Admission` still starts each build only while
+    /// its memory is free and memory pressure is low.
+    pub fn concurrent_builds(&self) -> usize {
+        if self.max_concurrent_builds > 0 {
+            return self.max_concurrent_builds;
+        }
+        static HOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *HOST.get_or_init(|| {
+            let cpus = std::thread::available_parallelism().map_or(1, usize::from);
+            let memory_bytes = crate::resources::capacity().map(|(memory, _)| memory);
+            let builds = host_concurrent_builds(cpus, memory_bytes, self);
+            tracing::info!(
+                cpus,
+                memory_bytes,
+                builds,
+                "Nest builds at once follow this host"
+            );
+            builds
+        })
+    }
+}
+
+/// One build per two CPUs (evaluation is single-threaded; much of a build
+/// waits on downloads) and per `memory_per_build_bytes` above the serving
+/// reserve; at least two, the number every Nest ran before, and at most eight.
+fn host_concurrent_builds(cpus: usize, memory_bytes: Option<u64>, build: &BuildConfig) -> usize {
+    let by_memory = memory_bytes.map_or(usize::MAX, |memory| {
+        let builds = memory.saturating_sub(build.serving_memory_reserve_bytes)
+            / build.memory_per_build_bytes.max(1);
+        usize::try_from(builds).unwrap_or(usize::MAX)
+    });
+    (cpus / 2).min(by_memory).clamp(2, 8)
+}
+
 impl Default for BuildConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            max_concurrent_builds: 2,
+            max_concurrent_builds: 0,
             max_build_cores: 4,
             max_nix_jobs: 0,
             memory_per_build_bytes: 4 * 1024 * 1024 * 1024,
@@ -1152,6 +1189,23 @@ mod tests {
             config.build.manage_source_url_template,
             manage_source::MANAGE_SOURCE_URL_TEMPLATE
         );
+    }
+
+    #[test]
+    fn builds_at_once_follow_the_hosts_cpus_and_memory() {
+        let build = BuildConfig::default();
+        let gib = 1024 * 1024 * 1024;
+        // Today's development Nests: 4 vCPUs, 19.5 GiB.
+        assert_eq!(host_concurrent_builds(4, Some(39 * gib / 2), &build), 2);
+        assert_eq!(host_concurrent_builds(8, Some(32 * gib), &build), 4);
+        assert_eq!(host_concurrent_builds(16, Some(16 * gib), &build), 3);
+        assert_eq!(host_concurrent_builds(64, Some(256 * gib), &build), 8);
+        assert_eq!(host_concurrent_builds(2, Some(8 * gib), &build), 2);
+        let explicit = BuildConfig {
+            max_concurrent_builds: 5,
+            ..BuildConfig::default()
+        };
+        assert_eq!(explicit.concurrent_builds(), 5);
     }
 
     #[test]
