@@ -1543,7 +1543,7 @@ fn open_nar_directory(cache_root: &Path) -> Result<fs::File> {
     Ok(unsafe { fs::File::from_raw_fd(nar_fd) })
 }
 
-fn parse_strong_sha256(value: &str, field: &str) -> Result<[u8; 32]> {
+pub(crate) fn parse_strong_sha256(value: &str, field: &str) -> Result<[u8; 32]> {
     let bytes = if let Some(encoded) = value.strip_prefix("sha256-") {
         BASE64_STANDARD
             .decode(encoded)

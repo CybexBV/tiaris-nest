@@ -4,7 +4,7 @@ use std::os::{
     unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
 };
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ffi::OsString,
     fs,
     io::{self, Write},
@@ -41,6 +41,8 @@ use crate::{
     models::{BootProfileType, BuildJob, CacheArtifact, clean_tags, normalize_mac},
     redact::redact_sensitive_key_values,
 };
+
+mod compact_report;
 
 const CAPABILITY_BOOT_V1: &str = "boot_v1";
 const CAPABILITY_BUILDER_V1: &str = "builder_v1";
@@ -116,6 +118,14 @@ struct ManagedState {
     last_peer_contract: Option<PeerContract>,
     /// When Manage confirmed `last_peer_contract` (Unix seconds).
     last_peer_contract_at: Option<i64>,
+    /// The cache inventory the report sees and the generation it was first
+    /// seen at (`compact_report`).
+    nest_cache_content: Option<compact_report::CacheInventoryContent>,
+    /// The cache inventory Manage last acknowledged complete.
+    nest_cache_acknowledged: Option<compact_report::CacheInventoryContent>,
+    /// Terminal build jobs whose result Manage settled: local id to the
+    /// `updated_at` it settled.
+    nest_build_jobs_settled: BTreeMap<i64, String>,
 }
 
 /// How long a confirmed contract outlives failing configuration fetches. Long enough for a Manage deploy or outage,
@@ -141,6 +151,9 @@ struct PeerContract {
     /// Manage accepts `appliance_update_replace_v1`.
     #[serde(default)]
     accepts_update_replace: bool,
+    /// Manage acknowledges what it holds and accepts compact reports.
+    #[serde(default)]
+    accepts_compact_report: bool,
     runtime_epoch: bool,
     report_protocol: u32,
 }
@@ -222,6 +235,10 @@ struct AgentNestConfigResponse {
     update_schedule: Option<Value>,
     #[serde(default)]
     workstation_netboot: Option<Value>,
+    /// The runtime of the `appliance_update` release, to prepare before the
+    /// restart (`netboot::prepare`); an older Manage sends none.
+    #[serde(default)]
+    workstation_netboot_prepare: Option<Value>,
     #[serde(default)]
     software_cache: Option<Value>,
     /// Manage accepts `software_cache_upload_v1` in reports; until it says
@@ -250,6 +267,10 @@ struct AgentNestConfigResponse {
     /// Manage answers `nest/build-work`; an older Manage does not have it.
     #[serde(default)]
     build_work_probe_supported: bool,
+    /// Manage acknowledges cache inventories and settled build results and
+    /// accepts compact cache entries (`compact_report`).
+    #[serde(default)]
+    compact_report_supported: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -259,6 +280,14 @@ struct NestReportResponse {
     workstation_netboot: Option<WorkstationNetbootReportReceipt>,
     #[serde(default)]
     warnings: NestReportWarnings,
+    /// Read leniently in `compact_report`: an answer it cannot read
+    /// acknowledges nothing.
+    #[serde(default)]
+    cache_inventory_acknowledged: Option<Value>,
+    #[serde(default)]
+    cache_evidence_required: Option<Value>,
+    #[serde(default)]
+    build_jobs_settled: Option<Value>,
 }
 
 #[derive(Debug, Default)]
@@ -631,6 +660,10 @@ struct NestCacheArtifactReport {
     cache_metadata: Value,
     created_at: String,
     updated_at: String,
+    /// Compact entry: Manage acknowledged this exact closure manifest, which
+    /// `cache_metadata` therefore leaves out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    acknowledged_closure_manifest_sha256: Option<String>,
 }
 
 impl From<BuildJob> for NestBuildJobReport {
@@ -689,6 +722,7 @@ impl From<CacheArtifact> for NestCacheArtifactReport {
             cache_metadata: artifact.cache_metadata,
             created_at: artifact.created_at,
             updated_at: artifact.updated_at,
+            acknowledged_closure_manifest_sha256: None,
         }
     }
 }
@@ -1233,6 +1267,7 @@ async fn sync_nest_foundation(
                 accepts_site_check: desired.site_check_supported,
                 accepts_boot_machine_identity: desired.boot_machine_identity_supported,
                 accepts_update_replace: desired.appliance_update_replace_supported,
+                accepts_compact_report: desired.compact_report_supported,
                 runtime_epoch: desired
                     .compatibility
                     .as_ref()
@@ -1269,6 +1304,7 @@ async fn sync_nest_foundation(
             site_check: peer.accepts_site_check,
             boot_machine_identity: peer.accepts_boot_machine_identity,
             update_replace: peer.accepts_update_replace,
+            compact: peer.accepts_compact_report,
         },
         peer.report_protocol,
     )
@@ -1303,6 +1339,7 @@ fn peer_contract_after_failed_fetch(
         accepts_site_check: false,
         accepts_boot_machine_identity: false,
         accepts_update_replace: false,
+        accepts_compact_report: false,
         runtime_epoch: false,
         report_protocol: TIARIS_COMPONENT_PROTOCOL_VERSION,
     })
@@ -1403,6 +1440,11 @@ async fn apply_nest_desired(
         retain_sync_failure(first_failure, "appliance update schedule", error);
     }
     if let Some(update) = desired.appliance_update {
+        // Queued first: the update waits for it before the restart.
+        if let Some(prepare) = desired.workstation_netboot_prepare {
+            let crate::appliance::release_v3::ReleaseDescriptor::Nixos(release) = &update.release;
+            crate::netboot::prepare::queue(state, prepare, &release.release_id);
+        }
         if !crate::appliance::nixos::queue(update) {
             debug!("coalesced the latest appliance update behind the in-flight download");
         }
@@ -1574,12 +1616,16 @@ async fn report_nest_state(
     report_protocol: u32,
 ) -> Result<NestReportReceipt> {
     let peer_accepts_uploads = peer_support.uploads;
+    if !peer_support.compact {
+        compact_report::forget(managed);
+    }
     let (build_jobs, build_listing_valid) = match db::list_build_jobs_report_page(
         &state.db,
         managed.nest_active_report_cursor,
         managed.nest_rejection_report_cursor,
         managed.nest_terminal_report_cursor,
         managed.nest_report_rotation_round,
+        &compact_report::settled_build_jobs(managed),
         MAX_REPORT_BUILD_JOBS,
         MAX_NEST_REPORT_BODY_BYTES,
     )
@@ -1614,8 +1660,16 @@ async fn report_nest_state(
         }
     };
     let (cache_inventory_instance_id, cache_inventory_generation, cache_inventory_valid) =
-        match db::cache_inventory_state(&state.db).await {
-            Ok(inventory) => (inventory.instance_id, inventory.generation, true),
+        match db::cache_inventory_snapshot(&state.db).await {
+            Ok((inventory, members)) => {
+                let generation = compact_report::content_generation(
+                    managed,
+                    &inventory.instance_id,
+                    inventory.generation,
+                    members,
+                );
+                (inventory.instance_id, generation, true)
+            }
             Err(_) => {
                 warn!(
                     error_code = "cache_inventory_report_storage_unavailable",
@@ -1624,16 +1678,25 @@ async fn report_nest_state(
                 (String::new(), 0, false)
             }
         };
+    // Manage holds exactly this inventory: the cache lane goes empty.
+    let compact_refresh = peer_support.compact
+        && cache_inventory_valid
+        && compact_report::inventory_acknowledged(managed);
     let cache_report_cursor = nest_cache_report_cursor(
         managed,
         &cache_inventory_instance_id,
         cache_inventory_generation,
         cache_inventory_valid,
     );
-    let (cache_artifacts, cache_listing_complete, cache_listing_valid) =
+    let acknowledged_artifacts =
+        compact_report::acknowledged_members(managed, &cache_inventory_instance_id);
+    let (cache_artifacts, cache_listing_complete, cache_listing_valid) = if compact_refresh {
+        (Vec::new(), false, true)
+    } else {
         match db::list_cache_artifacts_report_page(
             &state.db,
             cache_report_cursor,
+            &acknowledged_artifacts,
             MAX_REPORT_CACHE_ARTIFACTS,
             MAX_NEST_REPORT_BODY_BYTES,
         )
@@ -1647,7 +1710,8 @@ async fn report_nest_state(
                 );
                 (Vec::new(), false, false)
             }
-        };
+        }
+    };
     let cache_inventory_generation = cache_inventory_generation_for_peer(
         cache_inventory_generation,
         cache_listing_valid,
@@ -1710,10 +1774,21 @@ async fn report_nest_state(
         MAX_REPORT_BUILD_JOBS,
         report_priority,
     )?;
+    let acknowledged_artifacts: BTreeSet<(i64, &str)> = acknowledged_artifacts
+        .iter()
+        .map(|(id, updated_at)| (*id, updated_at.as_str()))
+        .collect();
     let cache_artifacts = rotate_report_items_after_cursor(
         cache_artifacts
             .into_iter()
-            .map(NestCacheArtifactReport::from)
+            .map(|artifact| {
+                let acknowledged =
+                    acknowledged_artifacts.contains(&(artifact.id, artifact.updated_at.as_str()));
+                let mut report = NestCacheArtifactReport::from(artifact);
+                report.acknowledged_closure_manifest_sha256 =
+                    compact_report::compact_entry(&mut report.cache_metadata, acknowledged);
+                report
+            })
             .collect(),
         cache_report_cursor,
         |artifact| artifact.local_id,
@@ -1807,7 +1882,12 @@ async fn report_nest_state(
         .context("report managed nest state request failed")?;
     let response =
         parse_success_json::<NestReportResponse>(response, "report managed nest state").await?;
-    accept_nest_report_response(&response, managed, &body)?;
+    accept_nest_report_response(
+        &response,
+        managed,
+        &body,
+        peer_support.compact.then_some(compact_refresh),
+    )?;
     crate::appliance::nixos::record_manage_contact(
         managed_device_id(managed)?,
         managed
@@ -1821,10 +1901,13 @@ async fn report_nest_state(
     Ok(NestReportReceipt)
 }
 
+/// `compact_refresh` is `Some` for a Manage that supports compact reports:
+/// whether this report's cache lane was the empty refresh.
 fn accept_nest_report_response(
     response: &NestReportResponse,
     managed: &mut ManagedState,
     body: &NestAgentReportRequest,
+    compact_refresh: Option<bool>,
 ) -> Result<()> {
     validate_nest_report_status(response)?;
     // Overall status=ok means Tiaris committed every independently valid
@@ -1832,6 +1915,9 @@ fn accept_nest_report_response(
     // rejection. Advance those accepted pages before surfacing the runtime
     // retry so a persistent runtime problem cannot pin build/cache prefixes.
     advance_nest_report_rotation(managed, body);
+    if let Some(compact_refresh) = compact_refresh {
+        compact_report::record(managed, body, compact_refresh, response);
+    }
     log_nest_report_warnings(&response.warnings, managed);
     validate_workstation_netboot_report_receipt(response)
 }
@@ -2930,6 +3016,8 @@ struct PeerReportSupport {
     site_check: bool,
     boot_machine_identity: bool,
     update_replace: bool,
+    /// Manage says `compact_report_supported` (`compact_report`).
+    compact: bool,
 }
 
 fn nest_capabilities(
@@ -3851,6 +3939,7 @@ mod tests {
             accepts_site_check: true,
             accepts_boot_machine_identity: true,
             accepts_update_replace: true,
+            accepts_compact_report: true,
             runtime_epoch: true,
             report_protocol: TIARIS_DETECTED_COMMITS_PROTOCOL_VERSION,
         };
@@ -5391,6 +5480,7 @@ mod tests {
             site_check: false,
             boot_machine_identity: false,
             update_replace: false,
+            compact: false,
         };
         let legacy = nest_capabilities(false, support(&older));
         let modern = nest_capabilities(false, support(&newer));
@@ -5417,6 +5507,7 @@ mod tests {
             site_check,
             boot_machine_identity: false,
             update_replace: false,
+            compact: false,
         };
         assert!(!nest_capabilities(false, support(false)).contains(&crate::site_check::CAPABILITY));
         assert!(nest_capabilities(false, support(true)).contains(&crate::site_check::CAPABILITY));
@@ -5443,6 +5534,7 @@ mod tests {
             site_check: false,
             boot_machine_identity,
             update_replace: false,
+            compact: false,
         };
         assert!(
             !nest_capabilities(false, support(false)).contains(&crate::boot_machines::CAPABILITY)
@@ -6456,7 +6548,7 @@ mod tests {
         .unwrap();
         let mut managed = ManagedState::default();
 
-        let error = accept_nest_report_response(&response, &mut managed, &body).unwrap_err();
+        let error = accept_nest_report_response(&response, &mut managed, &body, None).unwrap_err();
 
         assert_eq!(
             error.to_string(),
@@ -6602,7 +6694,7 @@ mod tests {
         let body = &source[start..end];
         assert!(body.contains("let (build_jobs, build_listing_valid)"));
         assert!(body.contains("match db::list_cache_artifacts"));
-        assert!(body.contains("match db::cache_inventory_state"));
+        assert!(body.contains("match db::cache_inventory_snapshot"));
         assert!(body.contains("let cache_scrub_valid"));
         assert!(body.contains("(Vec::new(), false, false)"));
         assert!(body.contains("cache_inventory_generation_for_peer("));
@@ -6751,7 +6843,7 @@ mod tests {
         pool
     }
 
-    fn sample_build_job(rejection_code: &str) -> BuildJob {
+    pub(super) fn sample_build_job(rejection_code: &str) -> BuildJob {
         let rejected = !rejection_code.is_empty();
         BuildJob {
             id: 1,
@@ -6786,7 +6878,9 @@ mod tests {
         }
     }
 
-    fn sample_nest_report(build_jobs: Vec<NestBuildJobReport>) -> NestAgentReportRequest {
+    pub(super) fn sample_nest_report(
+        build_jobs: Vec<NestBuildJobReport>,
+    ) -> NestAgentReportRequest {
         NestAgentReportRequest {
             protocol_version: TIARIS_COMPONENT_PROTOCOL_VERSION,
             capabilities: vec![],
@@ -6846,6 +6940,7 @@ mod tests {
             cache_metadata: json!({"path_info": large_metadata}),
             created_at: "2026-08-10T18:00:00Z".to_string(),
             updated_at: "2026-08-10T18:01:00Z".to_string(),
+            acknowledged_closure_manifest_sha256: None,
         }
     }
 
