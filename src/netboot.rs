@@ -3001,6 +3001,13 @@ fn normalize_failure_kind(value: &str) -> &str {
     }
 }
 
+/// How often a served bundle's `last_served_at` is written: a room of
+/// computers starting fetches each file many times (ranges, retries).
+const LAST_SERVED_REFRESH: chrono::Duration = chrono::Duration::minutes(10);
+
+/// Checks that the bundle may be served (verified, of this epoch, active,
+/// previous or held by a live boot session) and hands the file to nginx,
+/// which sends it (`assets::hand_file`).
 pub async fn serve_component(
     State(state): State<AppState>,
     AxumPath((bundle_sha256, component)): AxumPath<(String, String)>,
@@ -3011,67 +3018,71 @@ pub async fn serve_component(
         return Err(AppError::NotFound);
     }
     let now_unix = Utc::now().timestamp();
-    let allowed: (i64,) = sqlx::query_as(
-        "SELECT EXISTS(
-           SELECT 1 FROM workstation_netboot_bundles bundle
-           WHERE bundle.bundle_sha256 = ? AND bundle.retention_state = 'verified'
-             AND bundle.compatibility_epoch = ?
-             AND (
-               EXISTS(
-                 SELECT 1 FROM workstation_netboot_runtime
-                 WHERE singleton_id = 1
-                   AND (bundle.bundle_sha256 = active_bundle_sha256
-                        OR bundle.bundle_sha256 = previous_bundle_sha256)
-               ) OR EXISTS(
-                 SELECT 1 FROM nest_boot_sessions session
-                 WHERE session.bundle_sha256 = bundle.bundle_sha256 AND session.expires_at >= ?
-               )
+    let allowed: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT bundle.last_served_at FROM workstation_netboot_bundles bundle
+         WHERE bundle.bundle_sha256 = ? AND bundle.retention_state = 'verified'
+           AND bundle.compatibility_epoch = ?
+           AND (
+             EXISTS(
+               SELECT 1 FROM workstation_netboot_runtime
+               WHERE singleton_id = 1
+                 AND (bundle.bundle_sha256 = active_bundle_sha256
+                      OR bundle.bundle_sha256 = previous_bundle_sha256)
+             ) OR EXISTS(
+               SELECT 1 FROM nest_boot_sessions session
+               WHERE session.bundle_sha256 = bundle.bundle_sha256 AND session.expires_at >= ?
              )
-         )",
+           )",
     )
     .bind(&bundle_sha256)
     .bind(COMPATIBILITY_EPOCH)
     .bind(now_unix)
-    .fetch_one(&state.db)
+    .fetch_optional(&state.db)
     .await?;
-    if allowed.0 == 0 {
+    let Some((last_served_at,)) = allowed else {
         return Err(AppError::NotFound);
-    }
+    };
     let root = state
         .config
         .paths
         .boot_assets_dir
         .join("netboot")
         .join(&bundle_sha256);
-    let mut response = assets::serve_file_from_root(&root, &component, &headers).await?;
     let content_type = match component.as_str() {
         "bzImage" => "application/vnd.tiaris.kernel",
         "initrd" => "application/vnd.tiaris.initrd",
         "nix-store.squashfs" => "application/vnd.tiaris.squashfs",
         _ => unreachable!("component was allowlisted"),
     };
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        content_type
-            .parse()
-            .map_err(|_| AppError::Config("invalid netboot content type".to_string()))?,
-    );
-    response.headers_mut().insert(
-        header::ETAG,
-        format!("\"{bundle_sha256}-{component}\"")
-            .parse()
-            .map_err(|_| AppError::Config("invalid netboot ETag".to_string()))?,
-    );
-    sqlx::query(
-        "UPDATE workstation_netboot_bundles SET last_served_at = ?, updated_at = ? WHERE bundle_sha256 = ?",
+    // The bundle's name is the hash of its signed descriptor, which fixes
+    // every component's hash: a name never changes content.
+    let response = assets::hand_file(
+        &root,
+        &component,
+        &format!("netboot/{bundle_sha256}/{component}"),
+        &headers,
+        content_type,
+        "public, max-age=31536000, immutable",
     )
-    .bind(now())
-    .bind(now())
-    .bind(&bundle_sha256)
-    .execute(&state.db)
-    .await
-    .ok();
+    .await?;
+    if last_served_is_stale(last_served_at.as_deref(), Utc::now()) {
+        sqlx::query(
+            "UPDATE workstation_netboot_bundles SET last_served_at = ?, updated_at = ? WHERE bundle_sha256 = ?",
+        )
+        .bind(now())
+        .bind(now())
+        .bind(&bundle_sha256)
+        .execute(&state.db)
+        .await
+        .ok();
+    }
     Ok(response)
+}
+
+fn last_served_is_stale(last_served_at: Option<&str>, now: DateTime<Utc>) -> bool {
+    last_served_at
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .is_none_or(|served| now - served.with_timezone(&Utc) >= LAST_SERVED_REFRESH)
 }
 
 pub async fn readiness(State(state): State<AppState>) -> Response {
@@ -3988,6 +3999,65 @@ mod tests {
             report(&fixture.state).await.unwrap().last_verified_at,
             before
         );
+        fixture.cleanup();
+    }
+
+    /// nginx sends the file; the daemon still decides which bundles a
+    /// computer may fetch and writes `last_served_at` once per ten minutes.
+    #[tokio::test]
+    async fn an_allowed_bundle_is_handed_to_nginx_and_a_retired_one_is_not() {
+        let fixture = RuntimeFilesystemFixture::new().await;
+        let active = fixture.install_bundle("2.0.0", &"a".repeat(64)).await;
+        let retired = fixture.install_bundle("1.0.0", &"b".repeat(64)).await;
+        fixture.activate(&active, None).await;
+        let serve = |bundle: &str| {
+            serve_component(
+                State(fixture.state.clone()),
+                AxumPath((bundle.to_string(), "nix-store.squashfs".to_string())),
+                HeaderMap::new(),
+            )
+        };
+        let set_last_served = |minutes_ago: i64| {
+            sqlx::query(
+                "UPDATE workstation_netboot_bundles SET last_served_at = ? WHERE bundle_sha256 = ?",
+            )
+            .bind(
+                (Utc::now() - chrono::Duration::minutes(minutes_ago))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            )
+            .bind(&active.sha256)
+            .execute(&fixture.state.db)
+        };
+        let last_served = || {
+            sqlx::query_scalar::<_, String>(
+                "SELECT last_served_at FROM workstation_netboot_bundles WHERE bundle_sha256 = ?",
+            )
+            .bind(&active.sha256)
+            .fetch_one(&fixture.state.db)
+        };
+
+        let response = serve(&active.sha256).await.unwrap();
+        assert_eq!(
+            response.headers()["x-accel-redirect"],
+            format!("/_tiaris/netboot/{}/nix-store.squashfs", active.sha256).as_str()
+        );
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/vnd.tiaris.squashfs"
+        );
+        set_last_served(9).await.unwrap();
+        let recent = last_served().await.unwrap();
+        serve(&active.sha256).await.unwrap();
+        assert_eq!(last_served().await.unwrap(), recent);
+        set_last_served(10).await.unwrap();
+        let old = last_served().await.unwrap();
+        serve(&active.sha256).await.unwrap();
+        assert_ne!(last_served().await.unwrap(), old);
+
+        assert!(matches!(
+            serve(&retired.sha256).await,
+            Err(AppError::NotFound)
+        ));
         fixture.cleanup();
     }
 

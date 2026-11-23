@@ -18,14 +18,11 @@ use std::{
 };
 
 use anyhow::Result;
-use axum::{
-    http::{StatusCode, header},
-    response::Response,
-};
+use axum::response::Response;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{error::AppError, state_files};
+use crate::{assets::HandedBytes, error::AppError, state_files};
 
 /// State record of the persisted totals, in the data directory.
 const RECORD: &str = "cache-egress.json";
@@ -193,47 +190,35 @@ fn saturating_add(counter: &AtomicU64, delta: u64) {
 /// member; only the latter is a cache miss worth reporting.
 pub fn classify_cache_response(result: &Result<Response, AppError>, path_valid: bool) -> Egress {
     match result {
-        Ok(response) => match response.status() {
-            StatusCode::OK | StatusCode::PARTIAL_CONTENT => {
-                Egress::Served(content_length(response))
-            }
-            _ => Egress::None,
-        },
+        Ok(response) => response
+            .extensions()
+            .get::<HandedBytes>()
+            .map_or(Egress::None, |handed| Egress::Served(handed.0)),
         Err(AppError::NotFound) if path_valid => Egress::Missing,
         Err(_) => Egress::None,
     }
 }
 
-fn content_length(response: &Response) -> u64 {
-    response
-        .headers()
-        .get(header::CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{CacheEgressCounters, CacheEgressSnapshot, Egress, classify_cache_response};
-    use crate::error::AppError;
-    use axum::{
-        body::Body,
-        http::{StatusCode, header},
-        response::Response,
-    };
+    use crate::{assets::HandedBytes, error::AppError};
+    use axum::{body::Body, http::StatusCode, response::Response};
     use chrono::{TimeZone, Utc};
 
     fn counters() -> CacheEgressCounters {
         CacheEgressCounters::starting_at(Utc.with_ymd_and_hms(2026, 9, 3, 12, 34, 56).unwrap())
     }
 
-    fn response(status: StatusCode, content_length: Option<&str>) -> Result<Response, AppError> {
-        let mut builder = Response::builder().status(status);
-        if let Some(length) = content_length {
-            builder = builder.header(header::CONTENT_LENGTH, length);
+    fn response(status: StatusCode, handed: Option<u64>) -> Result<Response, AppError> {
+        let mut response = Response::builder()
+            .status(status)
+            .body(Body::empty())
+            .unwrap();
+        if let Some(bytes) = handed {
+            response.extensions_mut().insert(HandedBytes(bytes));
         }
-        Ok(builder.body(Body::empty()).unwrap())
+        Ok(response)
     }
 
     #[test]
@@ -410,34 +395,18 @@ mod tests {
     }
 
     #[test]
-    fn full_and_partial_responses_count_their_content_length() {
+    fn a_handed_member_counts_the_bytes_nginx_sends_and_nothing_else_counts() {
         assert_eq!(
-            classify_cache_response(&response(StatusCode::OK, Some("4096")), true),
+            classify_cache_response(&response(StatusCode::OK, Some(4096)), true),
             Egress::Served(4096)
         );
         assert_eq!(
-            classify_cache_response(&response(StatusCode::PARTIAL_CONTENT, Some("512")), true),
-            Egress::Served(512)
-        );
-        assert_eq!(
-            classify_cache_response(&response(StatusCode::OK, None), true),
+            classify_cache_response(&response(StatusCode::OK, Some(0)), true),
             Egress::Served(0),
-            "a success without Content-Length still counts the request"
+            "an empty member still counts the request"
         );
-        assert_eq!(
-            classify_cache_response(&response(StatusCode::OK, Some("not-a-number")), true),
-            Egress::Served(0)
-        );
-    }
-
-    #[test]
-    fn unsatisfiable_ranges_and_other_statuses_are_not_counted() {
         assert_eq!(
             classify_cache_response(&response(StatusCode::RANGE_NOT_SATISFIABLE, None), true),
-            Egress::None
-        );
-        assert_eq!(
-            classify_cache_response(&response(StatusCode::NOT_MODIFIED, Some("0")), true),
             Egress::None
         );
     }

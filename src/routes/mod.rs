@@ -167,6 +167,28 @@ pub(crate) fn forwarded_client(headers: &HeaderMap, connect: Option<SocketAddr>)
         .find_map(|part| part.trim().parse::<IpAddr>().ok())
 }
 
+/// The client's own port, which nginx sets from its connection
+/// (`nixos-appliance/nginx.nix`) as it does `X-Forwarded-For`.
+const CLIENT_PORT_HEADER: &str = "x-tiaris-client-port";
+
+/// The client end of the connection nginx served this request on, known only
+/// as `forwarded_client` is.
+pub(crate) fn forwarded_connection(
+    headers: &HeaderMap,
+    connect: Option<SocketAddr>,
+) -> Option<SocketAddr> {
+    let port = headers
+        .get(CLIENT_PORT_HEADER)
+        .and_then(|value| value.to_str().ok())?
+        .trim()
+        .parse::<u16>()
+        .ok()?;
+    Some(SocketAddr::new(
+        forwarded_client(headers, connect)?.to_canonical(),
+        port,
+    ))
+}
+
 /// A request this Nest made to itself, such as its readiness check of the
 /// boot URL: nginx served it to a loopback address, which no computer has.
 /// Only the address decides; a marker such as `tiaris_check=1` never makes a
@@ -871,7 +893,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_route_serves_only_static_binary_cache_members() {
+    async fn cache_route_hands_only_static_binary_cache_members_to_nginx() {
         let state = test_state().await;
         let cache_root = state.config.cache.root_dir.clone();
         let store_hash = "0".repeat(32);
@@ -887,26 +909,22 @@ mod tests {
         fs::write(cache_root.join("cache-priv-key.pem"), b"private-key").unwrap();
         let app = router(state);
 
-        for (path, expected, cache_control) in [
+        for (path, cache_control) in [
+            ("nix-cache-info".to_string(), "public, max-age=60"),
+            (format!("{store_hash}.narinfo"), "public, max-age=60"),
             (
-                "/cache/nix-cache-info".to_string(),
-                b"cache-info".as_slice(),
-                "public, max-age=60",
-            ),
-            (
-                format!("/cache/{store_hash}.narinfo"),
-                b"narinfo".as_slice(),
-                "public, max-age=60",
-            ),
-            (
-                format!("/cache/nar/{file_hash}.nar.xz"),
-                b"compressed-nar".as_slice(),
+                format!("nar/{file_hash}.nar.xz"),
                 "public, max-age=31536000, immutable",
             ),
         ] {
             let response = app
                 .clone()
-                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/cache/{path}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
@@ -915,8 +933,14 @@ mod tests {
                 cache_control
             );
             assert_eq!(
-                &to_bytes(response.into_body(), 1024).await.unwrap()[..],
-                expected
+                response.headers()["x-accel-redirect"],
+                format!("/_tiaris/cache/{path}").as_str()
+            );
+            assert!(
+                to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap()
+                    .is_empty()
             );
         }
 
@@ -931,6 +955,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert!(!response.headers().contains_key("x-accel-redirect"));
         }
     }
 
@@ -968,6 +993,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(full.status(), StatusCode::OK);
+        // nginx applies the range to the file it was handed.
         let partial = app
             .clone()
             .oneshot(get(
@@ -976,7 +1002,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(partial.status(), StatusCode::PARTIAL_CONTENT);
+        assert!(partial.headers().contains_key("x-accel-redirect"));
         let unsatisfiable = app
             .clone()
             .oneshot(get(

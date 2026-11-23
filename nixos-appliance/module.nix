@@ -120,28 +120,7 @@ in {
       settings = { PasswordAuthentication = false; KbdInteractiveAuthentication = false; PermitRootLogin = "no"; PubkeyAuthentication = true; AllowUsers = [ "tiaris-support" ]; TrustedUserCAKeys = "/etc/ssh/tiaris-nest-ca.pub"; AuthorizedPrincipalsFile = "/etc/ssh/tiaris-nest-principals"; AllowAgentForwarding = true; AllowTcpForwarding = "yes"; GatewayPorts = "no"; PermitTunnel = "no"; X11Forwarding = false; };
     };
     systemd.services.sshd = { aliases = [ "ssh.service" ]; requires = [ "tiaris-nest-first-boot.service" "tiaris-nest-firewall.service" ]; after = [ "tiaris-nest-first-boot.service" "tiaris-nest-firewall.service" ]; };
-    services.nginx = {
-      enable = true;
-      defaultListenAddresses = [ "0.0.0.0" ];
-      virtualHosts."_" = {
-        default = true;
-        # The daemon tells a computer from the Nest's own readiness check by
-        # this address (src/routes/mod.rs, `is_own_request`); it replaces
-        # whatever the client sent.
-        extraConfig = "proxy_set_header X-Forwarded-For $remote_addr;";
-        locations."/".proxyPass = "http://127.0.0.1:8080";
-        locations."~ \"^/boot-session/[A-Za-z0-9_-]{22}/context\\.cpio$\"" = { proxyPass = "http://127.0.0.1:8080"; extraConfig = "access_log off;"; };
-        locations."= /files/assets/pxe-menu.png".alias = "${a.package}/share/tiaris-nest/assets/pxe-menu.png";
-        locations."~ \"^/manage-source/(?<source_file>[0-9a-f]{40}\\.(?:tar|json))$\"" = { alias = "/usr/share/tiaris-nest/manage-source/$source_file"; extraConfig = ''
-          autoindex off;
-          disable_symlinks on;
-          limit_except GET { deny all; }
-          add_header Cache-Control "public, max-age=31536000, immutable";
-          add_header X-Content-Type-Options "nosniff";
-        ''; };
-        locations."/assets/" = { alias = "/var/cache/tiaris-nest/www/assets/"; extraConfig = "autoindex off;"; };
-      };
-    };
+    services.nginx = import ./nginx.nix { pxeMenu = "${a.package}/share/tiaris-nest/assets/pxe-menu.png"; };
     systemd.services.nginx = { after = [ "tiaris-nest-first-boot.service" ]; requires = [ "tiaris-nest-first-boot.service" ]; };
     systemd.tmpfiles.rules = [
       "d /var/lib/tiaris-nest 0750 root tiaris-nest -"
@@ -156,6 +135,9 @@ in {
       "d /var/cache/tiaris-nest/www/cache 0755 tiaris-nest tiaris-nest -"
       "d /var/cache/tiaris-nest/www/cache/nar 0755 tiaris-nest tiaris-nest -"
       "d /var/cache/tiaris-nest/www/cache/realisations 0755 tiaris-nest tiaris-nest -"
+      # nginx sends the verified runtime bundles below it (nginx.nix); the
+      # daemon's staging tree inside stays 0700.
+      "d /var/cache/tiaris-nest/www/netboot 0755 tiaris-nest tiaris-nest -"
       "d /run/lock/tiaris-nest 0750 root tiaris-nest -"
       "f /run/lock/tiaris-nest/maintenance.lock 0660 root tiaris-nest -"
       "d /etc/tiaris-nest 0755 root root -"
