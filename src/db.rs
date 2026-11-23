@@ -1241,19 +1241,29 @@ pub async fn list_build_jobs(pool: &SqlitePool) -> AppResult<Vec<BuildJob>> {
 /// materializing every potentially MiB-sized build specification and metadata
 /// document. Local-only jobs are excluded because Tiaris cannot correlate or
 /// consume them.
+///
+/// `settled` lists `(id, updated_at)` of terminal jobs whose result Manage
+/// settled: they stay out of the page until they change.
+#[allow(clippy::too_many_arguments)]
 pub async fn list_build_jobs_report_page(
     pool: &SqlitePool,
     active_cursor: Option<i64>,
     rejection_cursor: Option<i64>,
     terminal_cursor: Option<i64>,
     priority_round: u8,
+    settled: &[(i64, String)],
     max_items: usize,
     estimated_byte_budget: usize,
 ) -> AppResult<Vec<BuildJob>> {
     let max_items = max_items.max(1).min(i64::MAX as usize) as i64;
     let estimated_byte_budget = estimated_byte_budget.max(1).min(i64::MAX as usize) as i64;
+    let settled = json!(settled).to_string();
     let rows = sqlx::query_as::<_, BuildJobRow>(
-        r#"WITH classified AS (
+        r#"WITH settled AS MATERIALIZED (
+               SELECT json_extract(value, '$[0]') AS id,
+                      json_extract(value, '$[1]') AS updated_at
+               FROM json_each(?7)
+           ), classified AS (
                SELECT id,
                       CASE
                           WHEN status NOT IN ('succeeded', 'failed', 'cancelled') THEN 0
@@ -1276,6 +1286,11 @@ pub async fn list_build_jobs_report_page(
                       ) AS estimated_bytes
                FROM nest_build_jobs
                WHERE managed_job_id IS NOT NULL
+                 AND NOT EXISTS (
+                     SELECT 1 FROM settled
+                     WHERE settled.id = nest_build_jobs.id
+                       AND settled.updated_at = nest_build_jobs.updated_at
+                 )
            ), rotated AS (
                SELECT *,
                       CASE report_group
@@ -1323,6 +1338,7 @@ pub async fn list_build_jobs_report_page(
     .bind(i64::from(priority_round))
     .bind(max_items)
     .bind(estimated_byte_budget)
+    .bind(settled)
     .fetch_all(pool)
     .await?;
     build_job_rows_to_models(rows)
@@ -2077,39 +2093,73 @@ pub async fn list_cache_artifacts(pool: &SqlitePool) -> AppResult<Vec<CacheArtif
 /// performs exact streaming JSON measurement, but this query keeps the
 /// preflight working set bounded when individual metadata documents approach
 /// the 24 MiB persistence limit.
+///
+/// `acknowledged` lists `(id, updated_at)` of artifacts whose closure evidence
+/// Manage acknowledged: unchanged since, they come without `closure_manifest`
+/// (and are charged without it), which keeps a whole inventory on one page.
 pub async fn list_cache_artifacts_report_page(
     pool: &SqlitePool,
     cursor: Option<i64>,
+    acknowledged: &[(i64, String)],
     max_items: usize,
     estimated_byte_budget: usize,
 ) -> AppResult<(Vec<CacheArtifact>, bool)> {
     let max_items = max_items.max(1).min(i64::MAX as usize) as i64;
     let estimated_byte_budget = estimated_byte_budget.max(1).min(i64::MAX as usize) as i64;
+    let acknowledged = json!(acknowledged).to_string();
     let rows = sqlx::query_as::<_, CacheArtifactRow>(
-        r#"WITH ranked AS (
-               SELECT id,
+        r#"WITH acknowledged AS MATERIALIZED (
+               SELECT json_extract(value, '$[0]') AS id,
+                      json_extract(value, '$[1]') AS updated_at
+               FROM json_each(?4)
+           ), reported AS MATERIALIZED (
+               SELECT artifact.id,
+                      CASE
+                          WHEN acknowledged.id IS NOT NULL
+                           AND json_type(artifact.cache_metadata, '$.closure_manifest') IS NOT NULL
+                          THEN json_remove(artifact.cache_metadata, '$.closure_manifest')
+                          ELSE artifact.cache_metadata
+                      END AS cache_metadata
+               FROM nest_cache_artifacts artifact
+               LEFT JOIN acknowledged
+                 ON acknowledged.id = artifact.id
+                AND acknowledged.updated_at = artifact.updated_at
+               WHERE ?1 IS NULL OR artifact.id < ?1
+           ), ranked AS (
+               SELECT artifact.id,
                       ROW_NUMBER() OVER (
-                          ORDER BY id DESC
+                          ORDER BY artifact.id DESC
                       ) AS report_position,
                       SUM(
                           2048 + 4 * (
-                              LENGTH(COALESCE(managed_artifact_id, '')) +
-                              LENGTH(artifact_type) + LENGTH(hash) + LENGTH(path) +
-                              LENGTH(store_path) + LENGTH(narinfo_path) + LENGTH(nar_url) +
-                              LENGTH(file_hash) + LENGTH(nar_hash) + LENGTH(compression) +
-                              LENGTH(references_json) + LENGTH(serving_url) +
-                              LENGTH(COALESCE(source_build_job_id, '')) +
-                              LENGTH(cache_metadata) + LENGTH(created_at) + LENGTH(updated_at)
+                              LENGTH(COALESCE(artifact.managed_artifact_id, '')) +
+                              LENGTH(artifact.artifact_type) + LENGTH(artifact.hash) +
+                              LENGTH(artifact.path) + LENGTH(artifact.store_path) +
+                              LENGTH(artifact.narinfo_path) + LENGTH(artifact.nar_url) +
+                              LENGTH(artifact.file_hash) + LENGTH(artifact.nar_hash) +
+                              LENGTH(artifact.compression) + LENGTH(artifact.references_json) +
+                              LENGTH(artifact.serving_url) +
+                              LENGTH(COALESCE(artifact.source_build_job_id, '')) +
+                              LENGTH(reported.cache_metadata) + LENGTH(artifact.created_at) +
+                              LENGTH(artifact.updated_at)
                           )
                       ) OVER (
-                          ORDER BY id DESC
+                          ORDER BY artifact.id DESC
                       ) AS cumulative_bytes
-               FROM nest_cache_artifacts
-               WHERE ?1 IS NULL OR id < ?1
+               FROM reported
+               JOIN nest_cache_artifacts artifact ON artifact.id = reported.id
            )
-           SELECT artifact.*
+           SELECT artifact.id, artifact.managed_artifact_id, artifact.artifact_type,
+                  artifact.hash, artifact.size_bytes, artifact.path, artifact.store_path,
+                  artifact.narinfo_path, artifact.nar_url, artifact.file_hash,
+                  artifact.nar_hash, artifact.nar_size_bytes, artifact.closure_size_bytes,
+                  artifact.closure_file_size_bytes, artifact.compression,
+                  artifact.references_json, artifact.serving_url,
+                  artifact.source_build_job_id, reported.cache_metadata,
+                  artifact.created_at, artifact.updated_at
            FROM ranked
            JOIN nest_cache_artifacts artifact ON artifact.id = ranked.id
+           JOIN reported ON reported.id = ranked.id
            WHERE ranked.report_position = 1
               OR (ranked.report_position <= ?2 AND ranked.cumulative_bytes <= ?3)
            ORDER BY artifact.id DESC"#,
@@ -2117,6 +2167,7 @@ pub async fn list_cache_artifacts_report_page(
     .bind(cursor)
     .bind(max_items)
     .bind(estimated_byte_budget)
+    .bind(acknowledged)
     .fetch_all(pool)
     .await?;
     let remaining: i64 =
@@ -2142,6 +2193,27 @@ pub async fn cache_inventory_state(pool: &SqlitePool) -> AppResult<CacheInventor
     .fetch_one(pool)
     .await
     .map_err(AppError::from)
+}
+
+/// The inventory identity with what the report sees of each artifact: its id
+/// and when its reported content last changed, read together. The integrity
+/// check's own bookkeeping advances the generation but changes neither.
+pub async fn cache_inventory_snapshot(
+    pool: &SqlitePool,
+) -> AppResult<(CacheInventoryState, Vec<(i64, String)>)> {
+    let mut tx = pool.begin().await?;
+    let state = sqlx::query_as::<_, CacheInventoryState>(
+        "SELECT instance_id, generation FROM cache_inventory_state WHERE singleton = 1",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    let members = sqlx::query_as::<_, (i64, String)>(
+        "SELECT id, updated_at FROM nest_cache_artifacts ORDER BY id",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok((state, members))
 }
 
 pub async fn replace_managed_cache_protections(
@@ -5473,7 +5545,7 @@ mod tests {
         let mut first_traversal = Vec::new();
         let mut first_complete = false;
         for _ in 0..10 {
-            let (page, complete) = list_cache_artifacts_report_page(&pool, cursor, 10, 20_000)
+            let (page, complete) = list_cache_artifacts_report_page(&pool, cursor, &[], 10, 20_000)
                 .await
                 .unwrap();
             assert_eq!(page.len(), 1, "the byte budget must bound each page");
@@ -5500,7 +5572,7 @@ mod tests {
         // cursor, so losing the exact row never resets a page to the newest
         // prefix.
         let (after_deleted_cursor, _) =
-            list_cache_artifacts_report_page(&pool, Some(deleted_cursor), 10, 20_000)
+            list_cache_artifacts_report_page(&pool, Some(deleted_cursor), &[], 10, 20_000)
                 .await
                 .unwrap();
         assert_eq!(after_deleted_cursor.len(), 1);
@@ -5514,7 +5586,7 @@ mod tests {
         let mut second_traversal = Vec::new();
         let mut second_complete = false;
         for _ in 0..10 {
-            let (page, complete) = list_cache_artifacts_report_page(&pool, cursor, 10, 20_000)
+            let (page, complete) = list_cache_artifacts_report_page(&pool, cursor, &[], 10, 20_000)
                 .await
                 .unwrap();
             assert!(!page.is_empty());
@@ -5579,18 +5651,19 @@ mod tests {
         .await
         .unwrap();
 
-        let active = list_build_jobs_report_page(&pool, None, None, None, 0, 1, 1_000_000)
+        let active = list_build_jobs_report_page(&pool, None, None, None, 0, &[], 1, 1_000_000)
             .await
             .unwrap();
-        let terminal = list_build_jobs_report_page(&pool, None, None, None, 1, 1, 1_000_000)
+        let terminal = list_build_jobs_report_page(&pool, None, None, None, 1, &[], 1, 1_000_000)
             .await
             .unwrap();
-        let rejected = list_build_jobs_report_page(&pool, None, None, None, 2, 1, 1_000_000)
+        let rejected = list_build_jobs_report_page(&pool, None, None, None, 2, &[], 1, 1_000_000)
             .await
             .unwrap();
-        let cache_round = list_build_jobs_report_page(&pool, None, None, None, 3, 1, 1_000_000)
-            .await
-            .unwrap();
+        let cache_round =
+            list_build_jobs_report_page(&pool, None, None, None, 3, &[], 1, 1_000_000)
+                .await
+                .unwrap();
 
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].status, "queued");
@@ -5601,5 +5674,85 @@ mod tests {
         assert_eq!(rejected[0].rejection_code, "protected_material");
         assert_eq!(cache_round.len(), 1);
         assert_eq!(cache_round[0].status, "queued");
+
+        // A terminal result Manage settled stays out until the job changes.
+        let settled = [(managed[2].id, terminal[0].updated_at.clone())];
+        let page = list_build_jobs_report_page(&pool, None, None, None, 1, &settled, 8, 1_000_000)
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 2);
+        assert!(page.iter().all(|job| job.id != managed[2].id));
+        sqlx::query("UPDATE nest_build_jobs SET updated_at = ? WHERE id = ?")
+            .bind(now_rfc3339())
+            .bind(managed[2].id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let page = list_build_jobs_report_page(&pool, None, None, None, 1, &settled, 8, 1_000_000)
+            .await
+            .unwrap();
+        assert!(page.iter().any(|job| job.id == managed[2].id));
+    }
+
+    #[tokio::test]
+    async fn acknowledged_artifacts_are_listed_without_their_closure_manifest() {
+        let pool = test_pool().await;
+        for index in 1..=4 {
+            let hash = format!("{index:x}").repeat(64);
+            upsert_cache_artifact(
+                &pool,
+                None,
+                "nixos_closure",
+                &hash,
+                1,
+                &format!("/cache/nar/{index}.nar.zst"),
+                &format!("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa{index}-example"),
+                &format!("/cache/{index}.narinfo"),
+                &format!("nar/{index}.nar.zst"),
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                1,
+                1,
+                1,
+                "zstd",
+                Some(json!([])),
+                &format!("https://nest.test/cache/nar/{index}.nar.zst"),
+                None,
+                Some(json!({
+                    "closure_manifest": {"padding": "x".repeat(16_384)},
+                    "closure_manifest_sha256": hash,
+                })),
+            )
+            .await
+            .unwrap();
+        }
+        let (_, members) = cache_inventory_snapshot(&pool).await.unwrap();
+        assert_eq!(members.len(), 4);
+        // With its manifests each artifact needs a page of its own; without,
+        // the whole inventory completes on one.
+        let (page, complete) = list_cache_artifacts_report_page(&pool, None, &[], 10, 20_000)
+            .await
+            .unwrap();
+        assert_eq!((page.len(), complete), (1, false));
+        let (page, complete) = list_cache_artifacts_report_page(&pool, None, &members, 10, 20_000)
+            .await
+            .unwrap();
+        assert_eq!((page.len(), complete), (4, true));
+        assert!(page.iter().all(|artifact| {
+            artifact.cache_metadata.get("closure_manifest").is_none()
+                && artifact.cache_metadata["closure_manifest_sha256"] == json!(artifact.hash)
+        }));
+        // An artifact that changed since Manage acknowledged it comes whole.
+        let mut changed = members.clone();
+        changed[0].1 = "before it changed".into();
+        let (page, _) = list_cache_artifacts_report_page(&pool, None, &changed, 10, 1_000_000)
+            .await
+            .unwrap();
+        let whole: Vec<i64> = page
+            .iter()
+            .filter(|artifact| artifact.cache_metadata.get("closure_manifest").is_some())
+            .map(|artifact| artifact.id)
+            .collect();
+        assert_eq!(whole, vec![members[0].0]);
     }
 }
