@@ -1448,6 +1448,8 @@ async fn apply_nest_desired(
         if !crate::appliance::nixos::queue(update) {
             debug!("coalesced the latest appliance update behind the in-flight download");
         }
+    } else if let Err(error) = crate::appliance::nixos::discard_abandoned_partials() {
+        debug!(error = %error, "could not remove abandoned appliance update downloads");
     }
 
     let build_count_valid = desired.build_jobs.len() <= MAX_MANAGED_BUILD_JOBS;

@@ -38,6 +38,8 @@ use crate::{
 pub mod prepare;
 #[path = "netboot_transport.rs"]
 mod transport;
+#[path = "netboot_quarantine.rs"]
+mod quarantine;
 
 pub const DESCRIPTOR_SCHEMA: &str = "tiaris.nest.workstation-netboot.v1";
 pub const MANIFEST_SCHEMA: &str = "tiaris.nest.workstation-netboot-manifest.v1";
@@ -2371,6 +2373,7 @@ async fn maintain_once(state: &AppState) -> Result<()> {
     cleanup_expired_sessions(state).await?;
     scrub_due_bundles(state).await?;
     prune_expired_bundles(state).await?;
+    quarantine::prune(state, Utc::now()).await?;
     Ok(())
 }
 
@@ -4274,6 +4277,58 @@ mod tests {
         .unwrap();
         assert_eq!(prune_expired_bundles(&fixture.state).await.unwrap(), 1);
         kept(&[&active, &previous, &session, &desired]).await;
+        fixture.cleanup();
+    }
+
+    /// A quarantined tree stays a week for diagnosis, then goes with its row;
+    /// one without a row (found where a new tree went) goes a week after its
+    /// quarantine too.
+    #[tokio::test]
+    async fn quarantined_trees_go_after_a_week() {
+        let fixture = RuntimeFilesystemFixture::new().await;
+        let old = fixture.install_bundle("1.0.1", &"b".repeat(64)).await;
+        let fresh = fixture.install_bundle("1.0.2", &"c".repeat(64)).await;
+        for bundle in [&old, &fresh] {
+            let root = fixture.bundle_root(bundle);
+            quarantine_bundle(&fixture.state, &bundle.sha256, root.to_str().unwrap())
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "UPDATE workstation_netboot_bundles SET quarantined_at = ? WHERE bundle_sha256 = ?",
+        )
+        .bind(
+            (Utc::now() - chrono::Duration::days(8))
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        )
+        .bind(&old.sha256)
+        .execute(&fixture.state.db)
+        .await
+        .unwrap();
+        let quarantine_root = fixture.root.join("www/netboot-quarantine");
+        let orphan = quarantine_root.join(format!("{}.{}", "d".repeat(64), "e".repeat(32)));
+        fs::create_dir_all(orphan.join("boot")).unwrap();
+        let rows = || {
+            let db = fixture.state.db.clone();
+            async move {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT bundle_sha256 FROM workstation_netboot_bundles ORDER BY bundle_sha256",
+                )
+                .fetch_all(&db)
+                .await
+                .unwrap()
+            }
+        };
+        let trees = || fs::read_dir(&quarantine_root).unwrap().count();
+
+        assert_eq!(quarantine::prune(&fixture.state, Utc::now()).await.unwrap(), 1);
+        assert_eq!(rows().await, vec![fresh.sha256.clone()]);
+        assert_eq!(trees(), 2);
+
+        let later = Utc::now() + chrono::Duration::days(8);
+        assert_eq!(quarantine::prune(&fixture.state, later).await.unwrap(), 2);
+        assert!(rows().await.is_empty());
+        assert_eq!(trees(), 0);
         fixture.cleanup();
     }
 
