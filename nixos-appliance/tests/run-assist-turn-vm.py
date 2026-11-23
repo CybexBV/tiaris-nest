@@ -33,13 +33,19 @@ def boot(preflight, work, arguments, report):
     work = Path(work)
     (work / "tmp").mkdir()
     (work / "out").mkdir()
-    env = {**os.environ, "TMPDIR": str(work / "tmp"), "XDG_RUNTIME_DIR": str(work),
-           "PYTHONUNBUFFERED": "1"}
+    env = {**os.environ, "TMPDIR": str(work / "tmp"), "PYTHONUNBUFFERED": "1"}
     run_phase(["nix-build", str(TEST), *preflight.nix_args(arguments), "-A", "driver",
                "--out-link", str(work / "driver")], work, env, 3600)
     preflight.memory_gate(report)
-    run_phase([str(work / "driver/bin/nixos-test-driver"), "--output_directory", str(work / "out")],
-              work, env, 480)
+    # Unix socket names have a 108-byte limit. A procfs name keeps the
+    # driver and QEMU paths short while the actual files stay on the lease.
+    fd = os.open(work, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        env["XDG_RUNTIME_DIR"] = f"/proc/{os.getpid()}/fd/{fd}"
+        run_phase([str(work / "driver/bin/nixos-test-driver"), "--output_directory", str(work / "out")],
+                  work, env, 480)
+    finally:
+        os.close(fd)
 
 
 def main():
