@@ -590,3 +590,20 @@ fn hosts_are_names_or_addresses() {
         assert!(!valid_host(invalid), "{invalid}");
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn the_first_check_starts_once_the_start_has_settled() {
+    let asked = std::cell::Cell::new(0);
+    let started = tokio::time::Instant::now();
+    first_check_wait(|| {
+        asked.set(asked.get() + 1);
+        asked.get() > 3
+    })
+    .await;
+    assert_eq!(started.elapsed(), 3 * SETTLED_POLL);
+    // A start that never settles (time servers blocked) checks after a
+    // minute, as before.
+    let started = tokio::time::Instant::now();
+    first_check_wait(|| false).await;
+    assert_eq!(started.elapsed(), START_DELAY);
+}

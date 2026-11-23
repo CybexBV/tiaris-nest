@@ -16,9 +16,12 @@ machine-readable reason, a short detail and a plain-English remedy.
 
 ## When it runs
 
-A minute after the service starts, every six hours, every 15 minutes while a
-check does not pass, and when Manage asks ("Check again", the configuration's
-`site_check.requested_at`), at most once a minute.
+After the service starts, as soon as the Nest has reached Tiaris, its clock
+is set and it answers network starts (at the latest a minute after the
+start, so a check right after a start does not fail on the start itself);
+then every six hours, every 15 minutes while a check does not pass, and when
+Manage asks ("Check again", the configuration's `site_check.requested_at`),
+at most once a minute.
 
 ## Network boot evidence
 
