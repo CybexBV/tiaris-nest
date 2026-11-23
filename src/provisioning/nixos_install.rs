@@ -220,8 +220,8 @@ fn verify_members(
     if fs::symlink_metadata(cache).is_ok() {
         fs::remove_dir_all(cache)?;
     }
-    let verified = members::open_staged(Path::new(STAGED_MEMBERS), release).and_then(
-        |(stream, limit)| {
+    let verified =
+        members::open_staged(Path::new(STAGED_MEMBERS), release).and_then(|(stream, limit)| {
             closure::verify_staged(
                 stream,
                 limit,
@@ -231,8 +231,7 @@ fn verify_members(
                 members.present(),
                 |_, _, _| Ok(()),
             )
-        },
-    );
+        });
     let _ = fs::remove_file(STAGED_MEMBERS);
     Ok(StagedClosure::Members {
         manifest: verified?.manifest,

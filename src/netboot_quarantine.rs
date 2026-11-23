@@ -91,7 +91,10 @@ fn quarantined_tree<'a>(root: &Path, tree: &'a Path) -> Option<&'a str> {
     }
     let (sha256, id) = tree.file_name()?.to_str()?.split_once('.')?;
     let hex = |value: &str, length: usize| {
-        value.len() == length && value.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        value.len() == length
+            && value
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
     };
     (hex(sha256, 64) && hex(id, 32)).then_some(sha256)
 }

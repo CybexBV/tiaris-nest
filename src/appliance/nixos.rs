@@ -573,7 +573,9 @@ pub fn discard_abandoned_partials() -> Result<()> {
         return Ok(());
     }
     let cutoff = std::time::SystemTime::now() - ABANDONED_PARTIAL;
-    discard_partials(Path::new(UPDATE_BUNDLE_ROOT), |_, modified| modified < cutoff)
+    discard_partials(Path::new(UPDATE_BUNDLE_ROOT), |_, modified| {
+        modified < cutoff
+    })
 }
 
 /// Remove the partial download files in `directory` that `remove` picks,

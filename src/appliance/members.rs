@@ -600,7 +600,10 @@ fn held(manifest: &closure::ClosureManifest, present: &Present, closed: bool) ->
         .filter(|path| present.get(&path.path) == Some(&path.nar_hash))
         .map(|path| (path.path.clone(), path.nar_hash.clone()))
         .collect();
-    while closed {
+    if !closed {
+        return held;
+    }
+    loop {
         let open: Vec<String> = manifest
             .store_paths
             .iter()
@@ -674,11 +677,15 @@ async fn fetch_member(plan: &Plan, file: &File, wanted: &Wanted, at: u64) -> Res
     let mut got = wanted.offset;
     let mut cursor = at;
     plan.source
-        .fill(&mut got, wanted.offset + 512 + info.file_size, &mut |bytes| {
-            file.write_all_at(bytes, cursor)?;
-            cursor += bytes.len() as u64;
-            Ok(())
-        })
+        .fill(
+            &mut got,
+            wanted.offset + 512 + info.file_size,
+            &mut |bytes| {
+                file.write_all_at(bytes, cursor)?;
+                cursor += bytes.len() as u64;
+                Ok(())
+            },
+        )
         .await?;
     verify_entry(file, at, wanted, plan)?;
     let padding = info.file_size.div_ceil(512) * 512 - info.file_size;

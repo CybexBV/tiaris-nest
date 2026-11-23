@@ -72,7 +72,11 @@ mod tests {
     fn an_acknowledgement_holds_one_digest_for_six_hours() {
         let at = Instant::now();
         let acknowledged = ("a".repeat(64), at);
-        assert!(held(Some(&acknowledged), &"a".repeat(64), at + Duration::from_secs(60)));
+        assert!(held(
+            Some(&acknowledged),
+            &"a".repeat(64),
+            at + Duration::from_secs(60)
+        ));
         assert!(!held(Some(&acknowledged), &"b".repeat(64), at));
         assert!(!held(Some(&acknowledged), &"a".repeat(64), at + LASTS));
         assert!(!held(None, &"a".repeat(64), at));

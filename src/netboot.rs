@@ -36,10 +36,10 @@ use crate::{
 
 #[path = "netboot_prepare.rs"]
 pub mod prepare;
-#[path = "netboot_transport.rs"]
-mod transport;
 #[path = "netboot_quarantine.rs"]
 mod quarantine;
+#[path = "netboot_transport.rs"]
+mod transport;
 
 pub const DESCRIPTOR_SCHEMA: &str = "tiaris.nest.workstation-netboot.v1";
 pub const MANIFEST_SCHEMA: &str = "tiaris.nest.workstation-netboot-manifest.v1";
@@ -4391,7 +4391,10 @@ mod tests {
         };
         let trees = || fs::read_dir(&quarantine_root).unwrap().count();
 
-        assert_eq!(quarantine::prune(&fixture.state, Utc::now()).await.unwrap(), 1);
+        assert_eq!(
+            quarantine::prune(&fixture.state, Utc::now()).await.unwrap(),
+            1
+        );
         assert_eq!(rows().await, vec![fresh.sha256.clone()]);
         assert_eq!(trees(), 2);
 

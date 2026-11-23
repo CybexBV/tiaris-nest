@@ -624,10 +624,7 @@ async fn prepare_approved_plan(
     status: &SetupStatusReporter,
     prefetch: &mut closure_prefetch::ClosurePrefetch,
 ) -> std::result::Result<
-    (
-        NestProvisioningInventory,
-        nixos_install::StagedClosure,
-    ),
+    (NestProvisioningInventory, nixos_install::StagedClosure),
     PreDestructiveFailure,
 > {
     status.step(InstallStep::StageRelease);

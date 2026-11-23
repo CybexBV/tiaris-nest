@@ -920,15 +920,15 @@ async fn wait_for_next_sync<F, Fut>(
 /// unanswered question is no work: the regular sync still comes.
 async fn new_build_work(state: &AppState) -> bool {
     // A question that hangs never holds back the regular sync for long.
-    let work =
-        match tokio::time::timeout(BUILD_WORK_PROBE_INTERVAL, probe_build_work(state)).await {
-            Ok(Ok(work)) => work,
-            Ok(Err(error)) => {
-                debug!(error = %safe_error(&error), "could not ask Tiaris for queued build work");
-                return false;
-            }
-            Err(_) => return false,
-        };
+    let work = match tokio::time::timeout(BUILD_WORK_PROBE_INTERVAL, probe_build_work(state)).await
+    {
+        Ok(Ok(work)) => work,
+        Ok(Err(error)) => {
+            debug!(error = %safe_error(&error), "could not ask Tiaris for queued build work");
+            return false;
+        }
+        Err(_) => return false,
+    };
     if new_appliance_update(work.appliance_update_attempt_id) {
         return true;
     }
@@ -1469,8 +1469,10 @@ async fn apply_nest_desired(
     }
     *KNOWN_APPLIANCE_UPDATE
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-        desired.appliance_update.as_ref().map(|update| update.attempt_id);
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = desired
+        .appliance_update
+        .as_ref()
+        .map(|update| update.attempt_id);
     if let Some(update) = desired.appliance_update {
         // Queued first: the update waits for it before the restart.
         if let Some(prepare) = desired.workstation_netboot_prepare {
