@@ -85,8 +85,8 @@ fn valid_config(config: &Config) -> bool {
     }
     config.port == Some(PORT)
         && config.relay_ports == Some(RELAY_PORTS)
-        && config.max_bps == Some(3_000_000)
-        && config.bps_capacity == Some(30_000_000)
+        && config.max_bps == Some(500_000)
+        && config.bps_capacity == Some(5_000_000)
         && config.total_quota == Some(40)
         && config.user_quota == Some(2)
         && config.secrets.as_ref().is_some_and(|secrets| {

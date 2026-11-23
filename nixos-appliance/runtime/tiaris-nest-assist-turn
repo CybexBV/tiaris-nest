@@ -26,8 +26,8 @@ UNIT = 'tiaris-nest-turn.service'
 TABLE = 'tiaris_nest_turn'
 REALM = 'tiaris-assist'
 SCHEMA = 'tiaris.nest.assist-turn.v1'
-SETTINGS = dict(port=3478, relay_ports=[61000, 61040], max_bps=3000000,
-                bps_capacity=30000000, total_quota=40, user_quota=2)
+SETTINGS = dict(port=3478, relay_ports=[61000, 61040], max_bps=500_000,
+                bps_capacity=5_000_000, total_quota=40, user_quota=2)
 PRIVATE = tuple(map(ipaddress.IPv4Network, ('10.0.0.0/8', '172.16.0.0/12',
                                             '192.168.0.0/16', '100.64.0.0/10')))
 
@@ -107,8 +107,8 @@ denied-peer-ip=224.0.0.0-255.255.255.255
 denied-peer-ip={address}
 user-quota=2
 total-quota=40
-max-bps=3000000
-bps-capacity=30000000
+max-bps={SETTINGS['max_bps']}
+bps-capacity={SETTINGS['bps_capacity']}
 stale-nonce=600
 pidfile={PID}
 log-file=stdout
