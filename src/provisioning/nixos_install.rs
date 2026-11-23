@@ -241,15 +241,27 @@ fn verify_members(
 }
 
 /// Copy the ISO's own members of the closure, with their closures (all
-/// left out too: `members::plan_install`), into the target store. Each
-/// member's NARInfo signature was checked with the metadata and its signed
-/// NAR hash matched the one the ISO's store records; Nix hashes every NAR as
-/// it copies it and refuses one that differs from that record. The ISO's
-/// store carries no release signature, so Nix is not asked for one here.
-async fn copy_iso_members(iso: &closure::Present) -> Result<()> {
+/// left out too: `members::plan_install`), into the target store, checked as
+/// the fetched members are: first the release's signatures from the
+/// verified NARInfos onto the ISO's paths (Nix takes one only for the same
+/// NAR hash, size and references), then a copy that requires the release
+/// key and hashes every NAR against its record. The installed store then
+/// holds every member signed, as from the archive.
+async fn copy_iso_members(iso: &closure::Present, trust: &str) -> Result<()> {
     if iso.is_empty() {
         return Ok(());
     }
+    let cache = format!("file://{MEMBERS_CACHE}");
+    let mut arguments = vec![
+        "--extra-experimental-features",
+        "nix-command",
+        "store",
+        "copy-sigs",
+        "--substituter",
+        &cache,
+    ];
+    arguments.extend(iso.keys().map(String::as_str));
+    storage::run_checked("nix", &arguments).await?;
     let target = format!("local?root={TARGET}");
     let mut arguments = vec![
         "--extra-experimental-features",
@@ -257,8 +269,10 @@ async fn copy_iso_members(iso: &closure::Present) -> Result<()> {
         "--option",
         "substituters",
         "",
+        "--option",
+        "trusted-public-keys",
+        trust,
         "copy",
-        "--no-check-sigs",
         "--to",
         &target,
     ];
@@ -530,7 +544,7 @@ pub(super) async fn install(
         }
         StagedClosure::Members { manifest, iso } => {
             nixos::ensure_space(target, manifest.total_nar_bytes)?;
-            copy_iso_members(iso).await?;
+            copy_iso_members(iso, &trust).await?;
             PathBuf::from(MEMBERS_CACHE)
         }
     };

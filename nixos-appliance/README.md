@@ -211,10 +211,11 @@ of `/run/current-system` with the signed NAR hash. Setup from the ISO does the s
 with the ISO's own store (`nixos_install::stage_members`; 571 of 1149 members,
 1,186 of 1,727 MiB for 0.2.182-dev.1): it leaves out only members whose whole
 closure (the signed reference graph) the ISO holds, fetches the rest into RAM,
-verifies them once before the disk is touched, copies the ISO's members into the
-target store (Nix hashes each NAR against the ISO's record, which matched the signed
-NAR hash; the ISO's store carries no release signature, so that copy runs with
-`--no-check-sigs`) and then the rest from the verified cache with the release key.
+verifies them once before the disk is touched, puts the release's signatures from
+the verified NARInfos onto the ISO's paths (`nix store copy-sigs`: only for the same
+NAR hash, size and references), copies those into the target store with the release
+key required (Nix hashes every NAR as it copies it) and then the rest from the
+verified cache the same way.
 The full archive stays the way for an archive packed before this layout, when more
 than half of its members and of its bytes are new, and when the server does not
 answer byte ranges or sends bytes that do not verify.
