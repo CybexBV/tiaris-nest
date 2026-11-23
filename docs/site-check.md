@@ -14,6 +14,17 @@ machine-readable reason, a short detail and a plain-English remedy.
 | `software_cache` | The same for the software cache Manage names (`site_check.software_cache_url`). Where the cache is off Manage names none, computers never use the host, and the check is `not_applicable` (`software_cache_off`) | the same |
 | `directory` | LDAPS with a certificate computers trust (public roots plus the private CA Manage holds), when the organization uses a directory | `unreachable`, `certificate_untrusted`, `certificate_mismatch`, `certificate_expired`, `tls_failed` |
 
+## Link speed
+
+The Nest's own link speed is not one of the checks: a slow link is not a
+blocker, and a failing check would repeat every 15 minutes and ask the school
+to act at once. The Nest reports the negotiated speed of its default-route
+interface with its host metrics instead (`host.network_link_mbps` in the
+report, read from `/sys/class/net/<interface>/speed`; 0 when the card reports
+none, as virtual cards do). Manage's Network check card notes a known speed
+below 1 Gbit/s. A school that installs whole classrooms at once should use
+2.5 Gbit/s (2.5GbE) on the Nest and its switch port.
+
 ## When it runs
 
 A minute after the service starts, every six hours, every 15 minutes while a
