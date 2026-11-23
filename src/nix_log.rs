@@ -6,7 +6,7 @@
 //! events as a human-readable log equivalent to `--print-build-logs` output.
 //! Unknown or malformed lines pass through verbatim so no output is ever lost.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Instant};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -18,6 +18,7 @@ const NIX_JSON_PREFIX: &str = "@nix ";
 
 // Activity types (nix src/libutil/logging.hh).
 const ACT_COPY_PATH: u64 = 100;
+const ACT_REALISE: u64 = 102;
 const ACT_COPY_PATHS: u64 = 103;
 const ACT_BUILDS: u64 = 104;
 const ACT_BUILD: u64 = 105;
@@ -113,6 +114,7 @@ pub struct InternalJsonParser {
     reported_builds_expected: u64,
     reported_fetches_done: u64,
     reported_fetches_expected: u64,
+    realisation_started_at: Option<Instant>,
 }
 
 impl InternalJsonParser {
@@ -137,6 +139,13 @@ impl InternalJsonParser {
                 .find_map(|id| self.activities.get(id))
                 .map(|activity| activity.build_name.clone()),
         }
+    }
+
+    /// When Nix began realising paths (its first realise, builds or copy-paths
+    /// activity): the end of evaluation, unless the expression imports from a
+    /// derivation.
+    pub fn realisation_started_at(&self) -> Option<Instant> {
+        self.realisation_started_at
     }
 
     /// Consume one line of stderr. Returns the human-readable rendering of the
@@ -166,6 +175,13 @@ impl InternalJsonParser {
     }
 
     fn handle_start(&mut self, event: NixJsonEvent) -> Option<String> {
+        if matches!(
+            event.activity_type,
+            ACT_REALISE | ACT_COPY_PATHS | ACT_BUILDS
+        ) && self.realisation_started_at.is_none()
+        {
+            self.realisation_started_at = Some(Instant::now());
+        }
         let text = event.text.trim_end();
         if !matches!(
             event.activity_type,
@@ -323,6 +339,21 @@ mod tests {
         }
         assert!(parser.activities.is_empty());
         assert!(parser.build_start_order.is_empty());
+    }
+
+    #[test]
+    fn realisation_starts_with_the_first_worker_activity() {
+        let mut parser = InternalJsonParser::new();
+        parser
+            .feed_line(r#"@nix {"action":"start","id":1,"level":4,"text":"evaluating","type":0}"#);
+        parser.feed_line(
+            r#"@nix {"action":"start","id":2,"level":4,"text":"downloading","type":101}"#,
+        );
+        assert!(parser.realisation_started_at().is_none());
+        parser.feed_line(r#"@nix {"action":"start","id":3,"level":4,"text":"","type":102}"#);
+        let started = parser.realisation_started_at().unwrap();
+        start_build(&mut parser, 4, "/nix/store/x-a.drv");
+        assert_eq!(parser.realisation_started_at(), Some(started));
     }
 
     #[test]

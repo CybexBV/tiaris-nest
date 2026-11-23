@@ -20,7 +20,9 @@ menu_timeout_ms = 0
 
 [build]
 enabled = true
-max_concurrent_builds = 2
+# 0 follows the host: one build per two CPUs and per memory_per_build_bytes
+# above the serving reserve, at least 2 and at most 8.
+max_concurrent_builds = 0
 max_build_cores = 4
 # 0 explicitly preserves NixOS auto concurrency; cores and jobs are independent.
 max_nix_jobs = 0

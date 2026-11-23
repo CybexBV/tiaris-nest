@@ -33,7 +33,9 @@ use crate::{
 };
 
 mod failure;
+mod inventory;
 mod scan_rebuild;
+mod timings;
 
 pub(crate) use scan_rebuild::{RebuiltClosure, rebuild_for_scan};
 
@@ -270,7 +272,7 @@ pub fn spawn(state: AppState, _: crate::software_updates::OlderNestsCommitsTaken
         }
         sweep_stale_job_dirs(&state.config).await;
 
-        for worker_index in 0..state.config.build.max_concurrent_builds {
+        for worker_index in 0..state.config.build.concurrent_builds() {
             let worker_state = state.clone();
             tokio::spawn(async move { worker_loop(worker_state, worker_index).await });
         }
@@ -433,6 +435,7 @@ async fn sweep_stale_job_dirs(config: &AppConfig) {
 }
 
 async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
+    let mut timings = timings::StageTimings::start();
     let spec = match validate_build_spec(&state.config, &job) {
         Ok(spec) => spec,
         Err(err) => {
@@ -643,6 +646,7 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
     }
 
     if let Some(source) = spec.closure_source.clone() {
+        timings.finish("preparing");
         return execute_replica_copy(
             state,
             &job,
@@ -651,6 +655,7 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
             &source,
             admitted_commit.as_deref(),
             detected.as_ref().map(|ready| ready.nar_hash.as_str()),
+            timings,
         )
         .await;
     }
@@ -671,7 +676,10 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
     )
     .await?;
     let oom_kills_before = cgroup_oom_kill_count();
-    let outcome = run_nix_build(&state.db, &job, &command, &log, &state.config).await?;
+    timings.finish("preparing");
+    let (outcome, realisation_started_at) =
+        run_nix_build(&state.db, &job, &command, &log, &state.config).await?;
+    timings.finish_nix_build(realisation_started_at);
     let oom_kills_after = cgroup_oom_kill_count();
     let logs = log.snapshot().await;
     match outcome {
@@ -733,9 +741,16 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
                 .await?;
                 return Ok(());
             }
+            timings.finish("inspection");
             let nixpkgs_nar_hash = detected.as_ref().map(|ready| ready.nar_hash.as_str());
-            let software_inventory =
-                evaluate_software_inventory(&state.config, &spec, nixpkgs_nar_hash).await;
+            let software_inventory = inventory::evaluate(
+                &state.config,
+                &spec,
+                nixpkgs_nar_hash,
+                inventory::Limits::default(),
+            )
+            .await;
+            timings.finish("inventory");
             db::update_build_job_progress(
                 &state.db,
                 job.id,
@@ -757,6 +772,16 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
             {
                 Ok(artifact) => artifact,
                 Err(err) => {
+                    timings.finish("export");
+                    let mut metadata = admitted_result_metadata(
+                        &state.config,
+                        &job,
+                        &target,
+                        admitted_commit.as_deref(),
+                        detected.as_ref().map(|ready| ready.nar_hash.as_str()),
+                        Some("cache_export_failed"),
+                    );
+                    timings.attach(&mut metadata, job.id, "failed");
                     db::finish_build_job(
                         &state.db,
                         job.id,
@@ -767,19 +792,13 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
                         &output_info.output_sha256,
                         output_info.output_size_bytes,
                         Some(exit_code.into()),
-                        Some(admitted_result_metadata(
-                            &state.config,
-                            &job,
-                            &target,
-                            admitted_commit.as_deref(),
-                            detected.as_ref().map(|ready| ready.nar_hash.as_str()),
-                            Some("cache_export_failed"),
-                        )),
+                        Some(metadata),
                     )
                     .await?;
                     return Ok(());
                 }
             };
+            timings.finish_export("export_copy", &cached.timings);
             merge_build_metadata(
                 &mut cached.metadata,
                 &success_result_metadata(
@@ -807,6 +826,16 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
                 cached,
             )
             .await?;
+            timings.finish("publish");
+            let mut metadata = success_result_metadata(
+                &state.config,
+                &job,
+                &target,
+                &spec,
+                &software_inventory,
+                nixpkgs_nar_hash,
+            );
+            timings.attach(&mut metadata, job.id, "succeeded");
             db::finish_build_job(
                 &state.db,
                 job.id,
@@ -817,14 +846,7 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
                 &output_info.output_sha256,
                 output_info.output_size_bytes,
                 Some(exit_code.into()),
-                Some(success_result_metadata(
-                    &state.config,
-                    &job,
-                    &target,
-                    &spec,
-                    &software_inventory,
-                    nixpkgs_nar_hash,
-                )),
+                Some(metadata),
             )
             .await?;
             crate::software_updates::findings::candidate_built();
@@ -848,6 +870,7 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
                     json!(failure.failed_packages),
                 );
             }
+            timings.attach(&mut metadata, job.id, "failed");
             db::finish_build_job(
                 &state.db,
                 job.id,
@@ -914,6 +937,7 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
 /// instead of building it. The cache module verifies every member against
 /// the origin's signature and file hash and re-verifies the mirrored closure
 /// under this node's key; the job then publishes exactly like a build.
+#[allow(clippy::too_many_arguments)]
 async fn execute_replica_copy(
     state: &AppState,
     job: &BuildJob,
@@ -922,7 +946,18 @@ async fn execute_replica_copy(
     source: &ValidatedClosureSource,
     admitted_commit: Option<&str>,
     nixpkgs_nar_hash: Option<&str>,
+    mut timings: timings::StageTimings,
 ) -> Result<()> {
+    // Before the copy: the imported closure holds the cache's mutation lock
+    // until it is published.
+    let software_inventory = inventory::evaluate(
+        &state.config,
+        spec,
+        nixpkgs_nar_hash,
+        inventory::Limits::default(),
+    )
+    .await;
+    timings.finish("inventory");
     db::update_build_job_progress(
         &state.db,
         job.id,
@@ -951,6 +986,7 @@ async fn execute_replica_copy(
     let (mut cached, summary) = match imported {
         Ok(imported) => imported,
         Err(err) => {
+            timings.finish("replica_copy");
             db::finish_build_job(
                 &state.db,
                 job.id,
@@ -974,6 +1010,7 @@ async fn execute_replica_copy(
             return Ok(());
         }
     };
+    timings.finish_export("replica_copy", &cached.timings);
     if summary.output_size_bytes as u64 > state.config.build.max_artifact_size_bytes {
         db::finish_build_job(
             &state.db,
@@ -1005,8 +1042,6 @@ async fn execute_replica_copy(
         "Verified mirrored closure in Nest cache",
     )
     .await?;
-    let software_inventory =
-        evaluate_software_inventory(&state.config, spec, nixpkgs_nar_hash).await;
     merge_build_metadata(
         &mut cached.metadata,
         &success_result_metadata(
@@ -1028,6 +1063,16 @@ async fn execute_replica_copy(
     .await?;
     cache::record_cached_artifact(&state.db, &state.config, job, &spec.artifact_type, cached)
         .await?;
+    timings.finish("publish");
+    let mut metadata = success_result_metadata(
+        &state.config,
+        job,
+        target,
+        spec,
+        &software_inventory,
+        nixpkgs_nar_hash,
+    );
+    timings.attach(&mut metadata, job.id, "succeeded");
     db::finish_build_job(
         &state.db,
         job.id,
@@ -1041,14 +1086,7 @@ async fn execute_replica_copy(
         &summary.output_sha256,
         summary.output_size_bytes,
         Some(0),
-        Some(success_result_metadata(
-            &state.config,
-            job,
-            target,
-            spec,
-            &software_inventory,
-            nixpkgs_nar_hash,
-        )),
+        Some(metadata),
     )
     .await?;
     Ok(())
@@ -2010,10 +2048,6 @@ fn parse_memory_event(raw: &str, event: &str) -> Option<u64> {
     })
 }
 
-const SOFTWARE_INVENTORY_PROBE_TIMEOUT_SECS: u64 = 15;
-const SOFTWARE_INVENTORY_TOTAL_TIMEOUT_SECS: u64 = 120;
-const SOFTWARE_INVENTORY_STDOUT_MAX_BYTES: usize = 16 * 1024;
-const SOFTWARE_INVENTORY_STDERR_MAX_BYTES: usize = 64 * 1024;
 const REJECT_FLAKE_CONFIG_NIX_OPTION: [&str; 3] = ["--option", "accept-flake-config", "false"];
 const REQUIRE_BUILD_SANDBOX_NIX_OPTION: [&str; 3] = ["--option", "sandbox", "true"];
 
@@ -2031,25 +2065,6 @@ fn append_build_isolation_nix_options(args: &mut Vec<String>) {
             .iter()
             .map(|value| value.to_string()),
     );
-}
-
-#[derive(Clone, Copy)]
-struct SoftwareInventoryLimits {
-    probe_timeout: Duration,
-    total_timeout: Duration,
-    stdout_max_bytes: usize,
-    stderr_max_bytes: usize,
-}
-
-impl Default for SoftwareInventoryLimits {
-    fn default() -> Self {
-        Self {
-            probe_timeout: Duration::from_secs(SOFTWARE_INVENTORY_PROBE_TIMEOUT_SECS),
-            total_timeout: Duration::from_secs(SOFTWARE_INVENTORY_TOTAL_TIMEOUT_SECS),
-            stdout_max_bytes: SOFTWARE_INVENTORY_STDOUT_MAX_BYTES,
-            stderr_max_bytes: SOFTWARE_INVENTORY_STDERR_MAX_BYTES,
-        }
-    }
 }
 
 /// A safe store path's store item (`<hash>-<name>`).
@@ -2144,6 +2159,10 @@ fn build_result_metadata(
         json!(crate::resources::job_peaks(job.id)),
     );
     metadata.insert("max_nix_jobs".into(), json!(config.build.max_nix_jobs));
+    metadata.insert(
+        "concurrent_builds".into(),
+        json!(config.build.concurrent_builds()),
+    );
     metadata.insert(
         "memory_per_build_bytes".into(),
         json!(config.build.memory_per_build_bytes),
@@ -2266,110 +2285,6 @@ fn success_result_metadata(
         );
     }
     metadata
-}
-
-fn software_inventory_eval_args(installable: &str) -> Vec<String> {
-    let mut args = Vec::new();
-    // Inventory is metadata, but `nix eval` can still realize an
-    // import-from-derivation before returning that metadata. Keep it inside
-    // the same isolation boundary as the real build.
-    append_build_isolation_nix_options(&mut args);
-    args.extend([
-        "eval".to_string(),
-        "--raw".to_string(),
-        "--no-write-lock-file".to_string(),
-        installable.to_string(),
-    ]);
-    args
-}
-
-async fn evaluate_software_inventory(
-    config: &AppConfig,
-    spec: &ValidatedBuildSpec,
-    nixpkgs_nar_hash: Option<&str>,
-) -> Value {
-    evaluate_software_inventory_pinned(
-        config,
-        spec,
-        nixpkgs_nar_hash,
-        SoftwareInventoryLimits::default(),
-    )
-    .await
-}
-
-#[cfg(test)]
-async fn evaluate_software_inventory_with_limits(
-    config: &AppConfig,
-    spec: &ValidatedBuildSpec,
-    limits: SoftwareInventoryLimits,
-) -> Value {
-    evaluate_software_inventory_pinned(config, spec, None, limits).await
-}
-
-/// Probe package versions at the job's commit, from the narHash-pinned
-/// source at a detected commit.
-async fn evaluate_software_inventory_pinned(
-    config: &AppConfig,
-    spec: &ValidatedBuildSpec,
-    nixpkgs_nar_hash: Option<&str>,
-    limits: SoftwareInventoryLimits,
-) -> Value {
-    let Some(commit) = spec.nixpkgs_commit.as_deref() else {
-        return json!([]);
-    };
-    let Ok(nixpkgs) = nixpkgs_flake_ref(commit, nixpkgs_nar_hash) else {
-        return json!([]);
-    };
-    let mut refs = vec![(
-        "linux-kernel".to_string(),
-        "linuxPackages.kernel".to_string(),
-    )];
-    for package_ref in &spec.software_package_refs {
-        if !refs.iter().any(|(_, existing)| existing == package_ref) {
-            refs.push((package_ref.clone(), package_ref.clone()));
-        }
-    }
-    let started = Instant::now();
-    let mut inventory = Vec::new();
-    for (name, package_ref) in refs {
-        let remaining = limits.total_timeout.saturating_sub(started.elapsed());
-        if remaining.is_zero() {
-            break;
-        }
-        let installable = format!(
-            "{nixpkgs}#legacyPackages.{}.{}.version",
-            spec.system, package_ref
-        );
-        let mut command = crate::nix_command::tokio_command(&config.build.nix_binary);
-        command.args(software_inventory_eval_args(&installable));
-        let output = run_bounded_command(
-            command,
-            limits.probe_timeout.min(remaining),
-            limits.stdout_max_bytes,
-            limits.stderr_max_bytes,
-            "nix software inventory eval",
-        )
-        .await;
-        let Ok(output) = output else {
-            continue;
-        };
-        if !output.status.success() {
-            continue;
-        }
-        let version = String::from_utf8_lossy(&output.stdout)
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        if version.is_empty() || version.len() > 160 {
-            continue;
-        }
-        inventory.push(json!({
-            "name": name,
-            "package_ref": package_ref,
-            "version": version,
-        }));
-    }
-    Value::Array(inventory)
 }
 
 fn merge_build_metadata(destination: &mut Value, source: &Value) {
@@ -2933,7 +2848,7 @@ async fn run_nix_build(
     command: &NixBuildCommand,
     log: &SharedLog,
     config: &AppConfig,
-) -> Result<ProcessOutcome> {
+) -> Result<(ProcessOutcome, Option<Instant>)> {
     if let Some(parent) = command.out_link.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -3077,7 +2992,8 @@ async fn run_nix_build(
         Err(_) => bail!("nix build output pipes remained open after child exit"),
     }
     db::update_build_job_logs(pool, job.id, &log.snapshot().await).await?;
-    Ok(outcome)
+    let realisation_started_at = progress.lock().await.realisation_started_at();
+    Ok((outcome, realisation_started_at))
 }
 
 async fn inspect_build_output(
@@ -3953,7 +3869,7 @@ esac
         assert!(validate_build_spec(&config, &incomplete_v2).is_err());
     }
 
-    fn flake_config_is_rejected(args: &[String]) -> bool {
+    pub(super) fn flake_config_is_rejected(args: &[String]) -> bool {
         args.windows(REJECT_FLAKE_CONFIG_NIX_OPTION.len())
             .any(|window| {
                 window
@@ -3963,7 +3879,7 @@ esac
             })
     }
 
-    fn build_sandbox_is_required(args: &[String]) -> bool {
+    pub(super) fn build_sandbox_is_required(args: &[String]) -> bool {
         args.windows(REQUIRE_BUILD_SANDBOX_NIX_OPTION.len())
             .any(|window| {
                 window
@@ -3971,146 +3887,6 @@ esac
                     .map(String::as_str)
                     .eq(REQUIRE_BUILD_SANDBOX_NIX_OPTION)
             })
-    }
-
-    fn software_inventory_test_spec(software_package_refs: Vec<String>) -> ValidatedBuildSpec {
-        ValidatedBuildSpec {
-            artifact_type: "nixos_closure".to_string(),
-            target: "blueprint".to_string(),
-            system: "x86_64-linux".to_string(),
-            input_revision: "rev".to_string(),
-            input_config_hash: "a".repeat(64),
-            blueprint_id: None,
-            blueprint_revision_id: None,
-            blueprint_revision_config_hash: None,
-            nixpkgs_commit: Some("c".repeat(40)),
-            source_lock_sha256: Some("d".repeat(64)),
-            software_package_refs,
-            build_input: None,
-            closure_source: None,
-        }
-    }
-
-    #[test]
-    fn software_inventory_eval_keeps_the_build_isolation() {
-        let installable =
-            "github:NixOS/nixpkgs/reviewed#legacyPackages.x86_64-linux.firefox.version";
-        let args = software_inventory_eval_args(installable);
-        assert!(flake_config_is_rejected(&args));
-        assert!(build_sandbox_is_required(&args));
-        assert_eq!(args.last().map(String::as_str), Some(installable));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn software_inventory_uses_bounded_isolated_eval() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let root = std::env::temp_dir().join(format!(
-            "tiaris-nest-software-inventory-policy-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let fake_nix = root.join("fake-nix");
-        std::fs::write(
-            &fake_nix,
-            r#"#!/bin/sh
-set -eu
-case " $* " in
-  *" --option accept-flake-config false "*) ;;
-  *) exit 91 ;;
-esac
-printf '123.4\n'
-"#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&fake_nix, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let mut config = AppConfig::default();
-        config.build.nix_binary = fake_nix.display().to_string();
-        let spec = software_inventory_test_spec(vec!["firefox".to_string()]);
-
-        let inventory = evaluate_software_inventory_with_limits(
-            &config,
-            &spec,
-            SoftwareInventoryLimits {
-                probe_timeout: Duration::from_secs(1),
-                total_timeout: Duration::from_secs(2),
-                stdout_max_bytes: 1024,
-                stderr_max_bytes: 1024,
-            },
-        )
-        .await;
-
-        let inventory = inventory.as_array().unwrap();
-        assert_eq!(inventory.len(), 2);
-        assert!(
-            inventory
-                .iter()
-                .all(|item| item.get("version") == Some(&json!("123.4")))
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn software_inventory_timeout_kills_the_probe_process_group() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let root = std::env::temp_dir().join(format!(
-            "tiaris-nest-software-inventory-timeout-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let marker = root.join("orphan-survived");
-        let fake_nix = root.join("fake-nix");
-        std::fs::write(
-            &fake_nix,
-            format!(
-                r#"#!/bin/sh
-set -eu
-case " $* " in
-  *" --option accept-flake-config false "*) ;;
-  *) exit 91 ;;
-esac
-case " $* " in
-  *" --option allow-import-from-derivation false "*) ;;
-  *) exit 92 ;;
-esac
-( sleep 0.25; printf survived > '{}' ) &
-sleep 5
-"#,
-                marker.display()
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&fake_nix, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let mut config = AppConfig::default();
-        config.build.nix_binary = fake_nix.display().to_string();
-        let spec = software_inventory_test_spec(vec!["firefox".to_string()]);
-        let started = Instant::now();
-
-        let inventory = evaluate_software_inventory_with_limits(
-            &config,
-            &spec,
-            SoftwareInventoryLimits {
-                probe_timeout: Duration::from_millis(50),
-                total_timeout: Duration::from_millis(80),
-                stdout_max_bytes: 1024,
-                stderr_max_bytes: 1024,
-            },
-        )
-        .await;
-
-        assert_eq!(inventory, json!([]));
-        assert!(started.elapsed() < Duration::from_secs(1));
-        sleep(Duration::from_millis(350)).await;
-        assert!(
-            !marker.exists(),
-            "a timed-out inventory probe left a descendant process running"
-        );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
