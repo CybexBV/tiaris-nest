@@ -146,6 +146,8 @@ struct PeerContract {
     /// Manage accepts the site check lane (`site_check`).
     #[serde(default)]
     accepts_site_check: bool,
+    #[serde(default)]
+    accepts_assist_turn: bool,
     /// Manage accepts `boot_machine_identity_v1` (`boot_machines`).
     #[serde(default)]
     accepts_boot_machine_identity: bool,
@@ -255,6 +257,10 @@ struct AgentNestConfigResponse {
     /// report).
     #[serde(default)]
     site_check_supported: bool,
+    #[serde(default)]
+    assist_turn_supported: bool,
+    #[serde(default)]
+    assist_turn: Option<crate::assist_turn::Desired>,
     /// What the site check also tests and "Check again" (`site_check`).
     #[serde(default)]
     site_check: Option<Value>,
@@ -608,6 +614,8 @@ struct NestAgentReportRequest {
     /// To a Manage that accepts `site_check_v1`: the latest site check.
     #[serde(skip_serializing_if = "Option::is_none")]
     site_check: Option<crate::site_check::Report>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    assist_turn: Option<crate::assist_turn::Report>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1035,6 +1043,9 @@ async fn sync_boot_foundation(state: &AppState, managed: &mut ManagedState) -> R
                 // A retired Nest is refused, so no document can withdraw its
                 // network starts: the refusal itself does.
                 if crate::console_status::current_retirement().is_some() {
+                    if let Err(error) = crate::assist_turn::withdraw(&state.config.paths.data_dir) {
+                        warn!(error = %safe_error(&error), "could not withdraw TURN from a retired Nest");
+                    }
                     if let Err(error) = crate::pxe_discovery::withdraw(state) {
                         warn!(error = %safe_error(&error), "could not withdraw PXE discovery of a retired Nest");
                     }
@@ -1293,6 +1304,7 @@ async fn sync_nest_foundation(
                 accepts_usb_installer: false,
                 accepts_when_idle: desired.update_when_idle_supported,
                 accepts_site_check: desired.site_check_supported,
+                accepts_assist_turn: desired.assist_turn_supported,
                 accepts_boot_machine_identity: desired.boot_machine_identity_supported,
                 accepts_update_replace: desired.appliance_update_replace_supported,
                 accepts_compact_report: desired.compact_report_supported,
@@ -1330,6 +1342,7 @@ async fn sync_nest_foundation(
             uploads: peer.accepts_uploads,
             when_idle: peer.accepts_when_idle,
             site_check: peer.accepts_site_check,
+            assist_turn: peer.accepts_assist_turn && crate::assist_turn::shipped(),
             boot_machine_identity: peer.accepts_boot_machine_identity,
             update_replace: peer.accepts_update_replace,
             compact: peer.accepts_compact_report,
@@ -1365,6 +1378,7 @@ fn peer_contract_after_failed_fetch(
         accepts_usb_installer: false,
         accepts_when_idle: false,
         accepts_site_check: false,
+        accepts_assist_turn: false,
         accepts_boot_machine_identity: false,
         accepts_update_replace: false,
         accepts_compact_report: false,
@@ -1426,6 +1440,14 @@ async fn apply_nest_desired(
     .await
     {
         retain_sync_failure(first_failure, "site check settings", error);
+    }
+    if crate::assist_turn::shipped() {
+        let desired = desired
+            .assist_turn
+            .filter(|_| desired.assist_turn_supported);
+        if let Err(error) = crate::assist_turn::apply(&state.config.paths.data_dir, desired) {
+            retain_sync_failure(first_failure, "managed TURN configuration", error);
+        }
     }
     // Its own lane: an unusable channel or request only stops update checks.
     if let Err(error) = crate::software_updates::apply_managed(
@@ -1907,6 +1929,9 @@ async fn report_nest_state(
         software_update_checked_at,
         software_update_findings,
         software_update_findings_sha256,
+        assist_turn: peer_support.assist_turn.then(|| {
+            crate::assist_turn::report(&state.config.paths.data_dir, state.config.public_base_url())
+        }),
         site_check: peer_support
             .site_check
             .then(|| crate::site_check::report(&state.config.paths.data_dir))
@@ -3064,6 +3089,7 @@ struct PeerReportSupport {
     uploads: bool,
     when_idle: bool,
     site_check: bool,
+    assist_turn: bool,
     boot_machine_identity: bool,
     update_replace: bool,
     /// Manage says `compact_report_supported` (`compact_report`).
@@ -3084,6 +3110,9 @@ fn nest_capabilities(
     );
     if peer_support.uploads {
         capabilities.push(crate::software_cache_upload::CAPABILITY);
+    }
+    if peer_support.assist_turn {
+        capabilities.push(crate::assist_turn::CAPABILITY);
     }
     if peer_support.site_check {
         capabilities.push(crate::site_check::CAPABILITY);
@@ -4003,6 +4032,7 @@ mod tests {
             accepts_usb_installer: true,
             accepts_when_idle: true,
             accepts_site_check: true,
+            accepts_assist_turn: true,
             accepts_boot_machine_identity: true,
             accepts_update_replace: true,
             accepts_compact_report: true,
@@ -5582,6 +5612,7 @@ mod tests {
             uploads: desired.software_cache_upload_supported,
             when_idle: false,
             site_check: false,
+            assist_turn: false,
             boot_machine_identity: false,
             update_replace: false,
             compact: false,
@@ -5609,6 +5640,7 @@ mod tests {
             uploads: false,
             when_idle: false,
             site_check,
+            assist_turn: false,
             boot_machine_identity: false,
             update_replace: false,
             compact: false,
@@ -5625,6 +5657,28 @@ mod tests {
     }
 
     #[test]
+    fn turn_report_requires_manage_and_appliance_support() {
+        let older: AgentNestConfigResponse = serde_json::from_value(json!({})).unwrap();
+        let modern: AgentNestConfigResponse =
+            serde_json::from_value(json!({"assist_turn_supported": true})).unwrap();
+        assert!(!older.assist_turn_supported);
+        for (desired, shipped, expected) in [
+            (&modern, true, true),
+            (&modern, false, false),
+            (&older, true, false),
+        ] {
+            let peer = PeerReportSupport {
+                assist_turn: desired.assist_turn_supported && shipped,
+                ..Default::default()
+            };
+            assert_eq!(
+                nest_capabilities(false, peer).contains(&crate::assist_turn::CAPABILITY),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn boot_machine_identity_capability_requires_manage_support() {
         // An older Manage rejects a report that lists an unknown capability.
         let older: AgentNestConfigResponse = serde_json::from_value(json!({})).unwrap();
@@ -5636,6 +5690,7 @@ mod tests {
             uploads: false,
             when_idle: false,
             site_check: false,
+            assist_turn: false,
             boot_machine_identity,
             update_replace: false,
             compact: false,
@@ -7019,6 +7074,7 @@ mod tests {
             software_update_findings: None,
             software_update_findings_sha256: None,
             site_check: None,
+            assist_turn: None,
         }
     }
 

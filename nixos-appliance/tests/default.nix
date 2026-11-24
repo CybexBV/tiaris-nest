@@ -1,5 +1,6 @@
 { nixpkgs, pkgs, common }:
 {
+  assistTurn = import ./assist-turn-vm.nix { inherit nixpkgs; };
   console = import ./console-vm.nix { inherit nixpkgs; inherit (common) installerKiosk; };
   blueprintCachePolicy = import ./blueprint-cache-policy.nix { inherit nixpkgs pkgs; };
   daemonPath = import ./daemon-path-vm.nix { inherit nixpkgs; };

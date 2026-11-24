@@ -1,0 +1,16 @@
+Apply max-allocate-lifetime after choosing the default or minimum lifetime.
+The previous else-if chain skipped the cap when Allocate or Refresh omitted
+LIFETIME. Refresh with a zero lifetime still takes the server's delete path.
+
+--- a/src/client/ns_turn_msg.c
++++ b/src/client/ns_turn_msg.c
+@@ -1326,6 +1326,8 @@ turn_time_t stun_adjust_allocate_lifetime(turn_time_t lifetime, turn_time_t max_al
+     lifetime = STUN_DEFAULT_ALLOCATE_LIFETIME;
+   } else if (lifetime < STUN_MIN_ALLOCATE_LIFETIME) {
+     lifetime = STUN_MIN_ALLOCATE_LIFETIME;
+-  } else if (lifetime > max_allowed_lifetime) {
++  }
++
++  if (lifetime > max_allowed_lifetime) {
+     lifetime = max_allowed_lifetime;
+   }
