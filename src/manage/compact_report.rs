@@ -12,7 +12,11 @@
 //!   goes without its closure manifest (well over a megabyte each), so the
 //!   whole inventory fits one report and completes at once.
 //! - Settled build results stay out until the job changes, so the next report
-//!   carries the new results of running installs and rollouts first.
+//!   carries the new results of running installs and rollouts first. Which
+//!   ones Manage settled lives in memory: a restarted Nest sends each once
+//!   more. A job Manage lists again (its database was restored) changes
+//!   (`db::upsert_managed_build_job`, `db::record_rejected_managed_build_job`),
+//!   so its result goes again.
 //!
 //! The inventory generation advances on every local write to the cache table,
 //! also when the integrity check only records that it verified an artifact.
@@ -27,7 +31,57 @@
 use super::{ManagedState, NestAgentReportRequest, NestReportResponse, nest_build_job_is_terminal};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{Mutex, MutexGuard},
+};
+
+/// Terminal build jobs whose result Manage settled: local id to the
+/// `updated_at` it settled. Not in `manage-state.json`: it grows with every
+/// finished job, and the root updater reads that file with a 1 MiB limit
+/// (one it cannot read holds back every Nest update).
+static SETTLED: Mutex<BTreeMap<i64, String>> = Mutex::new(BTreeMap::new());
+
+fn settled() -> MutexGuard<'static, BTreeMap<i64, String>> {
+    SETTLED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The file next to `manage-state.json` that keeps the cache inventories
+/// across restarts.
+pub(super) const INVENTORIES_FILE: &str = "manage-cache-inventories.json";
+
+/// The cache inventories a restarted Nest keeps, so it does not send every
+/// closure manifest again. Not in `manage-state.json`: they grow with the
+/// cache (about 90 bytes an artifact), and the root updater reads that file
+/// with a 1 MiB limit. Earlier releases kept them there under the same
+/// names, so that file reads as well.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+pub(super) struct Inventories {
+    nest_cache_content: Option<CacheInventoryContent>,
+    nest_cache_acknowledged: Option<CacheInventoryContent>,
+}
+
+impl Inventories {
+    pub(super) fn of(managed: &ManagedState) -> Self {
+        Self {
+            nest_cache_content: managed.nest_cache_content.clone(),
+            nest_cache_acknowledged: managed.nest_cache_acknowledged.clone(),
+        }
+    }
+
+    /// Unreadable: none, and the inventory starts again.
+    pub(super) fn read(saved: &[u8]) -> Self {
+        serde_json::from_slice(saved).unwrap_or_default()
+    }
+
+    pub(super) fn restore(self, managed: &mut ManagedState) {
+        managed.nest_cache_content = self.nest_cache_content;
+        managed.nest_cache_acknowledged = self.nest_cache_acknowledged;
+    }
+}
 
 /// What the report sees of one artifact: its local id and when its reported
 /// content last changed.
@@ -91,9 +145,8 @@ pub(super) fn acknowledged_members(
 }
 
 /// Terminal build jobs Manage settled, as `(id, updated_at)`.
-pub(super) fn settled_build_jobs(managed: &ManagedState) -> Vec<InventoryMember> {
-    managed
-        .nest_build_jobs_settled
+pub(super) fn settled_build_jobs() -> Vec<InventoryMember> {
+    settled()
         .iter()
         .map(|(id, updated_at)| (*id, updated_at.clone()))
         .collect()
@@ -102,7 +155,7 @@ pub(super) fn settled_build_jobs(managed: &ManagedState) -> Vec<InventoryMember>
 /// A Manage that no longer says it supports compact reports gets everything.
 pub(super) fn forget(managed: &mut ManagedState) {
     managed.nest_cache_acknowledged = None;
-    managed.nest_build_jobs_settled.clear();
+    settled().clear();
 }
 
 /// Moves the closure manifest digest of an acknowledged artifact (its
@@ -147,7 +200,16 @@ pub(super) fn record(
         _ if compact_refresh => managed.nest_cache_acknowledged = None,
         _ => {}
     }
-    let settled: BTreeSet<&str> = response
+    settle(&mut settled(), body, response);
+}
+
+/// Records the terminal results of `body` that Manage settled.
+fn settle(
+    settled: &mut BTreeMap<i64, String>,
+    body: &NestAgentReportRequest,
+    response: &NestReportResponse,
+) {
+    let ids: BTreeSet<&str> = response
         .build_jobs_settled
         .as_ref()
         .and_then(Value::as_array)
@@ -158,11 +220,9 @@ pub(super) fn record(
             && job
                 .managed_job_id
                 .as_deref()
-                .is_some_and(|id| settled.contains(id))
+                .is_some_and(|id| ids.contains(id))
         {
-            managed
-                .nest_build_jobs_settled
-                .insert(job.local_id, job.updated_at.clone());
+            settled.insert(job.local_id, job.updated_at.clone());
         }
     }
 }
@@ -293,23 +353,40 @@ mod tests {
         assert_eq!(managed.nest_cache_artifact_report_cursor, None);
     }
 
+    fn job(local_id: i64, status: &str) -> NestBuildJobReport {
+        let mut job = NestBuildJobReport::from(sample_build_job(""));
+        job.local_id = local_id;
+        job.managed_job_id = Some(format!("job-{local_id}"));
+        job.status = status.to_string();
+        job.updated_at = format!("2026-11-23T10:00:00.{local_id:09}+00:00");
+        job
+    }
+
     #[test]
     fn only_terminal_results_manage_settled_stay_out() {
-        let mut managed = ManagedState::default();
-        let job = |local_id: i64, status: &str| {
-            let mut job = NestBuildJobReport::from(sample_build_job(""));
-            job.local_id = local_id;
-            job.managed_job_id = Some(format!("job-{local_id}"));
-            job.status = status.to_string();
-            job.updated_at = format!("t{local_id}");
-            job
-        };
         let jobs = vec![job(1, "succeeded"), job(2, "running"), job(3, "failed")];
         let answer = response(json!({"status": "ok", "build_jobs_settled": ["job-1", "job-2"]}));
+        let mut settled = BTreeMap::new();
+        settle(&mut settled, &body(1, false, jobs), &answer);
+        assert_eq!(
+            settled.into_iter().collect::<Vec<_>>(),
+            vec![(1, job(1, "succeeded").updated_at)]
+        );
+    }
+
+    /// The root updater reads `manage-state.json` with a 1 MiB limit; one it
+    /// cannot read holds back every Nest update. Settled results, one per
+    /// finished job and never fewer, stay out of it.
+    #[test]
+    fn settled_results_never_grow_the_state_file_the_updater_reads() {
+        let mut managed = ManagedState::default();
+        let jobs: Vec<_> = (1..=30_000).map(|id| job(id, "succeeded")).collect();
+        let ids: Vec<String> = (1..=30_000).map(|id| format!("job-{id}")).collect();
+        let answer = response(json!({"status": "ok", "build_jobs_settled": ids}));
         record(&mut managed, &body(1, false, jobs), false, &answer);
-        assert_eq!(settled_build_jobs(&managed), vec![(1, "t1".to_string())]);
+        let written = serde_json::to_vec(&managed).unwrap().len();
         forget(&mut managed);
-        assert!(settled_build_jobs(&managed).is_empty());
+        assert!(written < 1024 * 1024, "{written} bytes");
     }
 
     #[test]

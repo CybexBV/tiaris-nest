@@ -190,12 +190,15 @@ pub(super) async fn stage_members(
         Ok(None) => return Ok(None),
         Err(error) => return whole(error),
     };
-    // The staged members and their extracted cache, beside a bounded runtime.
+    // Members and their cache take twice their bytes in RAM; when they do
+    // not fit, the whole archive (once in RAM, extracted onto the disk) may.
     let staged = plan.bytes - plan.remaining_bytes();
-    ensure!(
-        available.saturating_add(staged) >= plan.bytes.saturating_mul(2).saturating_add(2 * GIB),
-        "insufficient available memory for the closure members plus bounded runtime"
-    );
+    let tmpfs = crate::disk::stats(Path::new(STAGING)).map_or(0, |stats| stats.available_bytes);
+    if !members_fit(plan.bytes, staged, available, tmpfs) {
+        return whole(anyhow!(
+            "insufficient available memory for the closure members plus bounded runtime"
+        ));
+    }
     tracing::info!(
         members = plan.members(),
         bytes = plan.bytes,
@@ -208,35 +211,64 @@ pub(super) async fn stage_members(
     }
 }
 
+/// Whether `bytes` of staged members (`staged` of them there already) and
+/// their extracted cache fit: in memory beside a bounded runtime, and in the
+/// tmpfs that holds them (`/run`, often smaller than the memory).
+fn members_fit(bytes: u64, staged: u64, available: u64, tmpfs_available: u64) -> bool {
+    let needed = bytes.saturating_mul(2);
+    available.saturating_add(staged) >= needed.saturating_add(2 * GIB)
+        && tmpfs_available.saturating_add(staged) >= needed
+}
+
 /// The staged members' one verification pass, extracting their binary cache
 /// into RAM; the members it leaves out are the ISO's, each with its signed
-/// NAR hash. The staged stream goes either way.
+/// NAR hash.
 fn verify_members(
     release: &NixosRelease,
     key: &ed25519_dalek::VerifyingKey,
     members: &members::Plan,
 ) -> Result<StagedClosure> {
-    let cache = Path::new(MEMBERS_CACHE);
+    let manifest = verify_staged_members(
+        release,
+        key,
+        members.present(),
+        Path::new(STAGED_MEMBERS),
+        Path::new(MEMBERS_CACHE),
+    )?;
+    Ok(StagedClosure::Members {
+        manifest,
+        iso: members.present().clone(),
+    })
+}
+
+/// The staged stream goes either way, and so does the cache of a pass that
+/// fails: the next try may take the whole archive, which needs that RAM.
+fn verify_staged_members(
+    release: &NixosRelease,
+    key: &ed25519_dalek::VerifyingKey,
+    present: &closure::Present,
+    staged: &Path,
+    cache: &Path,
+) -> Result<closure::ClosureManifest> {
     if fs::symlink_metadata(cache).is_ok() {
         fs::remove_dir_all(cache)?;
     }
-    let verified =
-        members::open_staged(Path::new(STAGED_MEMBERS), release).and_then(|(stream, limit)| {
-            closure::verify_staged(
-                stream,
-                limit,
-                release,
-                key,
-                cache,
-                members.present(),
-                |_, _, _| Ok(()),
-            )
-        });
-    let _ = fs::remove_file(STAGED_MEMBERS);
-    Ok(StagedClosure::Members {
-        manifest: verified?.manifest,
-        iso: members.present().clone(),
-    })
+    let verified = members::open_staged(staged, release).and_then(|(stream, limit)| {
+        closure::verify_staged(
+            stream,
+            limit,
+            release,
+            key,
+            cache,
+            present,
+            |_, _, _| Ok(()),
+        )
+    });
+    let _ = fs::remove_file(staged);
+    if verified.is_err() {
+        let _ = fs::remove_dir_all(cache);
+    }
+    Ok(verified?.manifest)
 }
 
 /// Copy the ISO's own members of the closure, with their closures (all
@@ -1026,6 +1058,40 @@ fn reboot_installed() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Members that do not fit take the whole archive instead of ending the
+    /// setup; the tmpfs that holds them counts as well as the memory.
+    #[test]
+    fn members_fit_in_memory_and_in_the_tmpfs_that_holds_them() {
+        assert!(members_fit(GIB, 0, 4 * GIB, 2 * GIB));
+        assert!(!members_fit(GIB, 0, 3 * GIB, 8 * GIB));
+        assert!(!members_fit(GIB, 0, 8 * GIB, GIB));
+        // What an earlier try staged is there already.
+        assert!(members_fit(GIB, GIB / 2, 8 * GIB, 3 * GIB / 2));
+    }
+
+    /// The members' cache lives in RAM; the next try may need that RAM for
+    /// the whole archive.
+    #[test]
+    fn a_failed_member_check_leaves_no_cache_behind() {
+        let mut fixture = crate::appliance::closure::full_archive_tests::Fixture::new();
+        let tar = fixture.tar();
+        // The size of a raw-block archive of one block holding `tar`: its
+        // frame (6 bytes) and one block header (3 bytes).
+        fixture.bind(&vec![0; 6 + 3 + tar.len()]);
+        let dir = std::env::temp_dir().join(format!("nest-members-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        let (staged, cache) = (dir.join("closure.members.tar"), dir.join("cache"));
+        // Cut short: the pass has started extracting when it fails.
+        fs::write(&staged, &tar[..tar.len() / 2]).unwrap();
+        let key = fixture.key.verifying_key();
+        let present = closure::Present::new();
+        let verified = verify_staged_members(&fixture.release, &key, &present, &staged, &cache);
+        assert!(verified.is_err());
+        assert!(!staged.exists());
+        assert!(!cache.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     fn closure_artifact() -> SystemClosure {
         SystemClosure {

@@ -84,13 +84,24 @@ impl Counter {
     /// connection is open. A closed one ends its download now, never earlier
     /// than it did; one kept alive counts until nginx closes it (75 s idle at
     /// most). Without the list of open connections all of them still count.
-    fn sending(&self, open: Option<&HashSet<SocketAddr>>) -> bool {
+    /// `open` lists them while the hand-overs are locked: a download handed
+    /// over on a connection opened after a list was read is never let go by
+    /// that list.
+    fn sending(&self, open: impl FnOnce() -> std::io::Result<HashSet<SocketAddr>>) -> bool {
         let mut handed = self.handed();
-        if let Some(open) = open {
-            let before = handed.len();
-            handed.retain(|client| open.contains(client));
-            if handed.len() < before {
-                self.touch();
+        if handed.is_empty() {
+            return false;
+        }
+        match open() {
+            Ok(open) => {
+                let before = handed.len();
+                handed.retain(|client| open.contains(client));
+                if handed.len() < before {
+                    self.touch();
+                }
+            }
+            Err(error) => {
+                warn!(error = %error, "could not list nginx's connections; handed-over downloads still count");
             }
         }
         !handed.is_empty()
@@ -277,11 +288,7 @@ fn proc_endpoint(value: &str) -> Option<SocketAddr> {
 
 async fn busy_reasons(state: &AppState, now: DateTime<Utc>) -> Vec<&'static str> {
     let mut busy = Vec::new();
-    let open = nginx_clients();
-    if let Err(error) = &open {
-        warn!(error = %error, "could not list nginx's connections; handed-over downloads still count");
-    }
-    if SERVED.in_flight.load(Ordering::SeqCst) > 0 || SERVED.sending(open.as_ref().ok()) {
+    if SERVED.in_flight.load(Ordering::SeqCst) > 0 || SERVED.sending(nginx_clients) {
         busy.push("serving_computers");
     }
     // Boot grants live ten minutes from a computer's start or install.
@@ -439,11 +446,42 @@ mod tests {
         let client: SocketAddr = "192.0.2.55:51000".parse().unwrap();
         assert_eq!(*COUNTER.handed(), BTreeSet::from([client]));
 
-        assert!(COUNTER.sending(Some(&HashSet::from([client]))));
-        assert!(COUNTER.sending(None), "unknown connections still count");
+        assert!(COUNTER.sending(|| Ok(HashSet::from([client]))));
+        assert!(
+            COUNTER.sending(|| Err(std::io::Error::other("unreadable"))),
+            "unknown connections still count"
+        );
         COUNTER.last_served.store(0, Ordering::SeqCst);
-        assert!(!COUNTER.sending(Some(&HashSet::new())));
+        assert!(!COUNTER.sending(|| Ok(HashSet::new())));
         assert!(COUNTER.last_served.load(Ordering::SeqCst) > 0);
+    }
+
+    /// A download handed over on a connection that opened after nginx's
+    /// connections were listed still counts: that list never lets it go.
+    /// (The pause lets the hand-over run while the list is read; without the
+    /// lock it was pruned and the Nest could restart during the download.)
+    #[test]
+    fn a_download_handed_over_while_connections_are_listed_still_counts() {
+        static COUNTER: Counter = Counter::new();
+        COUNTER.following.store(true, Ordering::SeqCst);
+        let (waiting, other) = (
+            "192.0.2.54:51000".parse().unwrap(),
+            "192.0.2.55:51000".parse().unwrap(),
+        );
+        COUNTER.hand(waiting);
+        let (listing, listed) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                listed.recv().unwrap();
+                COUNTER.hand(other);
+            });
+            COUNTER.sending(|| {
+                listing.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(50));
+                Ok(HashSet::new())
+            });
+        });
+        assert!(COUNTER.sending(|| Ok(HashSet::from([other]))));
     }
 
     /// A listener, two clients of nginx (one of them on an IPv6 socket), a

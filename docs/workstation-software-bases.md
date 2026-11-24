@@ -59,7 +59,9 @@ Manage offers it as a software update.
   (no computer served or starting, no build), the same quiet period its own
   updates wait for. A commit found by day looks every 5 minutes whether the
   Nest became idle and is evaluated at night at the latest. A request from
-  Manage, and the look right after an update of this Nest, evaluate at once. The
+  Manage evaluates at once. Right after an update of this Nest the channel is
+  looked at once more, and a commit to evaluate waits for a quiet Nest too:
+  the Nest builds first what waited for its update. The
   channel is `software_update_channel`, default `nixos-26.05`; Nest refuses any
   channel of another NixOS release, and a commit whose `lib.trivial.release`
   differs is never recorded. Only Nests with Blueprint targets that report to

@@ -520,13 +520,20 @@ async fn run(state: AppState) {
     // again now rather than at the next scheduled check: the update may be what it
     // waited for. (The ready commits of Nest 0.2.173 and older were taken
     // over before this task started: `take_over_commits_of_older_nests`.)
+    // A commit to evaluate waits for a quiet Nest or the night as any other:
+    // right after its update the Nest builds what waited for it.
     let data_dir = &state.config.paths.data_dir;
     let forgot = forget_verdicts_of_other_builds(data_dir).await;
+    // A commit found by day that waits for a quiet Nest or the night.
+    let mut waiting = false;
     if forgot || updated_nest_has_not_looked(data_dir).await {
         // The network may come up after the Nest: try for some minutes.
         for attempt in 1..=STARTUP_CHECK_ATTEMPTS {
-            match check(&state, Prepare::Now).await {
-                Ok(_) => break,
+            match check(&state, Prepare::WhenQuiet(local_timezone())).await {
+                Ok(checked) => {
+                    waiting = matches!(checked, Checked::Waiting);
+                    break;
+                }
                 Err(error) => {
                     warn!(attempt, error = %error, "software update check after an update of this Nest failed");
                     sleep(STARTUP_CHECK_RETRY).await;
@@ -534,13 +541,8 @@ async fn run(state: AppState) {
             }
         }
     }
-    // A commit found by day that waits for a quiet Nest or the night.
-    let mut waiting = false;
     loop {
-        let timezone = crate::appliance::nixos::is_nixos()
-            .then(crate::appliance::schedule::timezone)
-            .flatten()
-            .unwrap_or(chrono_tz::UTC);
+        let timezone = local_timezone();
         let now = Utc::now();
         let scheduled = next_check(now, timezone, offset);
         let mut wait = (scheduled - now).to_std().unwrap_or_default();
@@ -571,8 +573,7 @@ async fn run(state: AppState) {
             }
             continue;
         }
-        // Manage's request is an admin's: it evaluates at once, as the check
-        // right after an update of this Nest does.
+        // Manage's request is an admin's: it evaluates at once.
         let prepare = if on_demand {
             Prepare::Now
         } else {
@@ -602,6 +603,14 @@ async fn run(state: AppState) {
             warn!(error = %error, "could not record software update check");
         }
     }
+}
+
+/// The time zone the night and the scheduled checks are in.
+fn local_timezone() -> chrono_tz::Tz {
+    crate::appliance::nixos::is_nixos()
+        .then(crate::appliance::schedule::timezone)
+        .flatten()
+        .unwrap_or(chrono_tz::UTC)
 }
 
 fn pending_request(state: &CheckState) -> Option<String> {
@@ -705,7 +714,7 @@ fn prepare_now(local_minute: u32, quiet_for: Option<chrono::Duration>) -> bool {
 /// When a new commit is evaluated.
 #[derive(Clone, Copy)]
 enum Prepare {
-    /// Now: an admin asked, or this Nest was just updated.
+    /// Now: an admin asked.
     Now,
     /// Only when `may_prepare`; otherwise the check waits.
     WhenQuiet(chrono_tz::Tz),
