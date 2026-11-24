@@ -81,6 +81,8 @@ def active_address():
 
 
 def render_config(address):
+    # libnice renews a 120-second allocation halfway through its lifetime.
+    # The coturn package applies this cap even when Refresh omits LIFETIME.
     return f"""listening-ip={address}
 relay-ip={address}
 listening-port=3478
@@ -109,6 +111,7 @@ user-quota=2
 total-quota=40
 max-bps={SETTINGS['max_bps']}
 bps-capacity={SETTINGS['bps_capacity']}
+max-allocate-lifetime=120
 stale-nonce=600
 pidfile={PID}
 log-file=stdout

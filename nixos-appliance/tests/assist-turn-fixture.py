@@ -26,6 +26,9 @@ PEER_IPV6 = 'fd42:50::20'
 SCHEMA = 'tiaris.nest.assist-turn.v1'
 PORT = 3478
 PEER_PORT = 5000
+ALLOCATION_LIFETIME = 120
+ABANDONED_PORT = Path('/run/turn-abandoned-port')
+LIFETIMES_VERIFIED = Path('/run/turn-lifetimes-verified')
 LOW_PORT = 900
 IDS = ('20261123-00000001', '20261123-00000002')
 PAYLOAD = b'local TURN test' * 8
@@ -160,6 +163,55 @@ async def private_exchange(protocol):
     assert await asyncio.wait_for(protocol.receiver.incoming.get(), 2) == (PAYLOAD, (PEER, PEER_PORT))
 
 
+async def allocate_with_manual_refresh(protocol, requested_lifetime=None):
+    from aioice import stun, turn
+
+    attributes = {'REQUESTED-TRANSPORT': turn.UDP_TRANSPORT}
+    if requested_lifetime is not None:
+        attributes['LIFETIME'] = requested_lifetime
+    request = stun.Message(stun.Method.ALLOCATE, stun.Class.REQUEST, attributes=attributes)
+    response, _ = await asyncio.wait_for(protocol.request_with_retry(request), 4)
+    assert response.attributes['LIFETIME'] == ALLOCATION_LIFETIME
+    address = response.attributes['XOR-RELAYED-ADDRESS']
+    assert address[0] == LAN and 61000 <= address[1] <= 61040
+    protocol.relayed_address = address
+    return address
+
+
+async def allocation_lifetimes():
+    from aioice import stun
+
+    abandoned = await client(0)
+    _, port = await allocate_with_manual_refresh(abandoned)
+    await private_exchange(abandoned)
+    # UDP close sends no TURN messages, as when the helper is killed.
+    abandoned.transport.close()
+    ABANDONED_PORT.write_text(f'{port}\n')
+
+    active = await client(0)
+    clock = asyncio.get_running_loop()
+    try:
+        started = clock.time()
+        await allocate_with_manual_refresh(active, requested_lifetime=600)
+        await private_exchange(active)
+        interval = ALLOCATION_LIFETIME // 2
+        for elapsed in (interval, 2 * interval):
+            await asyncio.sleep(max(0, started + elapsed - clock.time()))
+            # libnice omits LIFETIME on its ordinary Refresh requests.
+            request = stun.Message(stun.Method.REFRESH, stun.Class.REQUEST)
+            response, _ = await asyncio.wait_for(active.request_with_retry(request), 4)
+            assert response.attributes['LIFETIME'] == ALLOCATION_LIFETIME
+            await private_exchange(active)
+
+        # Relay traffic must still work beyond the original allocation deadline.
+        await asyncio.sleep(max(0, started + ALLOCATION_LIFETIME + 3 - clock.time()))
+        await private_exchange(active)
+        await asyncio.wait_for(active.delete(), 4)
+        LIFETIMES_VERIFIED.touch()
+    finally:
+        active.transport.close()
+
+
 async def rotation():
     old = await client(0)
     original_relay = await allocate(old)
@@ -270,5 +322,7 @@ if __name__ == '__main__':
         binding(PEER_IPV6, NEST_IPV6, False)
         binding(PEER, OTHER_LOCAL, False)
         asyncio.run(boundary())
+    elif action == 'lifetimes':
+        asyncio.run(allocation_lifetimes())
     elif action == 'rotation':
         asyncio.run(rotation())
