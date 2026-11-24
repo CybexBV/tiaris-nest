@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -273,9 +274,12 @@ class PublicationRecoveryTests(unittest.TestCase):
         def sleep(seconds):
             sleeps.append(seconds)
             elapsed[0] += seconds
+        # Replace only the helper's own clock. Patching the shared `time` module also caught
+        # subprocess's own wait polling (sleeps of 0.001 to 0.05 s while a fake gh exits), which
+        # failed the Nest release gate on a busy runner (24 November 2026, v0.2.192).
+        clock = SimpleNamespace(monotonic=lambda: elapsed[0], sleep=sleep)
         with patch.dict(os.environ, self.environment), patch.object(publication, 'WAIT_SECONDS', 6), \
-                patch.object(publication.time, 'monotonic', side_effect=lambda: elapsed[0]), \
-                patch.object(publication.time, 'sleep', side_effect=sleep):
+                patch.object(publication, 'time', clock):
             error = None
             try:
                 publication.verify_attestation()
