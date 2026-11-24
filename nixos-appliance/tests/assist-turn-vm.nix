@@ -104,6 +104,8 @@ import (nixpkgs + "/nixos/tests/make-test-python.nix") ({ pkgs, ... }: {
     };
   };
   testScript = ''
+    import time
+
     smoke = ${if smoke then "True" else "False"}
     fixture = "python3 /etc/assist-turn-fixture.py"
     status = "/run/tiaris-nest-turn/status.json"
@@ -139,6 +141,21 @@ import (nixpkgs + "/nixos/tests/make-test-python.nix") ({ pkgs, ... }: {
     appliance.succeed("test $(stat -c %a /var/lib/tiaris-nest/state/agent/assist-turn.json) = 600")
     appliance.succeed("test $(stat -c %U:%G:%a /run/tiaris-nest-turn/turnserver.conf) = root:tiaris-turn:640")
     appliance.fail("runuser -u nobody -- test -r /var/lib/tiaris-nest-turn/turndb")
+
+    with subtest("abandoned allocation expires and libnice-style Refresh keeps a live relay"):
+        started = time.monotonic()
+        peer.succeed("systemd-run --unit=turn-lifetimes --property=RuntimeMaxSec=145s $(command -v python3) /etc/assist-turn-fixture.py lifetimes")
+        peer.wait_until_succeeds("test -s /run/turn-abandoned-port", timeout=10)
+        port = int(peer.succeed("cat /run/turn-abandoned-port").strip())
+        assert 61000 <= port <= 61040
+        sockets = f"ss -H -4lunp 'sport = :{port}'"
+        appliance.succeed(f"{sockets} | grep -F turnserver")
+        appliance.wait_until_succeeds(
+            f'rows=$({sockets}) && test -z "$rows"',
+            timeout=max(1, 130 - round(time.monotonic() - started)),
+        )
+        print(f"Abandoned TURN relay closed within {time.monotonic() - started:.1f} seconds")
+        peer.wait_until_succeeds("test -f /run/turn-lifetimes-verified", timeout=15)
 
     if not smoke:
         appliance.succeed("systemctl stop tiaris-nest-assist-turn.timer")

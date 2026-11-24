@@ -3,6 +3,9 @@ let
   cfg = config.services.tiaris-nest;
   a = cfg.appliance;
   runtime = import ./runtime.nix { inherit pkgs; inherit (a) package; };
+  coturn = pkgs.coturn.overrideAttrs (previous: {
+    patches = (previous.patches or [ ]) ++ [ ./coturn-max-allocation-lifetime.patch ];
+  });
   ipxe = pkgs.ipxe.override { additionalTargets."bin-x86_64-efi/snponly.efi" = null; };
   command = name: "${runtime}/bin/tiaris-nest-${name}";
   publicKey = pkgs.writeText "nest-release-public-key" (a.releasePublicKey + "\n");
@@ -246,7 +249,7 @@ in {
     };
     systemd.services.tiaris-nest-network-runtime = (rootService "network-runtime") // { after = [ "tiaris-nest-first-boot.service" "tiaris-nest-network-guard.service" "network-online.target" ]; wants = [ "network-online.target" ]; before = [ "tiaris-nest.service" ]; serviceConfig = { Type = "oneshot"; ExecStart = command "network-runtime"; TimeoutStartSec = "30s"; }; };
     systemd.services.tiaris-nest-assist-turn = (rootService "assist-turn") // {
-      environment.TIARIS_NEST_TURN_DB_SCHEMA = "${pkgs.coturn}/share/turnserver/schema.sql";
+      environment.TIARIS_NEST_TURN_DB_SCHEMA = "${coturn}/share/turnserver/schema.sql";
       wantedBy = [ "multi-user.target" ];
       requires = [ "tiaris-nest-first-boot.service" ];
       after = [ "tiaris-nest-first-boot.service" "tiaris-nest-network-runtime.service" ];
@@ -264,7 +267,7 @@ in {
       unitConfig.ConditionPathExists = "/run/tiaris-nest-turn/turnserver.conf";
       serviceConfig = {
         Type = "exec";
-        ExecStart = "${pkgs.coturn}/bin/turnserver -c /run/tiaris-nest-turn/turnserver.conf";
+        ExecStart = "${coturn}/bin/turnserver -c /run/tiaris-nest-turn/turnserver.conf";
         ExecStopPost = "+${pkgs.coreutils}/bin/rm -f /run/tiaris-nest-turn/status.json";
         User = "tiaris-turn";
         UMask = "0077";
