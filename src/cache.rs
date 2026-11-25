@@ -2,7 +2,7 @@ mod member_hashes;
 pub mod seeds;
 
 use std::{
-    collections::{BTreeSet, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     ffi::CString,
     fs,
     io::{self, Read},
@@ -38,6 +38,16 @@ const CACHE_EXPORT_NAR_COMPRESSION: &str = "zstd";
 const CACHE_EXPORT_COPY_MAX_ATTEMPTS: usize = 2;
 const MAX_NARINFO_BYTES: u64 = 1024 * 1024;
 const NIX_BASE32_ALPHABET: &[u8; 32] = b"0123456789abcdfghijklmnpqrsvwxyz";
+/// The caches a computer away from school downloads from besides its
+/// organization's tree: `cache.nixos.org` and the Tiaris software cache
+/// (Manage `docs/software-cache.md`, "Organization trees and off-site
+/// downloads"). The same keys as the appliance's `trusted-public-keys`.
+const OFFSITE_CACHE_PUBLIC_KEYS: [&str; 2] = [
+    "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=",
+    "cache.tiaris.com-1:xIrpkpeFBAzhhUQojSWqkpAWTwGoW4HtUEtHAcd4taY=",
+];
+const PROVENANCE_SUBSTITUTE: &str = "substitute";
+const PROVENANCE_BUILT: &str = "built";
 
 /// Cross-process lease for the cache filesystem and its artifact inventory.
 ///
@@ -225,6 +235,69 @@ struct VerifiedClosureManifest {
     oldest_member_hash: SystemTime,
 }
 
+/// How a closure manifest names each member's `provenance`. Manage grants
+/// this Nest an upload of exactly the `built` members to its organization's
+/// tree, from which computers away from school download them.
+#[derive(Clone, Debug)]
+struct ProvenanceRule {
+    offsite_keys: Vec<String>,
+    /// The provenance an existing artifact's manifest was recorded with, by
+    /// store path. An artifact's closure manifest is its identity: Manage
+    /// purges an artifact whose manifest digest changes, and the scrub
+    /// withdraws one whose rebuilt manifest differs. So members keep their
+    /// recorded value: `unknown` in manifests from before members were
+    /// classified, and the first value when a replica import later rewrote a
+    /// shared member's narinfo with other signatures.
+    recorded: BTreeMap<String, String>,
+}
+
+impl ProvenanceRule {
+    /// Classifies every member, keeping what `recorded_manifest` (the
+    /// closure manifest an artifact was recorded with, if any) says.
+    fn new(recorded_manifest: Option<&Value>) -> Self {
+        let recorded = recorded_manifest
+            .and_then(|manifest| manifest.get("artifacts"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|artifact| {
+                let store_path = artifact.get("store_path")?.as_str()?;
+                let provenance = artifact.get("provenance")?.as_str()?;
+                Some((store_path.to_string(), provenance.to_string()))
+            })
+            .collect();
+        Self {
+            offsite_keys: OFFSITE_CACHE_PUBLIC_KEYS.map(str::to_string).to_vec(),
+            recorded,
+        }
+    }
+
+    /// `substitute` when the narinfo carries a valid signature by an
+    /// off-site cache's key, so a computer can download the member without
+    /// this Nest. `built` otherwise: built here, imported from a release, or
+    /// signed only by Nests. Nix keeps a substituted path's signatures and
+    /// `nix copy` writes them into the narinfo, also for a mirrored replica.
+    fn of(&self, narinfo: &ParsedNarInfo) -> String {
+        if let Some(recorded) = self.recorded.get(&narinfo.store_path) {
+            return recorded.clone();
+        }
+        let offsite = self.offsite_keys.iter().any(|key| {
+            let name = key.split_once(':').map_or("", |(name, _)| name);
+            narinfo
+                .signatures
+                .iter()
+                .any(|signature| signature.split_once(':').is_some_and(|(n, _)| n == name))
+                && verify_narinfo_signature(narinfo, key).is_ok()
+        });
+        if offsite {
+            PROVENANCE_SUBSTITUTE
+        } else {
+            PROVENANCE_BUILT
+        }
+        .to_string()
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct NixCacheInfo {
     store_dir: String,
@@ -367,6 +440,7 @@ pub async fn export_output(
         "Nest cache export",
     )?;
     let public_key = ensure_signing_key(config).await?;
+    let recorded_manifest = db::recorded_closure_manifest(pool, store_path).await?;
     let cache_dir = config.cache.root_dir.clone();
     // Keep quarantined metadata outside the static cache document root. A
     // failed signature/hash check removes the signed discovery record from
@@ -406,6 +480,7 @@ pub async fn export_output(
             &store_path,
             evaluated_derivation.as_deref(),
             &public_key,
+            recorded_manifest.as_ref(),
         )?;
         let timings = ExportTimings {
             copy,
@@ -625,6 +700,7 @@ pub async fn import_replica_closure(
     let toplevel = source.toplevel_store_path.to_string();
     let evaluated_derivation = source.evaluated_derivation.map(str::to_string);
     let public_key_for_verify = public_key.clone();
+    let recorded_manifest = db::recorded_closure_manifest(pool, &toplevel).await?;
     let copy = copy_started.elapsed();
     let manifest_started = Instant::now();
     let verified = task::spawn_blocking(move || {
@@ -634,6 +710,7 @@ pub async fn import_replica_closure(
             &toplevel,
             evaluated_derivation.as_deref(),
             &public_key_for_verify,
+            recorded_manifest.as_ref(),
         )
     })
     .await
@@ -1091,14 +1168,17 @@ fn build_or_quarantine_closure_manifest(
     root_store_path: &str,
     evaluated_derivation: Option<&str>,
     trusted_public_key: &str,
+    recorded_manifest: Option<&Value>,
 ) -> Result<VerifiedClosureManifest> {
     let mut inspected_narinfos = Vec::new();
-    match build_closure_manifest(
+    match build_closure_manifest_with(
         cache_root,
         root_store_path,
         evaluated_derivation,
         trusted_public_key,
         &mut inspected_narinfos,
+        MemberHashes::global(),
+        &ProvenanceRule::new(recorded_manifest),
     ) {
         Ok(manifest) => Ok(manifest),
         Err(error) => {
@@ -1158,6 +1238,7 @@ fn build_closure_manifest(
         trusted_public_key,
         inspected_narinfos,
         MemberHashes::global(),
+        &ProvenanceRule::new(None),
     )
 }
 
@@ -1168,6 +1249,7 @@ fn build_closure_manifest_with(
     trusted_public_key: &str,
     inspected_narinfos: &mut Vec<PathBuf>,
     member_hashes: &MemberHashes,
+    provenance: &ProvenanceRule,
 ) -> Result<VerifiedClosureManifest> {
     validate_store_path(root_store_path).context("validate closure root store path")?;
     let evaluated_derivation = evaluated_derivation
@@ -1286,6 +1368,7 @@ fn build_closure_manifest_with(
             root_narinfo_path = Some(narinfo_path.clone());
             root_nar_path = Some(nar_path.clone());
         }
+        let member_provenance = provenance.of(&narinfo);
         artifacts.push(ClosureManifestArtifact {
             store_path: narinfo.store_path,
             narinfo_path: narinfo_filename,
@@ -1296,7 +1379,7 @@ fn build_closure_manifest_with(
             nar_size_bytes: nar_size,
             compression: narinfo.compression,
             references: narinfo.references,
-            provenance: "unknown".to_string(),
+            provenance: member_provenance,
         });
     }
 
@@ -2408,12 +2491,15 @@ fn verify_cache_artifact_blocking(
         .cache_metadata
         .pointer("/closure_manifest/evaluated_derivation")
         .and_then(Value::as_str);
+    // The rebuilt manifest keeps the provenance the artifact was recorded
+    // with, so only the closure's bytes, signatures and shape are compared.
     let verified = build_or_quarantine_closure_manifest(
         cache_root,
         quarantine_root,
         &artifact.store_path,
         evaluated_derivation,
         public_key,
+        artifact.cache_metadata.get("closure_manifest"),
     )?;
 
     let root = &verified.root_narinfo;
@@ -3396,7 +3482,7 @@ mod tests {
                 "store_path",
             ])
         );
-        assert_eq!(root_artifact["provenance"], "unknown");
+        assert_eq!(root_artifact["provenance"], "built");
         assert_eq!(
             root_artifact["references"],
             json!([dependency_a, dependency_b])
@@ -3471,6 +3557,7 @@ mod tests {
                 &test_public_key(),
                 &mut Vec::new(),
                 &hashes,
+                &ProvenanceRule::new(None),
             )
         };
 
@@ -3518,6 +3605,7 @@ mod tests {
             &test_public_key(),
             &mut Vec::new(),
             &hashes,
+            &ProvenanceRule::new(None),
         )
         .unwrap();
         let due = manifest.oldest_member_hash + member_hashes::SCRUB_EVERY;
@@ -3741,6 +3829,7 @@ mod tests {
             &root_store,
             None,
             &test_public_key(),
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -3811,7 +3900,8 @@ mod tests {
                     &quarantine,
                     &seed,
                     None,
-                    &test_public_key()
+                    &test_public_key(),
+                    None
                 )
                 .is_err()
             );
@@ -3857,6 +3947,7 @@ mod tests {
             &root_store,
             None,
             &test_public_key(),
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -4982,6 +5073,292 @@ CA: text:sha256:02ip8n5zbxc22shv5832dwhiaci5r9c306882a058savij6rnn7s\n";
             .flat_map(|batch| fs::read_dir(batch.unwrap().path()).unwrap())
             .count();
         assert_eq!(quarantined, 3);
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// A stand-in for `cache.nixos.org-1`: the same key name, another key.
+    fn test_offsite_signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[0x24; 32])
+    }
+
+    fn test_offsite_public_key() -> String {
+        format!(
+            "cache.nixos.org-1:{}",
+            BASE64_STANDARD.encode(test_offsite_signing_key().verifying_key().as_bytes())
+        )
+    }
+
+    /// Adds a `cache.nixos.org-1` signature to a cache member's narinfo, as
+    /// `nix copy` writes for a path Nix substituted from cache.nixos.org.
+    /// `valid: false` signs another fingerprint under the same key name.
+    fn add_offsite_signature(cache_root: &Path, store_path: &str, valid: bool) {
+        let path = cache_root.join(narinfo_filename_for_store_path(store_path).unwrap());
+        let raw = fs::read_to_string(&path).unwrap();
+        let mut narinfo = parse_narinfo_strict(&raw).unwrap();
+        narinfo.references.sort();
+        if !valid {
+            narinfo.nar_size += 1;
+        }
+        let signed = append_own_signature(
+            &raw,
+            &narinfo,
+            &test_offsite_signing_key(),
+            "cache.nixos.org-1",
+        )
+        .unwrap();
+        fs::write(path, signed).unwrap();
+    }
+
+    fn provenance_by_name(manifest: &Value) -> BTreeMap<String, String> {
+        manifest["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|artifact| {
+                let store_path = artifact["store_path"].as_str().unwrap();
+                (
+                    store_path.split_once('-').unwrap().1.to_string(),
+                    artifact["provenance"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// The manifest as Nest wrote it before members were classified.
+    fn legacy_manifest(manifest: &Value) -> Value {
+        let mut legacy = manifest.clone();
+        let object = legacy.as_object_mut().unwrap();
+        object.remove("manifest_sha256");
+        for artifact in object["artifacts"].as_array_mut().unwrap() {
+            artifact["provenance"] = json!("unknown");
+        }
+        let digest = sha256_hex(&canonical_json_bytes(&legacy).unwrap());
+        legacy["manifest_sha256"] = json!(digest);
+        legacy
+    }
+
+    #[test]
+    fn members_signed_by_an_offsite_cache_are_substitutes_and_the_rest_built() {
+        let root = test_temp_dir("closure-manifest-provenance");
+        let substituted = test_store_path('a', "substituted");
+        let forged = test_store_path('b', "forged");
+        let built = test_store_path('c', "built");
+        let root_store = test_store_path('d', "root");
+        for member in [&substituted, &forged, &built] {
+            write_manifest_cache_member(&root, member, member.as_bytes(), &[]);
+        }
+        write_manifest_cache_member(
+            &root,
+            &root_store,
+            b"root-nar",
+            &[substituted.clone(), forged.clone(), built.clone()],
+        );
+        add_offsite_signature(&root, &substituted, true);
+        add_offsite_signature(&root, &forged, false);
+        let rule = ProvenanceRule {
+            offsite_keys: vec![test_offsite_public_key()],
+            recorded: BTreeMap::new(),
+        };
+        let manifest = |rule: &ProvenanceRule| {
+            build_closure_manifest_with(
+                &root,
+                &root_store,
+                None,
+                &test_public_key(),
+                &mut Vec::new(),
+                MemberHashes::global(),
+                rule,
+            )
+            .unwrap()
+        };
+
+        let classified = manifest(&rule);
+        assert_eq!(
+            provenance_by_name(&classified.manifest),
+            BTreeMap::from([
+                ("built".to_string(), "built".to_string()),
+                ("forged".to_string(), "built".to_string()),
+                ("root".to_string(), "built".to_string()),
+                ("substituted".to_string(), "substitute".to_string()),
+            ])
+        );
+        // The real off-site keys do not accept the stand-in's signature.
+        let production = manifest(&ProvenanceRule::new(None));
+        assert!(
+            provenance_by_name(&production.manifest)
+                .values()
+                .all(|provenance| provenance == "built")
+        );
+
+        // A manifest recorded before classification keeps `unknown`, byte
+        // for byte, so its digest and Manage's record of it stay the same.
+        let legacy = legacy_manifest(&classified.manifest);
+        let rebuilt = manifest(&ProvenanceRule {
+            offsite_keys: vec![test_offsite_public_key()],
+            recorded: ProvenanceRule::new(Some(&legacy)).recorded,
+        });
+        assert_eq!(rebuilt.manifest, legacy);
+        assert_eq!(rebuilt.manifest_sha256, legacy["manifest_sha256"]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn scrub_and_export_keep_the_provenance_an_artifact_was_recorded_with() {
+        let pool = db::connect_with_url("sqlite::memory:").await.unwrap();
+        db::migrate(&pool).await.unwrap();
+        let root = test_temp_dir("integrity-scrub-provenance");
+        let cache_root = root.join("cache");
+        let data_root = root.join("data");
+        fs::create_dir_all(&cache_root).unwrap();
+        fs::create_dir_all(&data_root).unwrap();
+        let dependency = test_store_path('b', "dependency");
+        let legacy_root = test_store_path('a', "legacy-root");
+        let classified_root = test_store_path('c', "classified-root");
+        write_manifest_cache_member(&cache_root, &dependency, &[0x31; 16], &[]);
+        for (store_path, bytes) in [(&legacy_root, [0x41; 16]), (&classified_root, [0x51; 16])] {
+            write_manifest_cache_member(
+                &cache_root,
+                store_path,
+                &bytes,
+                std::slice::from_ref(&dependency),
+            );
+        }
+        add_offsite_signature(&cache_root, &dependency, true);
+        let public_key = test_public_key();
+        let rule = ProvenanceRule {
+            offsite_keys: vec![test_offsite_public_key()],
+            recorded: BTreeMap::new(),
+        };
+        let build = |store_path: &str, rule: &ProvenanceRule| {
+            build_closure_manifest_with(
+                &cache_root,
+                store_path,
+                None,
+                &public_key,
+                &mut Vec::new(),
+                MemberHashes::global(),
+                rule,
+            )
+            .unwrap()
+        };
+        let legacy = build(&legacy_root, &rule);
+        let legacy_manifest = legacy_manifest(&legacy.manifest);
+        let classified = build(&classified_root, &rule);
+        assert_eq!(
+            provenance_by_name(&classified.manifest)["dependency"],
+            "substitute"
+        );
+
+        let mut config = AppConfig::default();
+        config.cache.root_dir = cache_root.clone();
+        config.paths.data_dir = data_root.clone();
+        config.cache.private_key_path = data_root.join("cache-private-key");
+        config.cache.public_key_path = data_root.join("cache-public-key");
+        fs::write(&config.cache.private_key_path, "test-private-key").unwrap();
+        fs::write(&config.cache.public_key_path, &public_key).unwrap();
+        for (hash, verified, manifest) in [
+            ("d", legacy, legacy_manifest.clone()),
+            ("e", classified, Value::Null),
+        ] {
+            let manifest = if manifest.is_null() {
+                verified.manifest.clone()
+            } else {
+                manifest
+            };
+            let root_narinfo = verified.root_narinfo;
+            db::create_cache_artifact(
+                &pool,
+                crate::models::CreateCacheArtifactRequest {
+                    artifact_type: "nixos_closure".to_string(),
+                    hash: hash.repeat(64),
+                    size_bytes: root_narinfo.file_size,
+                    path: verified.root_nar_path.display().to_string(),
+                    store_path: Some(root_narinfo.store_path.clone()),
+                    narinfo_path: Some(verified.root_narinfo_path.display().to_string()),
+                    nar_url: Some(root_narinfo.url),
+                    file_hash: Some(root_narinfo.file_hash),
+                    nar_hash: Some(root_narinfo.nar_hash),
+                    nar_size_bytes: Some(root_narinfo.nar_size),
+                    closure_size_bytes: Some(32),
+                    closure_file_size_bytes: Some(verified.total_file_size_bytes as i64),
+                    compression: Some(root_narinfo.compression),
+                    references: Some(json!(root_narinfo.references)),
+                    serving_url: Some(format!(
+                        "http://nest.example/cache/{}",
+                        root_narinfo.store_path
+                    )),
+                    source_build_job_id: None,
+                    cache_metadata: Some(json!({
+                        "cache_schema": "tiaris.nest.cache.v1",
+                        "public_key_fingerprint": public_key_fingerprint(&public_key),
+                        "closure_manifest": manifest,
+                        "closure_manifest_sha256": manifest["manifest_sha256"],
+                    })),
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        // A replica import rewrites the shared member's narinfo without the
+        // off-site signature: classified afresh it would now be `built`.
+        let dependency_narinfo =
+            cache_root.join(narinfo_filename_for_store_path(&dependency).unwrap());
+        let unsigned = fs::read_to_string(&dependency_narinfo)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.starts_with("Sig: cache.nixos.org-1:"))
+            .fold(String::new(), |mut text, line| {
+                text.push_str(line);
+                text.push('\n');
+                text
+            });
+        fs::write(&dependency_narinfo, unsigned).unwrap();
+        assert_eq!(
+            provenance_by_name(&build(&classified_root, &rule).manifest)["dependency"],
+            "built"
+        );
+
+        // Neither artifact is withdrawn: both keep their recorded manifests.
+        assert_eq!(scrub_cache_artifacts(&pool, &config, 2).await.unwrap(), 0);
+        let artifacts = db::list_cache_artifacts(&pool).await.unwrap();
+        assert_eq!(artifacts.len(), 2);
+
+        // A new export of either closure reuses what was recorded.
+        for (store_path, expected) in [
+            (&legacy_root, legacy_manifest),
+            (
+                &classified_root,
+                artifacts
+                    .iter()
+                    .find(|artifact| artifact.store_path == classified_root)
+                    .unwrap()
+                    .cache_metadata["closure_manifest"]
+                    .clone(),
+            ),
+        ] {
+            let recorded = db::recorded_closure_manifest(&pool, store_path)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(recorded, expected);
+            let rebuilt = build_or_quarantine_closure_manifest(
+                &cache_root,
+                &data_root.join("cache-quarantine"),
+                store_path,
+                None,
+                &public_key,
+                Some(&recorded),
+            )
+            .unwrap();
+            assert_eq!(rebuilt.manifest, expected);
+        }
+        assert!(
+            db::recorded_closure_manifest(&pool, &dependency)
+                .await
+                .unwrap()
+                .is_none()
+        );
         fs::remove_dir_all(root).ok();
     }
 

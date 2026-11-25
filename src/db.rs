@@ -2344,6 +2344,28 @@ pub async fn create_cache_artifact(
     .await
 }
 
+/// The closure manifest an artifact of `store_path` was recorded with, from
+/// the oldest such artifact that has one. A new export of the same closure
+/// keeps its members' recorded provenance (`cache::ProvenanceRule`).
+pub async fn recorded_closure_manifest(
+    pool: &SqlitePool,
+    store_path: &str,
+) -> AppResult<Option<Value>> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT cache_metadata FROM nest_cache_artifacts WHERE store_path = ? ORDER BY id",
+    )
+    .bind(store_path)
+    .fetch_all(pool)
+    .await?;
+    for raw in rows {
+        let metadata = metadata_from_db(&raw, "cache artifact metadata")?;
+        if let Some(manifest) = metadata.get("closure_manifest").filter(|m| m.is_object()) {
+            return Ok(Some(manifest.clone()));
+        }
+    }
+    Ok(None)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn upsert_cache_artifact(
     pool: &SqlitePool,

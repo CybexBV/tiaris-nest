@@ -361,12 +361,14 @@ async fn export(
             export_timeout,
             &Default::default(),
         )?;
+        // Only checked: a seed records no artifact, so nothing to keep.
         super::build_or_quarantine_closure_manifest(
             &cache_dir,
             &quarantine_dir,
             &store_path,
             None,
             &public_key,
+            None,
         )?;
         Ok(())
     })
