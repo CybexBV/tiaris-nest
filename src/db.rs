@@ -150,6 +150,134 @@ pub async fn connect_with_url(database_url: &str) -> AppResult<SqlitePool> {
         .await?)
 }
 
+const DB_MAINTENANCE_INITIAL_DELAY: Duration = Duration::from_secs(10 * 60);
+const DB_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const VACUUM_HEADROOM_BYTES: u64 = 256 * 1024 * 1024;
+const INCREMENTAL_VACUUM_MIN_FREELIST_PAGES: i64 = 64;
+const INCREMENTAL_VACUUM_PAGES_PER_PASS: i64 = 256;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaintenanceReport {
+    pub auto_vacuum_before: i64,
+    pub auto_vacuum_after: i64,
+    pub vacuum_skipped: Option<String>,
+}
+
+/// Periodic SQLite maintenance: checkpoint/truncate the WAL, refresh query
+/// statistics, and convert/reclaim freed pages with incremental auto-vacuum
+/// when `TIARIS_STATE` has ample free space and no build or update is active.
+pub fn spawn_maintenance(pool: SqlitePool, database_path: std::path::PathBuf) {
+    tokio::spawn(async move {
+        tokio::time::sleep(DB_MAINTENANCE_INITIAL_DELAY).await;
+        loop {
+            if let Err(err) = run_maintenance(&pool, &database_path).await {
+                tracing::warn!(error = %err, "periodic SQLite maintenance failed");
+            }
+            tokio::time::sleep(DB_MAINTENANCE_INTERVAL).await;
+        }
+    });
+}
+
+pub async fn run_maintenance(
+    pool: &SqlitePool,
+    database_path: &Path,
+) -> AppResult<MaintenanceReport> {
+    let mut conn = pool.acquire().await?;
+    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("PRAGMA optimize").execute(&mut *conn).await?;
+
+    let auto_vacuum_before: i64 = sqlx::query_scalar("PRAGMA auto_vacuum")
+        .fetch_one(&mut *conn)
+        .await?;
+    let mut vacuum_skipped = None;
+    match auto_vacuum_before {
+        0 => match vacuum_skip_reason(&mut conn, database_path).await? {
+            None => {
+                sqlx::query("PRAGMA auto_vacuum = INCREMENTAL")
+                    .persistent(false)
+                    .execute(&mut *conn)
+                    .await?;
+                sqlx::query("VACUUM")
+                    .persistent(false)
+                    .execute(&mut *conn)
+                    .await?;
+                sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+                    .persistent(false)
+                    .execute(&mut *conn)
+                    .await?;
+            }
+            Some(reason) => {
+                tracing::debug!(reason = %reason, "skipping SQLite auto_vacuum conversion");
+                vacuum_skipped = Some(reason);
+            }
+        },
+        2 => {
+            let freelist: i64 = sqlx::query_scalar("PRAGMA freelist_count")
+                .fetch_one(&mut *conn)
+                .await?;
+            if freelist >= INCREMENTAL_VACUUM_MIN_FREELIST_PAGES {
+                sqlx::query(&format!(
+                    "PRAGMA incremental_vacuum({INCREMENTAL_VACUUM_PAGES_PER_PASS})"
+                ))
+                .execute(&mut *conn)
+                .await?;
+            }
+        }
+        _ => {}
+    }
+    let auto_vacuum_after: i64 = sqlx::query_scalar("PRAGMA auto_vacuum")
+        .fetch_one(&mut *conn)
+        .await?;
+    Ok(MaintenanceReport {
+        auto_vacuum_before,
+        auto_vacuum_after,
+        vacuum_skipped,
+    })
+}
+
+async fn vacuum_skip_reason(
+    conn: &mut sqlx::SqliteConnection,
+    database_path: &Path,
+) -> AppResult<Option<String>> {
+    let meta = match fs::symlink_metadata(database_path) {
+        Ok(meta) => meta,
+        Err(err) => return Ok(Some(format!("metadata error: {err}"))),
+    };
+    if !meta.is_file() {
+        return Ok(Some("database path is not a regular file".to_string()));
+    }
+    let active_jobs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM nest_build_jobs WHERE status IN ('queued', 'running')",
+    )
+    .fetch_one(conn)
+    .await?;
+    if active_jobs > 0 {
+        return Ok(Some(format!("{active_jobs} active build jobs")));
+    }
+    match crate::maintenance::lease_active() {
+        Ok(true) => return Ok(Some("maintenance lease active".to_string())),
+        Err(err) => return Ok(Some(format!("maintenance lease error: {err}"))),
+        Ok(false) => {}
+    }
+    let stats = match crate::disk::stats(database_path) {
+        Ok(stats) => stats,
+        Err(err) => return Ok(Some(format!("statvfs error: {err}"))),
+    };
+    let required = meta
+        .len()
+        .saturating_mul(2)
+        .saturating_add(VACUUM_HEADROOM_BYTES);
+    if stats.available_bytes < required {
+        return Ok(Some(format!(
+            "insufficient free space on {}: {} < {}",
+            stats.path, stats.available_bytes, required
+        )));
+    }
+    Ok(None)
+}
+
 /// Startup migration: this release's migrations, run alongside newer
 /// declared ones a rolled-back release left (`crate::schema_evolution`).
 pub async fn migrate(pool: &SqlitePool) -> AppResult<()> {
@@ -5795,5 +5923,48 @@ mod tests {
             .map(|artifact| artifact.id)
             .collect();
         assert_eq!(whole, vec![members[0].0]);
+    }
+
+    #[tokio::test]
+    async fn maintenance_enables_incremental_auto_vacuum_and_stays_rollback_compatible() {
+        let dir =
+            std::env::temp_dir().join(format!("tiaris-nest-db-maint-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("nest.sqlite");
+        let url = format!("sqlite://{}", db_path.display());
+        let pool = connect_with_url(&url).await.unwrap();
+        migrate(&pool).await.unwrap();
+
+        let before: i64 = sqlx::query_scalar("PRAGMA auto_vacuum")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(before, 0);
+
+        let report = run_maintenance(&pool, &db_path).await.unwrap();
+        assert_eq!(
+            report.vacuum_skipped, None,
+            "unexpected vacuum skip: {report:?}"
+        );
+        assert_eq!(report.auto_vacuum_after, 2);
+
+        // Second pass runs incremental vacuum path cleanly without error.
+        let second = run_maintenance(&pool, &db_path).await.unwrap();
+        assert_eq!(second.auto_vacuum_before, 2);
+        assert_eq!(second.auto_vacuum_after, 2);
+
+        pool.close().await;
+        let fresh = connect_with_url(&url).await.unwrap();
+        let persisted: i64 = sqlx::query_scalar("PRAGMA auto_vacuum")
+            .fetch_one(&fresh)
+            .await
+            .unwrap();
+        assert_eq!(persisted, 2);
+        fresh.close().await;
+
+        crate::schema_evolution::verify_rollback_target(&db_path)
+            .await
+            .unwrap();
+        let _ = fs::remove_dir_all(&dir);
     }
 }
