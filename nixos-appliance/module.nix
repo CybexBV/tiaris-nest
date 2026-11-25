@@ -322,6 +322,29 @@ in {
       serviceConfig = { Type = "oneshot"; ExecStart = command "generation-commit"; TimeoutStartSec = "5min"; };
     };
     systemd.services.tiaris-nest-gc = (rootService "gc");
+    systemd.services.tiaris-nest-disk-health = (rootService "disk-health") // {
+      path = [ pkgs.coreutils pkgs.util-linux pkgs.smartmontools pkgs.nvme-cli pkgs.python3 runtime ];
+      after = [ "tiaris-nest-first-boot.service" ];
+      serviceConfig = { Type = "oneshot"; ExecStart = command "disk-health"; TimeoutStartSec = "30s"; UMask = "0022"; };
+    };
+    systemd.timers.tiaris-nest-disk-health = {
+      wantedBy = [ "timers.target" ];
+      timerConfig = { OnBootSec = "2min"; OnUnitActiveSec = "1h"; RandomizedDelaySec = "30s"; };
+    };
+    systemd.services.tiaris-nest-network-reconfigure = (rootService "network-reconfigure") // {
+      requires = [ "tiaris-nest-first-boot.service" ];
+      after = [ "tiaris-nest-first-boot.service" "tiaris-nest-network-guard.service" ];
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = "${bootstrapPackage}/bin/tiaris-nest-bootstrap apply-network-reconfigure";
+        TimeoutStartSec = "180s";
+        UMask = "0077";
+      };
+    };
+    systemd.paths.tiaris-nest-network-reconfigure = {
+      wantedBy = [ "multi-user.target" ];
+      pathConfig.PathChanged = "/var/lib/tiaris-nest/state/agent/network-reconfigure.json";
+    };
     systemd.services.tiaris-nest-self-cache-trust = (rootService "self-cache-trust") // {
       wantedBy = [ "multi-user.target" ]; after = [ "tiaris-nest-first-boot.service" "tiaris-nest.service" ];
     };

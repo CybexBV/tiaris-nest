@@ -22,6 +22,7 @@ pub mod manage;
 pub(crate) mod manage_source;
 pub mod models;
 pub mod netboot;
+pub mod network_reconfigure;
 pub(crate) mod nix_command;
 pub mod nix_log;
 pub(crate) mod protected_material;

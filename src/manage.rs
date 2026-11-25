@@ -149,6 +149,9 @@ struct PeerContract {
     accepts_site_check: bool,
     #[serde(default)]
     accepts_assist_turn: bool,
+    /// Manage accepts `network_reconfigure_v1` and the report's `network_reconfigure` lane.
+    #[serde(default)]
+    accepts_network_reconfigure: bool,
     /// Manage accepts `boot_machine_identity_v1` (`boot_machines`).
     #[serde(default)]
     accepts_boot_machine_identity: bool,
@@ -262,6 +265,10 @@ struct AgentNestConfigResponse {
     assist_turn_supported: bool,
     #[serde(default)]
     assist_turn: Option<crate::assist_turn::Desired>,
+    #[serde(default)]
+    network_reconfigure_supported: bool,
+    #[serde(default)]
+    network_reconfigure: Option<crate::network_reconfigure::Desired>,
     /// What the site check also tests and "Check again" (`site_check`).
     #[serde(default)]
     site_check: Option<Value>,
@@ -617,6 +624,8 @@ struct NestAgentReportRequest {
     site_check: Option<crate::site_check::Report>,
     #[serde(skip_serializing_if = "Option::is_none")]
     assist_turn: Option<crate::assist_turn::Report>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    network_reconfigure: Option<crate::network_reconfigure::Report>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1306,6 +1315,7 @@ async fn sync_nest_foundation(
                 accepts_when_idle: desired.update_when_idle_supported,
                 accepts_site_check: desired.site_check_supported,
                 accepts_assist_turn: desired.assist_turn_supported,
+                accepts_network_reconfigure: desired.network_reconfigure_supported,
                 accepts_boot_machine_identity: desired.boot_machine_identity_supported,
                 accepts_update_replace: desired.appliance_update_replace_supported,
                 accepts_compact_report: desired.compact_report_supported,
@@ -1344,6 +1354,8 @@ async fn sync_nest_foundation(
             when_idle: peer.accepts_when_idle,
             site_check: peer.accepts_site_check,
             assist_turn: peer.accepts_assist_turn && crate::assist_turn::shipped(),
+            network_reconfigure: peer.accepts_network_reconfigure
+                && crate::network_reconfigure::shipped(),
             boot_machine_identity: peer.accepts_boot_machine_identity,
             update_replace: peer.accepts_update_replace,
             compact: peer.accepts_compact_report,
@@ -1380,6 +1392,7 @@ fn peer_contract_after_failed_fetch(
         accepts_when_idle: false,
         accepts_site_check: false,
         accepts_assist_turn: false,
+        accepts_network_reconfigure: false,
         accepts_boot_machine_identity: false,
         accepts_update_replace: false,
         accepts_compact_report: false,
@@ -1448,6 +1461,15 @@ async fn apply_nest_desired(
             .filter(|_| desired.assist_turn_supported);
         if let Err(error) = crate::assist_turn::apply(&state.config.paths.data_dir, desired) {
             retain_sync_failure(first_failure, "managed TURN configuration", error);
+        }
+    }
+    if crate::network_reconfigure::shipped() {
+        let desired = desired
+            .network_reconfigure
+            .filter(|_| desired.network_reconfigure_supported);
+        if let Err(error) = crate::network_reconfigure::apply(&state.config.paths.data_dir, desired)
+        {
+            retain_sync_failure(first_failure, "signed network reconfiguration", error);
         }
     }
     // Its own lane: an unusable channel or request only stops update checks.
@@ -1933,6 +1955,10 @@ async fn report_nest_state(
         assist_turn: peer_support.assist_turn.then(|| {
             crate::assist_turn::report(&state.config.paths.data_dir, state.config.public_base_url())
         }),
+        network_reconfigure: peer_support
+            .network_reconfigure
+            .then(crate::network_reconfigure::report)
+            .flatten(),
         site_check: peer_support
             .site_check
             .then(|| crate::site_check::report(&state.config.paths.data_dir))
@@ -3091,6 +3117,7 @@ struct PeerReportSupport {
     when_idle: bool,
     site_check: bool,
     assist_turn: bool,
+    network_reconfigure: bool,
     boot_machine_identity: bool,
     update_replace: bool,
     /// Manage says `compact_report_supported` (`compact_report`).
@@ -3114,6 +3141,9 @@ fn nest_capabilities(
     }
     if peer_support.assist_turn {
         capabilities.push(crate::assist_turn::CAPABILITY);
+    }
+    if peer_support.network_reconfigure {
+        capabilities.push(crate::network_reconfigure::CAPABILITY);
     }
     if peer_support.site_check {
         capabilities.push(crate::site_check::CAPABILITY);
@@ -4047,6 +4077,7 @@ mod tests {
             accepts_when_idle: true,
             accepts_site_check: true,
             accepts_assist_turn: true,
+            accepts_network_reconfigure: true,
             accepts_boot_machine_identity: true,
             accepts_update_replace: true,
             accepts_compact_report: true,
@@ -5627,6 +5658,7 @@ mod tests {
             when_idle: false,
             site_check: false,
             assist_turn: false,
+            network_reconfigure: false,
             boot_machine_identity: false,
             update_replace: false,
             compact: false,
@@ -5655,6 +5687,7 @@ mod tests {
             when_idle: false,
             site_check,
             assist_turn: false,
+            network_reconfigure: false,
             boot_machine_identity: false,
             update_replace: false,
             compact: false,
@@ -5693,6 +5726,28 @@ mod tests {
     }
 
     #[test]
+    fn network_reconfigure_requires_manage_and_appliance_support() {
+        let older: AgentNestConfigResponse = serde_json::from_value(json!({})).unwrap();
+        let modern: AgentNestConfigResponse =
+            serde_json::from_value(json!({"network_reconfigure_supported": true})).unwrap();
+        assert!(!older.network_reconfigure_supported);
+        for (desired, shipped, expected) in [
+            (&modern, true, true),
+            (&modern, false, false),
+            (&older, true, false),
+        ] {
+            let peer = PeerReportSupport {
+                network_reconfigure: desired.network_reconfigure_supported && shipped,
+                ..Default::default()
+            };
+            assert_eq!(
+                nest_capabilities(false, peer).contains(&crate::network_reconfigure::CAPABILITY),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn boot_machine_identity_capability_requires_manage_support() {
         // An older Manage rejects a report that lists an unknown capability.
         let older: AgentNestConfigResponse = serde_json::from_value(json!({})).unwrap();
@@ -5705,6 +5760,7 @@ mod tests {
             when_idle: false,
             site_check: false,
             assist_turn: false,
+            network_reconfigure: false,
             boot_machine_identity,
             update_replace: false,
             compact: false,
@@ -7089,6 +7145,7 @@ mod tests {
             software_update_findings_sha256: None,
             site_check: None,
             assist_turn: None,
+            network_reconfigure: None,
         }
     }
 

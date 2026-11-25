@@ -127,4 +127,27 @@ in {
     };
     serviceConfig = { Type = "simple"; ExecStart = "${a.installerKiosk}/bin/tiaris-installer-kiosk --nest-setup"; Restart = "always"; RestartSec = "2s"; StandardInput = "tty"; StandardOutput = "tty"; StandardError = "journal"; TTYPath = "/dev/tty1"; TTYReset = true; TTYVHangup = true; TTYVTDisallocate = true; UtmpIdentifier = "tty1"; UtmpMode = "user"; PAMName = "login"; RuntimeDirectory = "tiaris-nest-setup-console"; RuntimeDirectoryMode = "0700"; };
   };
+  # Guided pre-claim static IPv4 configurator on tty2 (Alt+F2) for networks
+  # without DHCP. Replaces getty@tty2 with a bounded L3-only prompt (no shell).
+  systemd.services."getty@tty2".enable = false;
+  systemd.services."autovt@tty2".enable = false;
+  systemd.services.tiaris-nest-setup-network = {
+    description = "Tiaris Nest pre-claim static IPv4 setup";
+    wantedBy = [ "multi-user.target" ];
+    after = [ "systemd-networkd.service" "systemd-user-sessions.service" ];
+    path = [ pkgs.systemd pkgs.iproute2 ];
+    serviceConfig = {
+      Type = "simple";
+      ExecStart = "${bootstrap}/bin/tiaris-nest-bootstrap configure-setup-network";
+      Restart = "always";
+      RestartSec = "2s";
+      StandardInput = "tty";
+      StandardOutput = "tty";
+      StandardError = "tty";
+      TTYPath = "/dev/tty2";
+      TTYReset = true;
+      TTYVHangup = true;
+      TTYVTDisallocate = true;
+    };
+  };
 }

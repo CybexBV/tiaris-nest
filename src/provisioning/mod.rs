@@ -10,6 +10,7 @@ mod inventory;
 mod network_runtime;
 mod nixos_install;
 mod packages;
+pub mod preclaim_network;
 pub(crate) mod protocol;
 mod recovery;
 mod setup_claim;
@@ -29,7 +30,17 @@ use std::{
 };
 use tracing::warn;
 
-pub use inventory::{NestProvisioningDisk, NestProvisioningInventory};
+pub use inventory::{
+    NestProvisioningDisk, NestProvisioningDiskSmartHealth, NestProvisioningEthernetInterface,
+    NestProvisioningInventory,
+};
+
+pub(crate) fn render_netplan_for_plan(
+    network: &protocol::NestProvisioningNetworkPlan,
+    plan: &SignedInstallPlan,
+) -> serde_json::Value {
+    storage::netplan(network, plan)
+}
 pub use network_runtime::{
     NetworkRuntimeOptions, NetworkRuntimeOutcome, network_fallback_active,
     reconcile_network_runtime,
@@ -314,12 +325,42 @@ pub fn validate_installed_state(
         bail!("promoted Nest agent identity is inconsistent")
     }
 
+    let supersession_path = control.join(crate::network_reconfigure::SUPERSESSION_FILE);
+    let active_supersession = match fs::symlink_metadata(&supersession_path) {
+        Ok(_) => {
+            let body = read_bounded_nofollow(
+                &supersession_path,
+                64 * 1024,
+                "committed network supersession",
+            )?;
+            let raw: serde_json::Value =
+                serde_json::from_slice(&body).context("parse committed network supersession")?;
+            Some(crate::network_reconfigure::verify_supersession_value(
+                &raw,
+                &durable.management_signing_public_key_b64,
+                &plan,
+                false,
+                Utc::now(),
+            )?)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("inspect committed network supersession"),
+    };
+    let expected_network = active_supersession
+        .as_ref()
+        .map_or(&plan.network, |doc| &doc.network);
+    let expected_cidrs = active_supersession
+        .as_ref()
+        .map_or(plan.management_cidrs.as_slice(), |doc| {
+            doc.management_cidrs.as_slice()
+        });
+
     let approved: serde_json::Value = serde_json::from_slice(&read_bounded_nofollow(
         &control.join("netplan-approved.json"),
         1024 * 1024,
         "promoted approved Netplan",
     )?)?;
-    if approved != storage::netplan(&plan.network, &plan) {
+    if approved != storage::netplan(expected_network, &plan) {
         bail!("approved Netplan is not derived from the authenticated installation")
     }
     let fallback_plan = protocol::NestProvisioningNetworkPlan {
@@ -342,7 +383,7 @@ pub fn validate_installed_state(
         64 * 1024,
         "promoted Management CIDRs",
     )?;
-    if cidrs != format!("{}\n", plan.management_cidrs.join("\n")).as_bytes() {
+    if cidrs != format!("{}\n", expected_cidrs.join("\n")).as_bytes() {
         bail!("promoted Management CIDRs are not derived from the authenticated plan")
     }
     Ok(())
@@ -399,6 +440,9 @@ pub async fn prepare(options: PrepareOptions) -> Result<()> {
 
 async fn prepare_with_status(options: &PrepareOptions, status: &SetupStatusReporter) -> Result<()> {
     packages::require_nixos_media()?;
+    // In no-DHCP networks, apply a bounded L3-only tiaris-net.toml from an
+    // attached USB stick before contacting Management.
+    let _ = preclaim_network::try_apply_from_usb();
     // The ISO starts before network time; Tiaris's answers set the clock.
     clock::follow_manage();
     let trusted_keys = protocol::load_trusted_provisioning_keys(&options.provisioning_keys_path)?;
