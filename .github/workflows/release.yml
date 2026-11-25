@@ -490,14 +490,6 @@ jobs:
           done
           closure_url="$artifact_base/tiaris-nest-appliance-closure-$version-x86_64-linux.tar.zst"
           runtime_url="$artifact_base/${{ steps.workstation-source.outputs.bundle_name }}"
-          if [ -n "${TIARIS_NEST_DOWNLOADS_CDN_ENV:-}" ]; then
-            case "$TIARIS_NEST_DOWNLOADS_CDN_ENV" in
-              production|beta|development) ;;
-              *) echo "Invalid TIARIS_NEST_DOWNLOADS_CDN_ENV: $TIARIS_NEST_DOWNLOADS_CDN_ENV" >&2; exit 1 ;;
-            esac
-            closure_url="https://downloads.tiaris.com/$TIARIS_NEST_DOWNLOADS_CDN_ENV/closures/$version/tiaris-nest-appliance-closure-$version-x86_64-linux.tar.zst"
-            runtime_url="https://downloads.tiaris.com/$TIARIS_NEST_DOWNLOADS_CDN_ENV/runtimes/$version/${{ steps.workstation-source.outputs.bundle_name }}"
-          fi
           if [ "${{ steps.workstation-runtime.outputs.reuse }}" = true ]; then
             workstation_args=(--reuse-workstation-netboot "$RUNNER_TEMP/tiaris-nest-predecessor/tiaris-nest-release.json")
           else

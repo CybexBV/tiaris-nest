@@ -4,6 +4,10 @@ from pathlib import Path
 import subprocess
 from appliance_state import CONTROL, read, write
 
-write(Path('/etc/netplan/90-tiaris-nest.yaml'), read(CONTROL / 'netplan-approved.json'), mode=0o600, group=0)
+EFFECTIVE = Path('/run/tiaris-nest-network/netplan-approved.json')
+if (CONTROL / 'network-supersession.json').exists():
+    subprocess.run(['/usr/lib/tiaris-nest/tiaris-nest-bootstrap', 'materialize-effective-network'], check=True)
+source = EFFECTIVE if EFFECTIVE.exists() else CONTROL / 'netplan-approved.json'
+write(Path('/etc/netplan/90-tiaris-nest.yaml'), read(source), mode=0o600, group=0)
 subprocess.run(['/usr/lib/tiaris-nest/tiaris-nest-netplan-activate'], check=True,
                env={**os.environ, 'TIARIS_NETWORK_RENDER_ONLY': '1'})

@@ -83,6 +83,25 @@ enum Command {
     },
     /// Interactive guided pre-claim static IPv4 configuration on tty2 (no shell).
     ConfigureSetupNetwork,
+    /// Apply pre-claim static IPv4 from an attached USB stick (`tiaris-net.toml`).
+    ApplyPreclaimUsb {
+        /// Write the systemd-networkd drop-in without reloading networkd (used before networkd starts).
+        #[arg(long)]
+        no_reload: bool,
+    },
+    /// Materialize effective network projections under `/run/tiaris-nest-network`
+    /// from any committed `control/network-supersession.json`.
+    MaterializeEffectiveNetwork {
+        #[arg(long, default_value = "/var/lib/tiaris-nest/control")]
+        control_dir: PathBuf,
+        #[arg(long, default_value = "/run/tiaris-nest-network")]
+        out_dir: PathBuf,
+        #[arg(
+            long,
+            default_value = "/usr/share/tiaris-nest/provisioning-public-keys"
+        )]
+        provisioning_keys: PathBuf,
+    },
     /// Verify and apply a signed post-install network reconfiguration with
     /// automatic revert if Manage cannot be reached.
     ApplyNetworkReconfigure {
@@ -175,6 +194,26 @@ async fn main() -> Result<()> {
         Command::ConfigureSetupNetwork => {
             require_root()?;
             tiaris_nest::provisioning::preclaim_network::run_interactive_tty()
+        }
+        Command::ApplyPreclaimUsb { no_reload } => {
+            require_root()?;
+            let _ = tiaris_nest::provisioning::preclaim_network::try_apply_from_usb_with_reload(
+                !no_reload,
+            );
+            Ok(())
+        }
+        Command::MaterializeEffectiveNetwork {
+            control_dir,
+            out_dir,
+            provisioning_keys,
+        } => {
+            require_root()?;
+            let _ = tiaris_nest::network_reconfigure::materialize_effective_network(
+                &control_dir,
+                &out_dir,
+                &provisioning_keys,
+            )?;
+            Ok(())
         }
         Command::ApplyNetworkReconfigure {
             inbox,

@@ -75,7 +75,6 @@ in {
     networking.networkmanager.enable = lib.mkForce false;
     networking.firewall.enable = false; # owned atomic default-deny nftables input allowlist (tiaris-nest-firewall)
     boot.kernelModules = [ "nf_conntrack_tftp" ];
-    boot.kernel.sysctl."net.netfilter.nf_conntrack_helper" = 0;
     systemd.network.enable = true;
     services.resolved.enable = true;
     services.timesyncd.enable = true;
@@ -325,19 +324,30 @@ in {
     systemd.services.tiaris-nest-disk-health = (rootService "disk-health") // {
       path = [ pkgs.coreutils pkgs.util-linux pkgs.smartmontools pkgs.nvme-cli pkgs.python3 runtime ];
       after = [ "tiaris-nest-first-boot.service" ];
-      serviceConfig = { Type = "oneshot"; ExecStart = command "disk-health"; TimeoutStartSec = "30s"; UMask = "0022"; };
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = command "disk-health";
+        TimeoutStartSec = "30s";
+        UMask = "0027";
+        RuntimeDirectory = "tiaris-nest-disk-health";
+        RuntimeDirectoryMode = "0750";
+        RuntimeDirectoryPreserve = "yes";
+      };
     };
     systemd.timers.tiaris-nest-disk-health = {
       wantedBy = [ "timers.target" ];
       timerConfig = { OnBootSec = "2min"; OnUnitActiveSec = "1h"; RandomizedDelaySec = "30s"; };
     };
     systemd.services.tiaris-nest-network-reconfigure = (rootService "network-reconfigure") // {
+      path = baseUnit.path ++ [ pkgs.iproute2 pkgs.nftables ];
+      wantedBy = [ "multi-user.target" ];
       requires = [ "tiaris-nest-first-boot.service" ];
-      after = [ "tiaris-nest-first-boot.service" "tiaris-nest-network-guard.service" ];
+      after = [ "tiaris-nest-first-boot.service" "tiaris-nest-network-guard.service" "tiaris-nest-generation-commit.service" ];
+      unitConfig.ConditionPathExists = "/var/lib/tiaris-nest/state/agent/network-reconfigure.json";
       serviceConfig = {
         Type = "oneshot";
         ExecStart = "${bootstrapPackage}/bin/tiaris-nest-bootstrap apply-network-reconfigure";
-        TimeoutStartSec = "180s";
+        TimeoutStartSec = "300s";
         UMask = "0077";
       };
     };

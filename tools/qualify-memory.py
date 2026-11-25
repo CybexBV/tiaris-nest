@@ -193,8 +193,6 @@ admin_token = "disposable-local-fixture"
 [build]
 max_concurrent_builds = {max_concurrent_builds}
 max_build_cores = 4
-minimum_memory_bytes = 1073741824
-minimum_swap_bytes = 0
 max_artifact_size_bytes = 1073741824
 work_dir = "{ROOT}/build"
 output_dir = "{ROOT}/outputs"

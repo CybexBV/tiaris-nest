@@ -546,7 +546,7 @@ async fn generic_iso_registers_is_claimed_and_continues_with_the_existing_sessio
     let id = Uuid::new_v4();
     let session = Uuid::new_v4();
     let bytes = envelope(session, 30);
-    let (_, _, inventory, _) = protocol::tests::signed_plan_fixture();
+    let (_, _, mut inventory, _) = protocol::tests::signed_plan_fixture();
     let dir = TempDir::new();
     let status_path = dir.0.join("setup/status.json");
     let (origin, fake, server) = fake_manage(
@@ -590,7 +590,7 @@ async fn generic_iso_registers_is_claimed_and_continues_with_the_existing_sessio
     let client = protocol::ProvisioningClient::test_client(origin, session);
     let hardware = inventory::hardware_digest(&inventory).unwrap();
     let (session_state, recovering) =
-        recovery::initial_session(&client, &result.verified, &key, &inventory, &hardware)
+        recovery::initial_session(&client, &result.verified, &key, &mut inventory, &hardware)
             .await
             .unwrap();
     assert!(!recovering);

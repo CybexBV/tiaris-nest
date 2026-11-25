@@ -36,7 +36,9 @@ in import (nixpkgs + "/nixos/tests/make-test-python.nix") ({ ... }: {
       qemu.options = [ "-no-user-config" ] ++ pkgs.lib.optional freePageReporting "-global virtio-balloon-pci.free-page-reporting=on";
     };
     zramSwap = { enable = true; algorithm = "zstd"; memoryPercent = 25; priority = 100; };
-    swapDevices = [ { device = "/var/swapfile"; size = 8192; priority = 10; } ];
+    # qemu-vm.nix overrides swapDevices with mkVMOverride []; override with higher priority
+    # so the qualification VM actually exercises the real 8 GiB disk swap + 25% zram setup.
+    swapDevices = lib.mkOverride 5 [ { device = "/var/swapfile"; size = 8192; priority = 10; } ];
     users.groups.nest = {};
     users.users.nest = { isSystemUser = true; group = "nest"; home = "/var/lib/nest-memory"; createHome = true; };
     nix.settings = {

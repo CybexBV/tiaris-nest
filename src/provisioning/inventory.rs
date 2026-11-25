@@ -698,23 +698,40 @@ async fn query_dns_ipv4_addr(
             if remaining.is_zero() {
                 break;
             }
-            let wait = remaining.min(Duration::from_secs(3));
+            let attempt_deadline =
+                tokio::time::Instant::now() + remaining.min(Duration::from_secs(3));
             socket
                 .send(packet)
                 .await
                 .context("send DNS query to approved DNS server")?;
-            match tokio::time::timeout(wait, socket.recv(&mut buf)).await {
-                Ok(Ok(len)) => {
-                    buf.truncate(len);
-                    received = Some(buf);
-                    break;
+            loop {
+                let wait = attempt_deadline.saturating_duration_since(tokio::time::Instant::now());
+                if wait.is_zero() {
+                    if attempt == 0 {
+                        break;
+                    }
+                    bail!("DNS query timed out");
                 }
-                Ok(Err(err)) if attempt == 0 => {
-                    let _ = err;
+                match tokio::time::timeout(wait, socket.recv(&mut buf)).await {
+                    Ok(Ok(len)) => {
+                        // Ignore stale or spoofed UDP datagrams with mismatched TXID until deadline.
+                        if len < 2 || u16::from_be_bytes([buf[0], buf[1]]) != txid {
+                            continue;
+                        }
+                        received = Some(buf[..len].to_vec());
+                        break;
+                    }
+                    Ok(Err(err)) if attempt == 0 => {
+                        let _ = err;
+                        break;
+                    }
+                    Ok(Err(err)) => return Err(err).context("read DNS UDP response"),
+                    Err(_) if attempt == 0 => break,
+                    Err(_) => bail!("DNS query timed out"),
                 }
-                Ok(Err(err)) => return Err(err).context("read DNS UDP response"),
-                Err(_) if attempt == 0 => {}
-                Err(_) => bail!("DNS query timed out"),
+            }
+            if received.is_some() {
+                break;
             }
         }
         received.ok_or_else(|| anyhow!("DNS query timed out"))?
@@ -1026,7 +1043,9 @@ fn disks_from_lsblk(
             blocker_codes.push("disk_too_small".to_string());
         }
         let Some(id) = stable_id(Path::new(path))? else {
-            without_serial.push(clean(path, 256));
+            if blocker_codes.is_empty() {
+                without_serial.push(clean(path, 256));
+            }
             continue;
         };
         disks.push(NestProvisioningDisk {
@@ -1043,6 +1062,8 @@ fn disks_from_lsblk(
             blocker_codes,
         });
     }
+    without_serial.sort();
+    without_serial.dedup();
     Ok((disks, without_serial))
 }
 

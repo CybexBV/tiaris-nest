@@ -55,5 +55,25 @@ let
       setup.systemd.services.tiaris-nest-bootstrap.after);
     setupMenuInstallsTiarisNest = menuLabel == "Install Tiaris Nest";
     setupUsesManageGrubTheme = setup.isoImage.grubTheme == appliance.grubTheme;
+    setupHasRequiredInstallTools = let
+      pathNames = map (p: p.pname or p.name or "") setup.systemd.services.tiaris-nest-bootstrap.path;
+      hasPrefix = prefix: builtins.any (n: builtins.substring 0 (builtins.stringLength prefix) n == prefix) pathNames;
+    in builtins.all hasPrefix [
+      "parted"
+      "efibootmgr"
+      "gptfdisk"
+      "e2fsprogs"
+      "dosfstools"
+      "util-linux"
+      "iproute2"
+      "curl"
+      "jq"
+      "zstd"
+      "smartmontools"
+      "nvme-cli"
+    ];
+    setupAppliesPreclaimUsbBeforeNetworkd =
+      builtins.elem "systemd-networkd.service" setup.systemd.services.tiaris-nest-preclaim-network.before
+      && builtins.elem "d /run/systemd/network 0755 root root -" setup.systemd.tmpfiles.rules;
   };
 in assert builtins.all (value: value) (builtins.attrValues checks); checks

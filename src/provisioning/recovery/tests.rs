@@ -235,7 +235,7 @@ async fn server(
 
 #[tokio::test]
 async fn only_an_unclaimed_session_can_fall_back_from_poll_to_claim() {
-    let (plan, verified, inventory) = fixture();
+    let (plan, verified, mut inventory) = fixture();
     let key = protocol::derive_provisioning_key(&verified.envelope.media_secret).unwrap();
     let hardware = inventory::hardware_digest(&inventory).unwrap();
     for status in [
@@ -256,7 +256,7 @@ async fn only_an_unclaimed_session_can_fall_back_from_poll_to_claim() {
             ..Default::default()
         }));
         let (client, handle) = server(state.clone(), verified.envelope.session_id).await;
-        let result = initial_session(&client, &verified, &key, &inventory, &hardware).await;
+        let result = initial_session(&client, &verified, &key, &mut inventory, &hardware).await;
         assert_eq!(result.is_ok(), status == StatusCode::UNAUTHORIZED);
         let state = state.lock().unwrap();
         assert_eq!(state.requests[0].0, Method::GET);
@@ -282,7 +282,7 @@ async fn only_an_unclaimed_session_can_fall_back_from_poll_to_claim() {
     }));
     let (client, handle) = server(state.clone(), verified.envelope.session_id).await;
     assert!(
-        initial_session(&client, &verified, &key, &inventory, &hardware)
+        initial_session(&client, &verified, &key, &mut inventory, &hardware)
             .await
             .unwrap()
             .1

@@ -152,6 +152,7 @@ pub async fn connect_with_url(database_url: &str) -> AppResult<SqlitePool> {
 
 const DB_MAINTENANCE_INITIAL_DELAY: Duration = Duration::from_secs(10 * 60);
 const DB_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const VACUUM_MIN_QUIET_SECONDS: i64 = 5 * 60;
 const VACUUM_HEADROOM_BYTES: u64 = 256 * 1024 * 1024;
 const INCREMENTAL_VACUUM_MIN_FREELIST_PAGES: i64 = 64;
 const INCREMENTAL_VACUUM_PAGES_PER_PASS: i64 = 256;
@@ -165,7 +166,8 @@ pub struct MaintenanceReport {
 
 /// Periodic SQLite maintenance: checkpoint/truncate the WAL, refresh query
 /// statistics, and convert/reclaim freed pages with incremental auto-vacuum
-/// when `TIARIS_STATE` has ample free space and no build or update is active.
+/// when `TIARIS_STATE` has ample free space and no build, boot activity, or
+/// appliance update is active.
 pub fn spawn_maintenance(pool: SqlitePool, database_path: std::path::PathBuf) {
     tokio::spawn(async move {
         tokio::time::sleep(DB_MAINTENANCE_INITIAL_DELAY).await;
@@ -183,9 +185,10 @@ pub async fn run_maintenance(
     database_path: &Path,
 ) -> AppResult<MaintenanceReport> {
     let mut conn = pool.acquire().await?;
-    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-        .execute(&mut *conn)
-        .await?;
+    let (checkpoint_busy, _, _): (i64, i64, i64) =
+        sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+            .fetch_one(&mut *conn)
+            .await?;
     sqlx::query("PRAGMA optimize").execute(&mut *conn).await?;
 
     let auto_vacuum_before: i64 = sqlx::query_scalar("PRAGMA auto_vacuum")
@@ -193,8 +196,12 @@ pub async fn run_maintenance(
         .await?;
     let mut vacuum_skipped = None;
     match auto_vacuum_before {
-        0 => match vacuum_skip_reason(&mut conn, database_path).await? {
-            None => {
+        0 if checkpoint_busy != 0 => {
+            tracing::debug!("skipping SQLite auto_vacuum conversion while WAL checkpoint is busy");
+            vacuum_skipped = Some("wal checkpoint busy".to_string());
+        }
+        0 => match acquire_vacuum_lease_and_check(&mut conn, database_path).await? {
+            Ok(_lease) => {
                 sqlx::query("PRAGMA auto_vacuum = INCREMENTAL")
                     .persistent(false)
                     .execute(&mut *conn)
@@ -203,12 +210,16 @@ pub async fn run_maintenance(
                     .persistent(false)
                     .execute(&mut *conn)
                     .await?;
-                sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-                    .persistent(false)
-                    .execute(&mut *conn)
-                    .await?;
+                let (post_busy, _, _): (i64, i64, i64) =
+                    sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+                        .persistent(false)
+                        .fetch_one(&mut *conn)
+                        .await?;
+                if post_busy != 0 {
+                    tracing::debug!("post-VACUUM WAL checkpoint reported busy readers");
+                }
             }
-            Some(reason) => {
+            Err(reason) => {
                 tracing::debug!(reason = %reason, "skipping SQLite auto_vacuum conversion");
                 vacuum_skipped = Some(reason);
             }
@@ -237,16 +248,32 @@ pub async fn run_maintenance(
     })
 }
 
-async fn vacuum_skip_reason(
+async fn acquire_vacuum_lease_and_check(
     conn: &mut sqlx::SqliteConnection,
     database_path: &Path,
-) -> AppResult<Option<String>> {
+) -> AppResult<Result<Option<crate::maintenance::BuildLease>, String>> {
+    if !crate::activity::is_idle_for_maintenance(VACUUM_MIN_QUIET_SECONDS) {
+        return Ok(Err("Nest recently served computers".to_string()));
+    }
+    let lease = if crate::appliance::nixos::is_nixos() {
+        match crate::maintenance::try_exclusive() {
+            Ok(Some(lease)) => Some(lease),
+            Ok(None) => return Ok(Err("maintenance lease active".to_string())),
+            Err(err) => return Ok(Err(format!("maintenance lease error: {err}"))),
+        }
+    } else {
+        match crate::maintenance::lease_active() {
+            Ok(true) => return Ok(Err("maintenance lease active".to_string())),
+            Err(err) => return Ok(Err(format!("maintenance lease error: {err}"))),
+            Ok(false) => None,
+        }
+    };
     let meta = match fs::symlink_metadata(database_path) {
         Ok(meta) => meta,
-        Err(err) => return Ok(Some(format!("metadata error: {err}"))),
+        Err(err) => return Ok(Err(format!("metadata error: {err}"))),
     };
     if !meta.is_file() {
-        return Ok(Some("database path is not a regular file".to_string()));
+        return Ok(Err("database path is not a regular file".to_string()));
     }
     let active_jobs: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM nest_build_jobs WHERE status IN ('queued', 'running')",
@@ -254,28 +281,23 @@ async fn vacuum_skip_reason(
     .fetch_one(conn)
     .await?;
     if active_jobs > 0 {
-        return Ok(Some(format!("{active_jobs} active build jobs")));
-    }
-    match crate::maintenance::lease_active() {
-        Ok(true) => return Ok(Some("maintenance lease active".to_string())),
-        Err(err) => return Ok(Some(format!("maintenance lease error: {err}"))),
-        Ok(false) => {}
+        return Ok(Err(format!("{active_jobs} active build jobs")));
     }
     let stats = match crate::disk::stats(database_path) {
         Ok(stats) => stats,
-        Err(err) => return Ok(Some(format!("statvfs error: {err}"))),
+        Err(err) => return Ok(Err(format!("statvfs error: {err}"))),
     };
     let required = meta
         .len()
         .saturating_mul(2)
         .saturating_add(VACUUM_HEADROOM_BYTES);
     if stats.available_bytes < required {
-        return Ok(Some(format!(
+        return Ok(Err(format!(
             "insufficient free space on {}: {} < {}",
             stats.path, stats.available_bytes, required
         )));
     }
-    Ok(None)
+    Ok(Ok(lease))
 }
 
 /// Startup migration: this release's migrations, run alongside newer

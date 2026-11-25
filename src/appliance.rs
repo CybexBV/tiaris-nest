@@ -463,7 +463,7 @@ async fn local_health(readiness: crate::readiness::ApplianceReadiness) -> Value 
 const STATE_DIR: &str = "/var/lib/tiaris-nest/state";
 const EFI_DIR: &str = "/boot";
 const ROOT_DIR: &str = "/";
-const DISK_HEALTH_PATH: &str = "/run/tiaris-nest/disk-health.json";
+const DISK_HEALTH_PATH: &str = "/run/tiaris-nest-disk-health/disk-health.json";
 const MAX_DISK_HEALTH_BYTES: u64 = 8 * 1024;
 /// STATE (16 GiB: database, identity, receipts) below this is attention.
 const STATE_STORAGE_LOW_BYTES: u64 = 512 * 1024 * 1024;

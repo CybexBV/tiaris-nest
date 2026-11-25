@@ -97,13 +97,25 @@ pub fn validate_config(config: PreclaimNetworkConfig) -> Result<ValidatedPreclai
     {
         bail!("pre-claim address must be a unicast host IPv4 address");
     }
+    let mask = u32::MAX.checked_shl(u32::from(32 - prefix)).unwrap_or(0);
+    let addr_raw = u32::from(address);
+    let net = addr_raw & mask;
+    let bcast = net | !mask;
+    if addr_raw == net || addr_raw == bcast {
+        bail!("pre-claim address must be a usable host address inside the subnet");
+    }
     let gateway: Ipv4Addr = config
         .gateway
         .trim()
         .parse()
         .context("pre-claim gateway must be an IPv4 address")?;
-    if gateway == address || !same_ipv4_subnet(address, gateway, prefix) {
-        bail!("pre-claim gateway must be a distinct address inside the selected subnet");
+    let gw_raw = u32::from(gateway);
+    if gateway == address
+        || !same_ipv4_subnet(address, gateway, prefix)
+        || gw_raw == net
+        || gw_raw == bcast
+    {
+        bail!("pre-claim gateway must be a distinct usable address inside the selected subnet");
     }
     if config.dns_servers.is_empty() || config.dns_servers.len() > 4 {
         bail!("pre-claim config requires between 1 and 4 IPv4 DNS servers");
@@ -172,7 +184,63 @@ fn same_ipv4_subnet(left: Ipv4Addr, right: Ipv4Addr, prefix: u8) -> bool {
 }
 
 pub fn apply_networkd_config(config: &ValidatedPreclaimNetwork) -> Result<()> {
-    apply_networkd_config_to(Path::new(NETWORKD_DIR), config, true)
+    apply_networkd_config_with_reload(config, true)
+}
+
+pub fn apply_networkd_config_with_reload(
+    config: &ValidatedPreclaimNetwork,
+    reload: bool,
+) -> Result<()> {
+    let mut resolved = config.clone();
+    if resolved.interface_mac.is_none() {
+        let detected = wired_interfaces();
+        resolved.interface_mac = resolve_target_mac(None, &detected)?;
+    }
+    apply_networkd_config_to(Path::new(NETWORKD_DIR), &resolved, reload)
+}
+
+fn ensure_networkd_dir(networkd_dir: &Path) -> Result<()> {
+    match fs::symlink_metadata(networkd_dir) {
+        Ok(meta) => {
+            if !meta.file_type().is_dir() {
+                bail!("{} must be a directory", networkd_dir.display());
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(networkd_dir).context("create /run/systemd/network")?;
+        }
+        Err(err) => return Err(err).context("inspect /run/systemd/network"),
+    }
+    // systemd-networkd runs as unprivileged user systemd-network and needs
+    // traversal access even when called from a UMask=0077 root unit.
+    fs::set_permissions(networkd_dir, fs::Permissions::from_mode(0o755))
+        .context("set 0755 permissions on /run/systemd/network")?;
+    Ok(())
+}
+
+fn resolve_target_mac(
+    requested: Option<&str>,
+    wired: &[(String, String, bool)],
+) -> Result<Option<String>> {
+    if let Some(mac) = requested {
+        return Ok(Some(mac.to_string()));
+    }
+    if wired.is_empty() {
+        return Ok(None);
+    }
+    let up: Vec<&(String, String, bool)> = wired.iter().filter(|(_, _, link)| *link).collect();
+    if up.len() == 1 && !up[0].1.is_empty() {
+        return Ok(Some(up[0].1.clone()));
+    }
+    if up.is_empty() && wired.len() == 1 && !wired[0].1.is_empty() {
+        return Ok(Some(wired[0].1.clone()));
+    }
+    if wired.len() > 1 {
+        bail!(
+            "multiple wired interfaces detected; specify interface_mac to avoid duplicate static IP addresses"
+        );
+    }
+    Ok(None)
 }
 
 fn apply_networkd_config_to(
@@ -180,7 +248,7 @@ fn apply_networkd_config_to(
     config: &ValidatedPreclaimNetwork,
     reload: bool,
 ) -> Result<()> {
-    fs::create_dir_all(networkd_dir).context("create /run/systemd/network")?;
+    ensure_networkd_dir(networkd_dir)?;
     let target = networkd_dir.join(PRECLAIM_NETWORK_FILE);
     let body = config.render_networkd_unit();
     if fs::read_to_string(&target).ok().as_deref() == Some(body.as_str()) {
@@ -206,19 +274,25 @@ fn apply_networkd_config_to(
         if !status.success() {
             bail!("networkctl reload failed");
         }
-        for iface in wired_interface_names() {
-            let _ = Command::new("networkctl")
-                .args(["reconfigure", &iface])
-                .status();
+        for (iface, mac, _) in wired_interfaces() {
+            if config
+                .interface_mac
+                .as_deref()
+                .is_none_or(|wanted| wanted.eq_ignore_ascii_case(&mac))
+            {
+                let _ = Command::new("networkctl")
+                    .args(["reconfigure", &iface])
+                    .status();
+            }
         }
     }
     Ok(())
 }
 
-fn wired_interface_names() -> Vec<String> {
-    let mut names = Vec::new();
+fn wired_interfaces() -> Vec<(String, String, bool)> {
+    let mut out = Vec::new();
     let Ok(entries) = fs::read_dir("/sys/class/net") else {
-        return names;
+        return out;
     };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
@@ -232,10 +306,20 @@ fn wired_interface_names() -> Vec<String> {
         {
             continue;
         }
-        names.push(name);
+        let mac = fs::read_to_string(root.join("address"))
+            .map(|v| v.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        let link_up = fs::read_to_string(root.join("carrier"))
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false);
+        out.push((name, mac, link_up));
     }
-    names.sort();
-    names
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+fn wired_interface_names() -> Vec<String> {
+    wired_interfaces().into_iter().map(|(n, _, _)| n).collect()
 }
 
 struct UsbCandidate {
@@ -350,6 +434,10 @@ fn read_bounded_config(path: &Path) -> Result<Option<String>> {
 /// `tiaris-net.toml`. Applies the first valid L3 configuration to
 /// systemd-networkd and unmounts immediately. Never fails setup if absent.
 pub fn try_apply_from_usb() -> Option<ValidatedPreclaimNetwork> {
+    try_apply_from_usb_with_reload(true)
+}
+
+pub fn try_apply_from_usb_with_reload(reload: bool) -> Option<ValidatedPreclaimNetwork> {
     let candidates = discover_usb_candidates();
     if candidates.is_empty() {
         return None;
@@ -373,7 +461,7 @@ pub fn try_apply_from_usb() -> Option<ValidatedPreclaimNetwork> {
         match read_bounded_config(&mount_dir.join(CONFIG_FILENAME)) {
             Ok(Some(raw)) => match parse_and_validate_toml(&raw) {
                 Ok(validated) => {
-                    if let Err(err) = apply_networkd_config(&validated) {
+                    if let Err(err) = apply_networkd_config_with_reload(&validated, reload) {
                         warn!(
                             device = %candidate.path.display(),
                             error = %err,
@@ -468,7 +556,7 @@ pub fn run_interactive_tty() -> Result<()> {
         let Some(mac_raw) = prompt_line(
             &mut reader,
             &mut stdout,
-            "Interface MAC (optional, Enter for all wired): ",
+            "Interface MAC (required if multiple wired NICs, Enter to auto-select single wired NIC): ",
         )?
         else {
             return Ok(());
@@ -614,10 +702,43 @@ dns_servers = ["10.0.0.1"]
         )
         .unwrap();
         apply_networkd_config_to(&dir, &cfg, false).unwrap();
+        assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o755);
         apply_networkd_config_to(&dir, &cfg, false).unwrap();
         let content = fs::read_to_string(dir.join(PRECLAIM_NETWORK_FILE)).unwrap();
         assert!(content.contains("Name=en* eth*"));
         assert!(content.contains("Address=10.0.0.50/24"));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn target_mac_resolution_picks_single_up_nic_and_rejects_multi_nic_ambiguity() {
+        let single_up = vec![
+            ("eno1".into(), "52:54:00:00:00:01".into(), true),
+            ("eno2".into(), "52:54:00:00:00:02".into(), false),
+        ];
+        assert_eq!(
+            resolve_target_mac(None, &single_up).unwrap().as_deref(),
+            Some("52:54:00:00:00:01")
+        );
+        let two_up = vec![
+            ("eno1".into(), "52:54:00:00:00:01".into(), true),
+            ("eno2".into(), "52:54:00:00:00:02".into(), true),
+        ];
+        assert!(resolve_target_mac(None, &two_up).is_err());
+        assert_eq!(
+            resolve_target_mac(Some("52:54:00:00:00:02"), &two_up)
+                .unwrap()
+                .as_deref(),
+            Some("52:54:00:00:00:02")
+        );
+        // Network/broadcast addresses must be rejected.
+        assert!(parse_and_validate_toml(
+            "address_cidr = \"10.0.0.0/24\"\ngateway = \"10.0.0.1\"\ndns_servers = [\"1.1.1.1\"]\n"
+        )
+        .is_err());
+        assert!(parse_and_validate_toml(
+            "address_cidr = \"10.0.0.10/24\"\ngateway = \"10.0.0.255\"\ndns_servers = [\"1.1.1.1\"]\n"
+        )
+        .is_err());
     }
 }
