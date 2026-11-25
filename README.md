@@ -284,6 +284,17 @@ sent it (`<id>.grant`) and its state (`<id>.state.json`), whose progress names
 items only by their index in the grant. A corrupt state restarts the grant with
 exactly its own items; a missing or altered document fails that grant.
 
+- **What it built.** Each closure manifest names every member's
+  `provenance`, and Manage grants exactly the `built` ones. A member is
+  `substitute` when its narinfo in the Nest cache carries a valid
+  `cache.nixos.org-1` or `cache.tiaris.com-1` signature (Nix keeps a
+  substituted path's signatures and `nix copy` writes them), so a computer
+  away from school can download it there; everything else is `built` (built
+  here, imported from a release, or signed only by Nests). An artifact keeps
+  the provenance it was recorded with, in the scrub and on a new export of
+  the same closure, because Manage purges an artifact whose manifest digest
+  changes: manifests recorded before 25 November 2026 say `unknown` and get
+  no grant.
 - **Capability.** Nest advertises `software_cache_upload_v1` only when
   Manage's configuration says it accepts it
   (`software_cache_upload_supported: true`); a Manage that does not know the
