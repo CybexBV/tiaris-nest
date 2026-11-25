@@ -388,31 +388,12 @@ pub(crate) async fn preflight_network(
 
             let mut resolved_addresses = Vec::new();
             for dns_server in dns_servers {
-                let dns_server = dns_server.to_string();
-                let dns_selector = format!("@{dns_server}");
-                let output = bounded_command_output(
-                    "dig",
-                    &[
-                        "+short",
-                        "+time=3",
-                        "+tries=1",
-                        "-b",
-                        &address_text,
-                        &dns_selector,
-                        &manage_host,
-                        "A",
-                    ],
-                    Duration::from_secs(8),
-                )
-                .await
-                .with_context(|| {
-                    format!("query Management through approved DNS server {dns_server}")
-                })?;
-                let answers = String::from_utf8(output)
-                    .context("approved DNS server returned non-UTF-8 output")?
-                    .lines()
-                    .filter_map(|line| line.trim().parse::<Ipv4Addr>().ok())
-                    .collect::<Vec<_>>();
+                let answers =
+                    query_dns_ipv4(address, dns_server, &manage_host, Duration::from_secs(8))
+                        .await
+                        .with_context(|| {
+                            format!("query Management through approved DNS server {dns_server}")
+                        })?;
                 if answers.is_empty() {
                     bail!("approved DNS server {dns_server} did not resolve the Management origin")
                 }
@@ -643,6 +624,249 @@ fn manage_https_endpoint(manage_origin: &str) -> Result<(String, u16)> {
 fn ipv4_network(address: Ipv4Addr, prefix: u8) -> Ipv4Addr {
     let mask = u32::MAX.checked_shl((32 - prefix).into()).unwrap_or(0);
     Ipv4Addr::from(u32::from(address) & mask)
+}
+
+/// Resolve IPv4 A records for `host` directly against `dns_server` from
+/// `source_ip` without relying on external tools (`dig` is not shipped on the
+/// minimal NixOS setup ISO). Falls back to TCP when the UDP response is
+/// truncated (TC bit set).
+async fn query_dns_ipv4(
+    source_ip: Ipv4Addr,
+    dns_server: Ipv4Addr,
+    host: &str,
+    timeout: Duration,
+) -> Result<Vec<Ipv4Addr>> {
+    if let Ok(ip) = host.parse::<Ipv4Addr>() {
+        return Ok(vec![ip]);
+    }
+    let txid: u16 = rand::random();
+    let packet = build_dns_a_query(txid, host)?;
+    let server_addr = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(dns_server, 53));
+    query_dns_ipv4_addr(source_ip, server_addr, txid, &packet, timeout).await
+}
+
+async fn query_dns_ipv4_addr(
+    source_ip: Ipv4Addr,
+    server_addr: std::net::SocketAddr,
+    txid: u16,
+    packet: &[u8],
+    timeout: Duration,
+) -> Result<Vec<Ipv4Addr>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpSocket, UdpSocket};
+
+    let bind_addr = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(source_ip, 0));
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    let udp_response = {
+        let socket = UdpSocket::bind(bind_addr)
+            .await
+            .context("bind UDP socket for static DNS preflight")?;
+        socket
+            .connect(server_addr)
+            .await
+            .context("connect UDP socket to approved DNS server")?;
+        let mut buf = vec![0u8; 4096];
+        let mut received = None;
+        for attempt in 0..2 {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let wait = remaining.min(Duration::from_secs(3));
+            socket
+                .send(packet)
+                .await
+                .context("send DNS query to approved DNS server")?;
+            match tokio::time::timeout(wait, socket.recv(&mut buf)).await {
+                Ok(Ok(len)) => {
+                    buf.truncate(len);
+                    received = Some(buf);
+                    break;
+                }
+                Ok(Err(err)) if attempt == 0 => {
+                    let _ = err;
+                }
+                Ok(Err(err)) => return Err(err).context("read DNS UDP response"),
+                Err(_) if attempt == 0 => {}
+                Err(_) => bail!("DNS query timed out"),
+            }
+        }
+        received.ok_or_else(|| anyhow!("DNS query timed out"))?
+    };
+
+    if udp_response.len() >= 4 && (udp_response[2] & 0x02) != 0 {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            bail!("DNS TCP fallback timed out");
+        }
+        let tcp_result = tokio::time::timeout(remaining, async {
+            let socket = TcpSocket::new_v4().context("create TCP socket for DNS fallback")?;
+            socket
+                .bind(bind_addr)
+                .context("bind TCP socket for DNS fallback")?;
+            let mut stream = socket
+                .connect(server_addr)
+                .await
+                .context("connect TCP to approved DNS server")?;
+            let len = u16::try_from(packet.len()).context("DNS query too large for TCP")?;
+            stream.write_all(&len.to_be_bytes()).await?;
+            stream.write_all(packet).await?;
+            let mut len_buf = [0u8; 2];
+            stream.read_exact(&mut len_buf).await?;
+            let resp_len = u16::from_be_bytes(len_buf) as usize;
+            if !(12..=16 * 1024).contains(&resp_len) {
+                bail!("DNS TCP response length {resp_len} is out of bounds");
+            }
+            let mut resp = vec![0u8; resp_len];
+            stream.read_exact(&mut resp).await?;
+            Ok::<_, anyhow::Error>(resp)
+        })
+        .await
+        .context("DNS TCP fallback timed out")??;
+        return parse_dns_a_response(&tcp_result, txid);
+    }
+
+    parse_dns_a_response(&udp_response, txid)
+}
+
+fn build_dns_a_query(txid: u16, host: &str) -> Result<Vec<u8>> {
+    let trimmed = host.trim_end_matches('.');
+    if trimmed.is_empty() || trimmed.len() > 253 {
+        bail!("invalid DNS hostname");
+    }
+    let mut out = Vec::with_capacity(12 + trimmed.len() + 6);
+    out.extend_from_slice(&txid.to_be_bytes());
+    out.extend_from_slice(&0x0100u16.to_be_bytes()); // standard query, RD=1
+    out.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT=1
+    out.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
+    out.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
+    out.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+    for label in trimmed.split('.') {
+        if label.is_empty() || label.len() > 63 || !label.is_ascii() {
+            bail!("invalid DNS label");
+        }
+        out.push(label.len() as u8);
+        out.extend_from_slice(label.as_bytes());
+    }
+    out.push(0); // root label
+    out.extend_from_slice(&1u16.to_be_bytes()); // QTYPE=A
+    out.extend_from_slice(&1u16.to_be_bytes()); // QCLASS=IN
+    Ok(out)
+}
+
+fn skip_dns_name(packet: &[u8], mut offset: usize) -> Result<usize> {
+    let mut jumps = 0usize;
+    loop {
+        if offset >= packet.len() {
+            bail!("truncated DNS name");
+        }
+        let len = packet[offset];
+        if len == 0 {
+            return Ok(offset + 1);
+        }
+        if (len & 0xC0) == 0xC0 {
+            if offset + 1 >= packet.len() {
+                bail!("truncated DNS compression pointer");
+            }
+            let ptr = (((len & 0x3F) as usize) << 8) | (packet[offset + 1] as usize);
+            if ptr >= packet.len() {
+                bail!("DNS compression pointer out of bounds");
+            }
+            jumps += 1;
+            if jumps > 32 {
+                bail!("DNS compression pointer loop");
+            }
+            // Validate target lazily enough to reject loops, and return the
+            // position immediately after this 2-byte pointer in the caller stream.
+            let mut cursor = ptr;
+            let mut depth = jumps;
+            loop {
+                if cursor >= packet.len() {
+                    bail!("truncated DNS compressed target");
+                }
+                let next = packet[cursor];
+                if next == 0 {
+                    break;
+                }
+                if (next & 0xC0) == 0xC0 {
+                    if cursor + 1 >= packet.len() {
+                        bail!("truncated DNS compressed pointer");
+                    }
+                    cursor = (((next & 0x3F) as usize) << 8) | (packet[cursor + 1] as usize);
+                    depth += 1;
+                    if depth > 32 || cursor >= packet.len() {
+                        bail!("invalid DNS compression pointer");
+                    }
+                } else if (next & 0xC0) != 0 {
+                    bail!("invalid DNS label flags");
+                } else {
+                    cursor = cursor
+                        .checked_add(1 + next as usize)
+                        .ok_or_else(|| anyhow!("DNS label overflow"))?;
+                }
+            }
+            return Ok(offset + 2);
+        }
+        if (len & 0xC0) != 0 {
+            bail!("invalid DNS label flags");
+        }
+        offset = offset
+            .checked_add(1 + len as usize)
+            .ok_or_else(|| anyhow!("DNS label overflow"))?;
+    }
+}
+
+fn parse_dns_a_response(packet: &[u8], expected_txid: u16) -> Result<Vec<Ipv4Addr>> {
+    if packet.len() < 12 {
+        bail!("DNS response is truncated");
+    }
+    let txid = u16::from_be_bytes([packet[0], packet[1]]);
+    if txid != expected_txid {
+        bail!("DNS response transaction ID mismatch");
+    }
+    let flags = u16::from_be_bytes([packet[2], packet[3]]);
+    if (flags & 0x8000) == 0 {
+        bail!("DNS packet is not a response");
+    }
+    let rcode = flags & 0x000F;
+    if rcode != 0 {
+        bail!("DNS server returned error rcode {rcode}");
+    }
+    let qdcount = u16::from_be_bytes([packet[4], packet[5]]) as usize;
+    let ancount = u16::from_be_bytes([packet[6], packet[7]]) as usize;
+    let mut offset = 12usize;
+    for _ in 0..qdcount {
+        offset = skip_dns_name(packet, offset)?;
+        if offset + 4 > packet.len() {
+            bail!("truncated DNS question");
+        }
+        offset += 4;
+    }
+    let mut answers = Vec::new();
+    for _ in 0..ancount {
+        offset = skip_dns_name(packet, offset)?;
+        if offset + 10 > packet.len() {
+            bail!("truncated DNS answer header");
+        }
+        let rtype = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
+        let rclass = u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]);
+        let rdlength = u16::from_be_bytes([packet[offset + 8], packet[offset + 9]]) as usize;
+        offset += 10;
+        if offset + rdlength > packet.len() {
+            bail!("truncated DNS answer rdata");
+        }
+        if rtype == 1 && rclass == 1 && rdlength == 4 {
+            answers.push(Ipv4Addr::new(
+                packet[offset],
+                packet[offset + 1],
+                packet[offset + 2],
+                packet[offset + 3],
+            ));
+        }
+        offset += rdlength;
+    }
+    Ok(answers)
 }
 
 async fn collect_ethernet_interfaces() -> Result<Vec<NestProvisioningEthernetInterface>> {
@@ -1122,5 +1346,81 @@ mod tests {
     #[test]
     fn appliance_disk_floor_matches_the_shared_cache_layout() {
         assert_eq!(MIN_DISK_BYTES, 160 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn dns_a_query_encodes_and_parses_compressed_answers() {
+        let query = build_dns_a_query(0x1234, "manage.tiaris.com").unwrap();
+        assert_eq!(&query[0..2], &[0x12, 0x34]);
+        assert!(build_dns_a_query(1, "").is_err());
+        assert!(build_dns_a_query(1, "a..b").is_err());
+
+        // Synthetic response: 1 question + 1 CNAME + 2 A answers using compression pointers.
+        let mut resp = query.clone();
+        resp[2] = 0x81; // QR=1, RD=1
+        resp[3] = 0x80; // RA=1, RCODE=0
+        resp[6] = 0x00;
+        resp[7] = 0x03; // ANCOUNT=3
+        // Answer 1: CNAME pointing to 0x0c -> "cdn.tiaris.com"
+        resp.extend_from_slice(&[
+            0xC0, 0x0C, 0, 5, 0, 1, 0, 0, 0, 60, 0, 5, 3, b'c', b'd', b'n', 0,
+        ]);
+        // Answer 2: A record 203.0.113.10
+        resp.extend_from_slice(&[0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 203, 0, 113, 10]);
+        // Answer 3: A record 203.0.113.11
+        resp.extend_from_slice(&[0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 203, 0, 113, 11]);
+
+        let ips = parse_dns_a_response(&resp, 0x1234).unwrap();
+        assert_eq!(
+            ips,
+            vec![
+                Ipv4Addr::new(203, 0, 113, 10),
+                Ipv4Addr::new(203, 0, 113, 11),
+            ]
+        );
+        assert!(parse_dns_a_response(&resp, 0x9999).is_err());
+
+        // Reject NXDOMAIN (rcode 3).
+        let mut nx = resp.clone();
+        nx[3] = 0x83;
+        assert!(parse_dns_a_response(&nx, 0x1234).is_err());
+
+        // Reject pointer loop.
+        let mut loop_pkt = query.clone();
+        loop_pkt[2] = 0x81;
+        loop_pkt[7] = 0x01;
+        let ptr_pos = loop_pkt.len() as u16;
+        loop_pkt.extend_from_slice(&(0xC000 | ptr_pos).to_be_bytes());
+        assert!(parse_dns_a_response(&loop_pkt, 0x1234).is_err());
+    }
+
+    #[tokio::test]
+    async fn dns_udp_query_resolves_against_loopback_server() {
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (len, peer) = server.recv_from(&mut buf).await.unwrap();
+            let mut resp = buf[..len].to_vec();
+            resp[2] = 0x81;
+            resp[3] = 0x80;
+            resp[6] = 0x00;
+            resp[7] = 0x01;
+            resp.extend_from_slice(&[0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 30, 0, 4, 198, 51, 100, 7]);
+            server.send_to(&resp, peer).await.unwrap();
+        });
+
+        let packet = build_dns_a_query(0x4321, "manage.tiaris.com").unwrap();
+        let ips = query_dns_ipv4_addr(
+            Ipv4Addr::LOCALHOST,
+            addr,
+            0x4321,
+            &packet,
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        handle.await.unwrap();
+        assert_eq!(ips, vec![Ipv4Addr::new(198, 51, 100, 7)]);
     }
 }
