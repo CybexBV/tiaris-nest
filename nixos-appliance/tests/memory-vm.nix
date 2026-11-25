@@ -1,6 +1,6 @@
 # Component performance/leak fixture. Does not enroll or contact Manage.
 # Arguments are exact locally built baseline/candidate ELF files, never live VMs.
-{ baselineBinary, candidateBinary, memoryMiB ? 18432, freePageReporting ? false, cycles ? 5, soakHours ? 0, candidateFirst ? false }:
+{ baselineBinary, candidateBinary, memoryMiB ? 18432, maxConcurrentBuilds ? 2, freePageReporting ? false, cycles ? 5, soakHours ? 0, candidateFirst ? false, candidateOnly ? false }:
 let
   pin = import ../../release/nixpkgs.nix;
   nixpkgs = builtins.fetchTarball { inherit (pin) url sha256; };
@@ -35,7 +35,8 @@ in import (nixpkgs + "/nixos/tests/make-test-python.nix") ({ ... }: {
       memorySize = memoryMiB; cores = 4; diskSize = 65536;
       qemu.options = [ "-no-user-config" ] ++ pkgs.lib.optional freePageReporting "-global virtio-balloon-pci.free-page-reporting=on";
     };
-    swapDevices = [ { device = "/var/swapfile"; size = 8192; } ];
+    zramSwap = { enable = true; algorithm = "zstd"; memoryPercent = 25; priority = 100; };
+    swapDevices = [ { device = "/var/swapfile"; size = 8192; priority = 10; } ];
     users.groups.nest = {};
     users.users.nest = { isSystemUser = true; group = "nest"; home = "/var/lib/nest-memory"; createHome = true; };
     nix.settings = {
@@ -54,6 +55,12 @@ in import (nixpkgs + "/nixos/tests/make-test-python.nix") ({ ... }: {
       serviceConfig = { User = "nest"; Group = "nest"; MemoryAccounting = true; ExecStart = "/var/lib/nest-memory/active-nest --config /var/lib/nest-memory/config.toml serve"; Restart = "no"; KillMode = "control-group"; TimeoutStopSec = 20; };
     };
     environment.systemPackages = [ pkgs.python3 pkgs.curl pkgs.sqlite pkgs.nix pkgs.coreutils ];
+    # Populate every build input of pkgs.runCommand in the offline guest store.
+    system.extraDependencies = [
+      pkgs.stdenvNoCC
+      pkgs.bash
+      (pkgs.runCommand "nest-memory-seed" {} "mkdir -p $out; ln -s ${pkgs.bash}/bin/bash $out/bash").inputDerivation
+    ];
     environment.etc."nest-memory-fixture".text = "disposable component fixture\n";
     environment.etc."nest-memory-baseline".source = baseline + "/bin/tiaris-nest";
     environment.etc."nest-memory-candidate".source = candidate + "/bin/tiaris-nest";
@@ -78,7 +85,7 @@ in import (nixpkgs + "/nixos/tests/make-test-python.nix") ({ ... }: {
     traffic.wait_for_unit("nest-memory-traffic.service")
     machine.succeed("test $(systemd-detect-virt) = kvm")
     traffic.succeed("test $(systemd-detect-virt) = kvm")
-    status, output = machine.execute("python3 /etc/nest-memory-qualification.py --external-traffic --cycles ${toString cycles} --soak-hours ${toString soakHours} ${pkgs.lib.optionalString candidateFirst "--candidate-first"} --output /var/lib/nest-memory-results.json", timeout=${toString (3600 + soakHours * 3600)})
+    status, output = machine.execute("python3 /etc/nest-memory-qualification.py --external-traffic --max-concurrent-builds ${toString maxConcurrentBuilds} --cycles ${toString cycles} --soak-hours ${toString soakHours} ${pkgs.lib.optionalString candidateFirst "--candidate-first"} ${pkgs.lib.optionalString candidateOnly "--candidate-only"} --output /var/lib/nest-memory-results.json", timeout=${toString (3600 + soakHours * 3600)})
     print(output)
     machine.copy_from_machine("/var/lib/nest-memory-results.json", ".")
     machine.copy_from_machine("/var/lib/nest-memory-results.checkpoint.json", ".")

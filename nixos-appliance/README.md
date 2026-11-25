@@ -7,7 +7,7 @@ reinstall from the current Nest ISO. They do not receive a NixOS in-place update
 
 The product journey stays **Download Nest ISO → one disk safety check → Install
 Nest once → Ready**, with no local appliance input. Nest requires x86-64 UEFI
-with Secure Boot turned off, at least 16 GiB RAM, the existing CPU/wired-Ethernet
+with Secure Boot turned off, at least 8 GiB RAM, the existing CPU/wired-Ethernet
 requirements and an eligible fixed disk of at least 160 GiB. Firmware Secure Boot
 state is reported for information and is not an admission check.
 
@@ -442,7 +442,7 @@ and `backoff`) when this server already runs a Nest that the ISO starts at that
 time unless it is claimed; letters and code appear in no other state and never in a log. A claim
 screen replaces a preserved `stopped` screen. Then `checking` (rows `firmware`, `processor`, `memory`,
 `ethernet`, `disk`, `tiaris` with `done|active|queued|error`; a row below the
-Tiaris admission minimum of UEFI, 4 cores, 16 GiB, a linked wired interface and
+Tiaris admission minimum of UEFI, 4 cores, 8 GiB, a linked wired interface and
 an eligible 160 GiB disk is `error`), `awaiting_approval` (`tiaris_host`,
 `network`, `boot_mode`, and `disk` only when exactly one disk is eligible),
 `installing` (`approved_at`, `organization`, `name`, plan `disk`/`network`,

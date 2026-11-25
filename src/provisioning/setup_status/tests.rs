@@ -65,10 +65,10 @@ mod tempdir {
 fn check_values_use_design_units() {
     assert_eq!(format_memory(32 * GIB), "32 GiB");
     assert_eq!(format_memory(32 * GIB - 300 * 1024 * 1024), "32 GiB");
-    assert_eq!(format_insufficient_memory(8 * GIB), "8 GiB");
+    assert_eq!(format_insufficient_memory(4 * GIB), "4 GiB");
     assert_eq!(
-        format_insufficient_memory(15 * GIB + 700 * 1024 * 1024),
-        "15.6 GiB"
+        format_insufficient_memory(7 * GIB + 700 * 1024 * 1024),
+        "7.6 GiB"
     );
     assert_eq!(format_disk_size(960_197_124_096), "960 GB");
     assert_eq!(format_disk_size(1_920_383_410_176), "1.9 TB");
@@ -115,6 +115,15 @@ fn inventory_rows_follow_admission_minimums() {
     assert!(hardware_stop(&checks).is_none());
 
     inventory.memory_bytes = 8 * GIB;
+    let eight_gb_checks = inventory_checks(
+        &inventory,
+        LinkFacts::default(),
+        (CheckState::Queued, "Queued"),
+    );
+    assert_eq!(eight_gb_checks[2].state, CheckState::Done);
+    assert_eq!(eight_gb_checks[2].value, "8 GiB");
+
+    inventory.memory_bytes = 4 * GIB;
     inventory.cpu_cores = 2;
     let checks = inventory_checks(
         &inventory,
@@ -123,7 +132,7 @@ fn inventory_rows_follow_admission_minimums() {
     );
     assert_eq!(checks[1].state, CheckState::Error);
     assert_eq!(checks[1].value, "2 cores · needs 4");
-    assert_eq!(checks[2].value, "8 GiB · needs 16 GiB");
+    assert_eq!(checks[2].value, "4 GiB · needs 8 GiB");
     assert_eq!(checks[3].value, "eno1 · link up");
     // The first failing row decides the stop explanation.
     let stop = hardware_stop(&checks).unwrap();
@@ -384,7 +393,7 @@ fn process_errors_before_disk_writes_are_untouched_stops() {
 
     // A recorded hardware stop is kept rather than replaced by a generic one.
     let mut blocked = inventory.clone();
-    blocked.memory_bytes = 8 * GIB;
+    blocked.memory_bytes = 4 * GIB;
     // Each run is independent: no preserved screen from the previous one.
     let dir = tempdir::TempDir::new();
     let (status, path) = reporter(&dir);
@@ -693,7 +702,7 @@ fn restarted_run_never_replaces_failed_with_checking_or_an_untouched_stop() {
 fn restarted_run_rechecks_a_hardware_stop_with_fresh_inventory() {
     let (_, inventory) = fixture();
     let mut blocked = inventory.clone();
-    blocked.memory_bytes = 8 * GIB;
+    blocked.memory_bytes = 4 * GIB;
     let (dir, path, _) = restarted_after(|status| {
         status.media_verified("https://manage.cybex.net");
         status.inventory_collected(&blocked);

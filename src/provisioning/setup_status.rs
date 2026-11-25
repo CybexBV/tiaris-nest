@@ -27,7 +27,7 @@ pub const SETUP_STATUS_SCHEMA: &str = "tiaris.nest-setup-status.v1";
 const MAX_STATUS_BYTES: usize = 16 * 1024;
 // Keep these synchronized with Tiaris's Nest provisioning admission.
 const MIN_CPU_CORES: u32 = 4;
-const MIN_MEMORY_BYTES: u64 = 16 * GIB;
+const MIN_MEMORY_BYTES: u64 = 8 * GIB;
 const GIB: u64 = 1024 * 1024 * 1024;
 const PROGRESS_PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_VALUE_CHARS: usize = 80;
@@ -480,7 +480,7 @@ pub(super) fn format_memory(bytes: u64) -> String {
 }
 
 /// Below the floor, rounding up could print the minimum itself. Show a
-/// truncated tenth instead so "15.6 GiB · needs 16 GiB" stays truthful.
+/// truncated tenth instead so "7.6 GiB · needs 8 GiB" stays truthful.
 fn format_insufficient_memory(bytes: u64) -> String {
     let rounded = (bytes + GIB / 2) / GIB;
     if rounded * GIB < MIN_MEMORY_BYTES {
@@ -663,9 +663,9 @@ pub(super) fn hardware_stop(checks: &[Check]) -> Option<StopDetail> {
             ],
         ),
         CheckId::Memory => (
-            "Tiaris Nest needs at least 16 GiB of memory.",
+            "Tiaris Nest needs at least 8 GiB of memory.",
             vec![
-                "Add memory so this server has at least 16 GiB.".into(),
+                "Add memory so this server has at least 8 GiB.".into(),
                 RESTART_SAME_ISO.into(),
             ],
         ),

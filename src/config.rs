@@ -993,14 +993,19 @@ impl BuildConfig {
 
 /// One build per two CPUs (evaluation is single-threaded; much of a build
 /// waits on downloads) and per `memory_per_build_bytes` above the serving
-/// reserve; at least two, the number every Nest ran before, and at most eight.
+/// reserve; at least two on 12 GiB+ hosts (the number every 16 GiB+ Nest ran
+/// before), one on 8 GiB mini-PC hosts, and at most eight.
 fn host_concurrent_builds(cpus: usize, memory_bytes: Option<u64>, build: &BuildConfig) -> usize {
     let by_memory = memory_bytes.map_or(usize::MAX, |memory| {
         let builds = memory.saturating_sub(build.serving_memory_reserve_bytes)
             / build.memory_per_build_bytes.max(1);
         usize::try_from(builds).unwrap_or(usize::MAX)
     });
-    (cpus / 2).min(by_memory).clamp(2, 8)
+    let floor = match memory_bytes {
+        Some(memory) if memory < 12 * 1024 * 1024 * 1024 => 1,
+        _ => 2,
+    };
+    (cpus / 2).min(by_memory).clamp(floor, 8)
 }
 
 impl Default for BuildConfig {
@@ -1013,7 +1018,7 @@ impl Default for BuildConfig {
             memory_per_build_bytes: 4 * 1024 * 1024 * 1024,
             serving_memory_reserve_bytes: 2 * 1024 * 1024 * 1024,
             memory_pressure_full_percent: 5,
-            minimum_memory_bytes: 16 * 1024 * 1024 * 1024,
+            minimum_memory_bytes: 8 * 1024 * 1024 * 1024,
             minimum_swap_bytes: 8 * 1024 * 1024 * 1024,
             timeout_seconds: 60 * 60,
             cancel_grace_seconds: 10,
@@ -1183,7 +1188,7 @@ mod tests {
         );
         assert_eq!(config.manage.http_timeout_seconds, 30);
         assert_eq!(config.build.max_build_cores, 4);
-        assert_eq!(config.build.minimum_memory_bytes, 16 * 1024 * 1024 * 1024);
+        assert_eq!(config.build.minimum_memory_bytes, 8 * 1024 * 1024 * 1024);
         assert_eq!(config.build.minimum_swap_bytes, 8 * 1024 * 1024 * 1024);
         assert_eq!(
             config.build.manage_source_url_template,
@@ -1200,7 +1205,9 @@ mod tests {
         assert_eq!(host_concurrent_builds(8, Some(32 * gib), &build), 4);
         assert_eq!(host_concurrent_builds(16, Some(16 * gib), &build), 3);
         assert_eq!(host_concurrent_builds(64, Some(256 * gib), &build), 8);
-        assert_eq!(host_concurrent_builds(2, Some(8 * gib), &build), 2);
+        assert_eq!(host_concurrent_builds(4, Some(8 * gib), &build), 1);
+        assert_eq!(host_concurrent_builds(2, Some(8 * gib), &build), 1);
+        assert_eq!(host_concurrent_builds(4, Some(12 * gib), &build), 2);
         let explicit = BuildConfig {
             max_concurrent_builds: 5,
             ..BuildConfig::default()

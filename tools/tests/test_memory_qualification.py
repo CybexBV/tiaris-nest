@@ -48,6 +48,24 @@ class MemoryQualificationTests(unittest.TestCase):
             self.execute(hours=1, elapsed=3599)
         self.assertFalse(self.writes[-1]['soak_complete'])
 
+    def test_candidate_only_runs_single_tier_without_baseline(self):
+        row = {'seconds': 100, 'served_bytes': 1000000, 'traffic_seconds': 100,
+               'path_p95_seconds': {'cache': .01, 'file': .01, 'ipxe': .01}}
+        result = {'elapsed_seconds': 210, 'runs': [row] * 2}
+        argv = ['qualify-memory.py', '--output', '/unused/results.json', '--cycles', '2',
+                '--candidate-only', '--max-concurrent-builds', '0']
+        writes = []
+        with patch('sys.argv', argv), \
+                patch.object(Path, 'read_text', return_value='disposable component fixture\n'), \
+                patch.object(MEMORY, 'prepare') as prep, \
+                patch.object(MEMORY, 'run', return_value='fixture'), \
+                patch.object(MEMORY, 'trial', return_value=result) as trial, \
+                patch.object(MEMORY, 'write_evidence', side_effect=lambda p, e: writes.append(copy.deepcopy(e))):
+            MEMORY.main()
+        prep.assert_called_once_with(False, 0)
+        self.assertEqual([call.args[:3] for call in trial.call_args_list], [('candidate', 2, 0)])
+        self.assertTrue(writes[-1]['performance_pass'])
+
 
 if __name__ == '__main__':
     unittest.main()
