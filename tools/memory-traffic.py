@@ -25,14 +25,18 @@ def serve_load(stop, results):
         path = paths[index % len(paths)]
         started = time.monotonic()
         with urllib.request.urlopen(URL+path, timeout=30) as response:
+            accel = response.headers.get('X-Accel-Redirect')
             length, prefix = 0, b''
             while chunk := response.read(1024*1024):
                 if not prefix: prefix = chunk[:16]
                 length += len(chunk)
         if path.startswith('/boot/'):
             if not prefix.startswith(b'#!ipxe'): raise RuntimeError('invalid iPXE response')
+        elif path.startswith('/cache/') and accel is not None:
+            if accel != '/_tiaris' + path or length != 0:
+                raise RuntimeError(f'unexpected cache handoff for {path}: {accel!r}')
         elif length != 16*1024*1024 or prefix != bytes(range(16)):
-            raise RuntimeError('served file content or size changed')
+            raise RuntimeError(f'served file content or size changed for {path}')
         results.append((path, time.monotonic()-started, length))
         index += 1
         time.sleep(.02)

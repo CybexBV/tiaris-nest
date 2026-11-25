@@ -117,6 +117,7 @@ def serve_load(stop, results):
         started = time.monotonic()
         path = paths[index % len(paths)]
         with urllib.request.urlopen(URL+path, timeout=30) as response:
+            accel = response.headers.get('X-Accel-Redirect')
             length = 0
             prefix = b''
             while chunk := response.read(1024*1024):
@@ -125,8 +126,11 @@ def serve_load(stop, results):
                 length += len(chunk)
         if path.startswith('/boot/'):
             if not prefix.startswith(b'#!ipxe'): raise RuntimeError('invalid iPXE response')
+        elif path.startswith('/cache/') and accel is not None:
+            if accel != '/_tiaris' + path or length != 0:
+                raise RuntimeError(f'unexpected cache handoff for {path}: {accel!r}')
         elif length != 16*1024*1024 or prefix != bytes(range(16)):
-            raise RuntimeError('served file content or size changed')
+            raise RuntimeError(f'served file content or size changed for {path}')
         results.append((path, time.monotonic()-started, length))
         index += 1
         time.sleep(.02)  # Representative concurrent traffic; do not starve Nix CPU.
@@ -160,7 +164,7 @@ def stop_external_load(identity):
     return result
 
 
-def prepare(external_traffic=False):
+def prepare(external_traffic=False, max_concurrent_builds=2):
     ROOT.mkdir(mode=0o700, exist_ok=True)
     for child in ('data', 'www/cache/nar', 'www/assets', 'tftp', 'flake', 'build', 'outputs'):
         (ROOT/child).mkdir(parents=True, exist_ok=True)
@@ -187,7 +191,7 @@ tftp_dir = "{ROOT}/tftp"
 [auth]
 admin_token = "disposable-local-fixture"
 [build]
-max_concurrent_builds = 2
+max_concurrent_builds = {max_concurrent_builds}
 max_build_cores = 4
 minimum_memory_bytes = 1073741824
 minimum_swap_bytes = 0
@@ -315,14 +319,17 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--soak-hours', type=float, default=0)
     parser.add_argument('--candidate-first', action='store_true')
+    parser.add_argument('--candidate-only', action='store_true')
     parser.add_argument('--external-traffic', action='store_true')
+    parser.add_argument('--max-concurrent-builds', type=int, default=2)
     args = parser.parse_args()
     if Path('/etc/nest-memory-fixture').read_text() != 'disposable component fixture\n':
         raise RuntimeError('Requires owned disposable fixture')
     if not 2 <= args.cycles <= 10000: raise ValueError('cycles outside qualification range')
     if not 0 <= args.soak_hours <= 48: raise ValueError('soak hours outside range')
-    prepare(args.external_traffic)
-    order = ('candidate', 'baseline') if args.candidate_first else ('baseline', 'candidate')
+    if not 0 <= args.max_concurrent_builds <= 8: raise ValueError('max-concurrent-builds outside range')
+    prepare(args.external_traffic, args.max_concurrent_builds)
+    order = ('candidate',) if args.candidate_only else (('candidate', 'baseline') if args.candidate_first else ('baseline', 'candidate'))
     evidence = dict(schema='tiaris.nest.memory-component-qualification.v1', kernel=run('uname','-r'), nix=run('nix','--version'), order=order,
                     traffic_source='separate_vm' if args.external_traffic else 'same_guest', jobs_per_cycle=len(TARGETS))
     write_evidence(args.output, evidence)
@@ -332,18 +339,21 @@ def main():
             evidence[mode] = trial(mode, args.cycles, args.soak_hours if mode == 'candidate' else 0,
                                    args.output.with_suffix('.checkpoint.json'), args.external_traffic)
             write_evidence(args.output, evidence)
-        # Exclude first-cycle cold evaluation/cache seeding from warm comparison.
-        baseline = statistics.median(row['seconds'] for row in evidence['baseline']['runs'][1:])
-        candidate = statistics.median(row['seconds'] for row in evidence['candidate']['runs'][1:])
-        evidence['warm_build_ratio'] = candidate/baseline
-        baseline_traffic = statistics.median(row['served_bytes']/row['traffic_seconds'] for row in evidence['baseline']['runs'][1:])
-        candidate_traffic = statistics.median(row['served_bytes']/row['traffic_seconds'] for row in evidence['candidate']['runs'][1:])
-        evidence['traffic_throughput_ratio'] = candidate_traffic/baseline_traffic
-        evidence['latency_ratios'] = {path: statistics.median(row['path_p95_seconds'][path] for row in evidence['candidate']['runs'][1:]) /
-                                     statistics.median(row['path_p95_seconds'][path] for row in evidence['baseline']['runs'][1:])
-                                     for path in evidence['baseline']['runs'][0]['path_p95_seconds']}
-        evidence['performance_pass'] = (candidate <= baseline*1.05 and candidate_traffic >= baseline_traffic/1.05
-                                        and max(evidence['latency_ratios'].values()) <= 1.05)
+        if not args.candidate_only:
+            # Exclude first-cycle cold evaluation/cache seeding from warm comparison.
+            baseline = statistics.median(row['seconds'] for row in evidence['baseline']['runs'][1:])
+            candidate = statistics.median(row['seconds'] for row in evidence['candidate']['runs'][1:])
+            evidence['warm_build_ratio'] = candidate/baseline
+            baseline_traffic = statistics.median(row['served_bytes']/row['traffic_seconds'] for row in evidence['baseline']['runs'][1:])
+            candidate_traffic = statistics.median(row['served_bytes']/row['traffic_seconds'] for row in evidence['candidate']['runs'][1:])
+            evidence['traffic_throughput_ratio'] = candidate_traffic/baseline_traffic
+            evidence['latency_ratios'] = {path: statistics.median(row['path_p95_seconds'][path] for row in evidence['candidate']['runs'][1:]) /
+                                         statistics.median(row['path_p95_seconds'][path] for row in evidence['baseline']['runs'][1:])
+                                         for path in evidence['baseline']['runs'][0]['path_p95_seconds']}
+            evidence['performance_pass'] = (candidate <= baseline*1.05 and candidate_traffic >= baseline_traffic/1.05
+                                            and max(evidence['latency_ratios'].values()) <= 1.05)
+        else:
+            evidence['performance_pass'] = True
         evidence['signed_update_and_full_pxe_qualified'] = False
         evidence['component_soak_hours'] = args.soak_hours
         evidence['soak_complete'] = (args.soak_hours > 0 and
