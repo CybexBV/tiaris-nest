@@ -150,14 +150,24 @@ class ArtifactServerTests(unittest.TestCase):
                 self.assertEqual(headers['Content-Range'], f'bytes {offset}-{len(self.body)-1}/{len(self.body)}')
                 self.assertEqual(headers['Content-Length'], str(len(self.body) - offset))
                 self.assertEqual(body, self.body[offset:] if method == 'GET' else b'')
+        for start, end in ((0, 0), (1, 2), (13, 255), (len(self.body) - 5, len(self.body) + 100)):
+            clamped_end = min(end, len(self.body) - 1)
+            for method in ('GET', 'HEAD'):
+                status, headers, body = self.request(method=method, headers={'Range': f'bytes={start}-{end}'})
+                self.assertEqual(status, 206)
+                self.assertEqual(headers['Content-Range'], f'bytes {start}-{clamped_end}/{len(self.body)}')
+                self.assertEqual(headers['Content-Length'], str(clamped_end - start + 1))
+                self.assertEqual(body, self.body[start:clamped_end + 1] if method == 'GET' else b'')
+        self.assertEqual(self.server.request_counts, {'full': 2, 'open_range': 6, 'bounded_range': 8})
 
     def test_concurrent_ranges_use_independent_fd_offsets(self):
         self.start()
         def fetch(offset):
-            return self.request(headers={'Range': f'bytes={offset}-'})[2]
+            return self.request(headers={'Range': f'bytes={offset}-{offset + 31}'})[2]
         with ThreadPoolExecutor(max_workers=4) as pool:
             results = list(pool.map(fetch, range(1, 17)))
-        self.assertEqual(results, [self.body[offset:] for offset in range(1, 17)])
+        self.assertEqual(results, [self.body[offset:offset + 32] for offset in range(1, 17)])
+        self.assertEqual(self.server.request_counts['bounded_range'], 16)
 
     def test_only_exact_routes_and_methods_are_served(self):
         self.start()
@@ -176,8 +186,9 @@ class ArtifactServerTests(unittest.TestCase):
 
     def test_invalid_ranges_return_exact_416(self):
         self.start()
-        for value in ('bytes=-10', 'bytes=1-2', 'bytes=0-,1-', 'bytes=00-',
-                      f'bytes={len(self.body)}-', 'bytes=999999999999999999999999-', 'items=0-'):
+        for value in ('bytes=-10', 'bytes=5-2', 'bytes=00-1', 'bytes=1-02', 'bytes=0-,1-', 'bytes=00-',
+                      f'bytes={len(self.body)}-', f'bytes={len(self.body)}-{len(self.body)}',
+                      'bytes=999999999999999999999999-', 'items=0-'):
             status, headers, body = self.request(headers={'Range': value})
             self.assertEqual(status, 416)
             self.assertEqual(headers['Content-Range'], f'bytes */{len(self.body)}')

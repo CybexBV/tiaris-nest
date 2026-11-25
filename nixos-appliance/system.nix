@@ -21,15 +21,50 @@
   networking.hostName = "tiaris-nest";
   system.stateVersion = "26.05";
   boot.loader.systemd-boot.enable = true;
+  boot.loader.systemd-boot.editor = false;
   boot.loader.systemd-boot.configurationLimit = 4; # current + 2 known good + pending
   boot.loader.efi.canTouchEfiVariables = true;
   boot.loader.timeout = 3;
-  boot.initrd.availableKernelModules = [ "xhci_pci" "ahci" "nvme" "virtio_pci" "virtio_blk" "virtio_scsi" "sd_mod" "sr_mod" "usbhid" "usb_storage" "vmd" ];
+  # Include server RAID/HBA, hypervisor, USB/UAS, eMMC, and real-hardware
+  # watchdog drivers in initrd so udev can find TIARIS_ROOT and arm the
+  # hardware watchdog on bare metal as well as VMs.
+  boot.initrd.availableKernelModules = [
+    "xhci_pci" "xhci-hcd" "ehci-pci" "ohci-pci" "uhci-hcd"
+    "ahci" "ata_piix" "ata_generic" "nvme" "vmd"
+    "virtio_pci" "virtio_blk" "virtio_scsi" "sd_mod" "sr_mod"
+    "usbhid" "usb_storage" "uas"
+    "megaraid_sas" "mpt3sas" "mpi3mr" "smartpqi" "hpsa" "aacraid" "mptsas" "mptspi"
+    "hv_vmbus" "hv_storvsc" "vmw_pvscsi" "xen-blkfront"
+    "mmc_block" "sdhci" "sdhci-pci" "sdhci-acpi"
+    "iTCO_wdt" "lpc_ich" "i2c-i801" "sp5100_tco"
+  ];
   boot.initrd.kernelModules = [ "i6300esb" ];
   boot.initrd.systemd.enable = true;
   boot.initrd.systemd.emergencyAccess = false;
   boot.initrd.systemd.settings.Manager = { RuntimeWatchdogSec = "120s"; RebootWatchdogSec = "10min"; };
   boot.initrd.systemd.targets.initrd.unitConfig = { JobTimeoutSec = "180s"; JobTimeoutAction = "reboot-force"; };
+  boot.initrd.systemd.services.tiaris-nest-disk-missing = {
+    description = "Report missing Nest root disk before emergency reboot";
+    wantedBy = [ "emergency.target" ];
+    before = [ "emergency.service" ];
+    unitConfig = {
+      DefaultDependencies = false;
+      ConditionPathExists = "!/dev/disk/by-label/TIARIS_ROOT";
+    };
+    serviceConfig = {
+      Type = "oneshot";
+      StandardOutput = "journal+console";
+      StandardError = "journal+console";
+    };
+    script = ''
+      printf '\n============================================================\n'
+      printf 'Tiaris Nest: root disk (TIARIS_ROOT) was not found.\n'
+      printf 'Check disk connection or storage controller driver support.\n'
+      printf 'Rebooting...\n'
+      printf '============================================================\n'
+      sleep 3
+    '';
+  };
   boot.initrd.systemd.services.emergency.serviceConfig.ExecStart = lib.mkForce [ "" "${pkgs.systemd}/bin/systemctl --no-block reboot" ];
   boot.kernelParams = [ "panic=30" "console=ttyS0,115200n8" "console=tty0" ];
   hardware.enableRedistributableFirmware = true;

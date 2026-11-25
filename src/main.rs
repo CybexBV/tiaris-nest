@@ -10,7 +10,6 @@ use tiaris_nest::{
     db, router,
 };
 use tokio::net::TcpListener;
-use tokio::process::Command as TokioCommand;
 use tokio::time::{Duration, sleep};
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -204,6 +203,7 @@ async fn run_server(
         state.db.clone(),
         state.config.paths.data_dir.join("resources.json"),
     );
+    db::spawn_maintenance(state.db.clone(), state.config.paths.database_path.clone());
     let app = router(state.clone());
 
     info!(%listen_addr, "tiaris-nest listening");
@@ -222,25 +222,23 @@ async fn run_server(
 /// trivial request on loopback, so a hung daemon is restarted. Liveness only:
 /// readiness, PXE, Tiaris contact, locks and builds never count, and the
 /// unit's `WatchdogSec` (5 minutes) leaves room for a busy Nest.
+///
+/// Writes directly to `$NOTIFY_SOCKET` from the main process instead of
+/// spawning `systemd-notify`, which also allows `NotifyAccess=main`.
 fn spawn_systemd_watchdog(listening: SocketAddr) {
-    if std::env::var_os("NOTIFY_SOCKET").is_none() {
+    let Some(notify_socket) = std::env::var_os("NOTIFY_SOCKET").filter(|value| !value.is_empty())
+    else {
         return;
-    }
+    };
     let target = liveness_target(listening);
     tokio::spawn(async move {
-        let _ = TokioCommand::new("systemd-notify")
-            .arg("--ready")
-            .status()
-            .await;
+        if let Err(err) = send_systemd_notify(&notify_socket, "READY=1") {
+            warn!(error = %err, "failed to notify systemd readiness");
+        }
         loop {
             if tiaris_nest::routes::server_answers(target).await {
-                if TokioCommand::new("systemd-notify")
-                    .arg("WATCHDOG=1")
-                    .status()
-                    .await
-                    .is_err()
-                {
-                    warn!("failed to notify systemd watchdog");
+                if let Err(err) = send_systemd_notify(&notify_socket, "WATCHDOG=1") {
+                    warn!(error = %err, "failed to notify systemd watchdog");
                 }
             } else {
                 warn!("the Nest's own HTTP server did not answer its liveness request");
@@ -248,6 +246,40 @@ fn spawn_systemd_watchdog(listening: SocketAddr) {
             sleep(Duration::from_secs(10)).await;
         }
     });
+}
+
+#[cfg(unix)]
+fn send_systemd_notify(notify_socket: &std::ffi::OsStr, state: &str) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::net::{SocketAddr as UnixSocketAddr, UnixDatagram};
+
+    let raw = notify_socket.as_bytes();
+    let addr = if let Some(abstract_name) = raw.strip_prefix(b"@") {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::linux::net::SocketAddrExt;
+            UnixSocketAddr::from_abstract_name(abstract_name)?
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = abstract_name;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "abstract unix sockets are only supported on Linux",
+            ));
+        }
+    } else {
+        UnixSocketAddr::from_pathname(std::path::Path::new(notify_socket))?
+    };
+
+    let socket = UnixDatagram::unbound()?;
+    socket.send_to_addr(state.as_bytes(), &addr)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn send_systemd_notify(_notify_socket: &std::ffi::OsStr, _state: &str) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Where the server answers locally: loopback for a wildcard listener.
@@ -324,5 +356,52 @@ mod tests {
             &config,
             &Command::SyncOnce
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemd_notify_writes_to_pathname_socket() {
+        use std::os::unix::net::UnixDatagram;
+
+        let dir =
+            std::env::temp_dir().join(format!("tiaris-nest-notify-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock_path = dir.join("notify.sock");
+        let receiver = UnixDatagram::bind(&sock_path).unwrap();
+        receiver
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+
+        super::send_systemd_notify(sock_path.as_os_str(), "READY=1").unwrap();
+        super::send_systemd_notify(sock_path.as_os_str(), "WATCHDOG=1").unwrap();
+
+        let mut buf = [0u8; 64];
+        let n1 = receiver.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n1], b"READY=1");
+        let n2 = receiver.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n2], b"WATCHDOG=1");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn systemd_notify_writes_to_abstract_socket() {
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::{SocketAddr as UnixSocketAddr, UnixDatagram};
+
+        let name = format!("tiaris-nest-notify-abstract-{}", uuid::Uuid::new_v4());
+        let addr = UnixSocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+        let receiver = UnixDatagram::bind_addr(&addr).unwrap();
+        receiver
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+
+        let env_value = std::ffi::OsString::from(format!("@{name}"));
+        super::send_systemd_notify(&env_value, "WATCHDOG=1").unwrap();
+
+        let mut buf = [0u8; 64];
+        let n = receiver.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"WATCHDOG=1");
     }
 }

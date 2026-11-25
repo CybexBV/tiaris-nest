@@ -68,6 +68,7 @@ def prepare_cache_directories(root=Path('/var/cache/tiaris-nest'), uid=UID, gid=
     directory(root / 'www/cache', 0o755, uid, gid)
     for name in ('build', 'build-outputs'):
         directory(root / name, 0o750, uid, gid)
+    directory(root / 'vulnix', 0o700, uid, gid)
     directory(root / 'tftp', 0o755, root_uid, root_gid)
 
 
