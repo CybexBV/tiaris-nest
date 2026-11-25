@@ -4,12 +4,13 @@ use std::os::{
     unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
 };
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ffi::OsString,
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
     str::FromStr,
+    sync::{Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -3489,15 +3490,28 @@ fn append_bounded_response_chunk_with_limit(
 }
 
 fn http_client_for_config(config: &AppConfig) -> Result<Client> {
-    let timeout = Duration::from_secs(bounded_http_timeout_seconds(
-        config.manage.http_timeout_seconds,
-    ));
-    Client::builder()
+    let timeout_seconds = bounded_http_timeout_seconds(config.manage.http_timeout_seconds);
+    static CLIENTS: OnceLock<Mutex<BTreeMap<u64, Client>>> = OnceLock::new();
+    let cache = CLIENTS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(client) = guard.get(&timeout_seconds) {
+            return Ok(client.clone());
+        }
+    }
+    let timeout = Duration::from_secs(timeout_seconds);
+    let client = Client::builder()
         .timeout(timeout)
         .connect_timeout(timeout.min(Duration::from_secs(10)))
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .context("failed to build managed HTTP client")
+        .context("failed to build managed HTTP client")?;
+    if let Ok(mut guard) = cache.lock() {
+        if guard.len() >= 16 {
+            guard.clear();
+        }
+        guard.insert(timeout_seconds, client.clone());
+    }
+    Ok(client)
 }
 
 fn bounded_http_timeout_seconds(value: u64) -> u64 {

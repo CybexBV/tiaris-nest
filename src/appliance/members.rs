@@ -34,6 +34,7 @@ use std::{
     os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     pin::Pin,
+    sync::atomic::{AtomicU64, Ordering},
     task::Poll,
     time::Duration,
 };
@@ -44,8 +45,13 @@ const BLOCK: u64 = 128 * 1024;
 /// not say how far the metadata goes (2.2 MiB for 1149 members; the
 /// manifest, 0.6 MiB of it, comes first).
 const METADATA_STEP: u64 = 1024 * 1024;
-/// Members fetched at once.
+/// Members or coalesced batches fetched at once.
 const AT_ONCE: usize = 4;
+/// Coalesce adjacent/nearby small wanted members into one Range request up to
+/// this combined tar span and inter-member gap, eliminating hundreds of tiny
+/// round trips while keeping unwanted gap transfer minimal.
+const MAX_COALESCE_SPAN: u64 = 4 * 1024 * 1024;
+const MAX_COALESCE_GAP: u64 = 64 * 1024;
 const MAX_METADATA: u64 = 64 * 1024 * 1024;
 const RESUMES: u32 = 8;
 const RESUME_PAUSE: Duration = Duration::from_secs(5);
@@ -660,29 +666,51 @@ fn held(manifest: &closure::ClosureManifest, present: &Present, closed: bool) ->
 }
 
 /// Fetch what `plan` wants into its partial stream and complete it as
-/// `target`, [`AT_ONCE`] members at a time, each into its own place. Each
-/// member is checked against its signed NARInfo once its bytes are there; a
-/// member that does not verify ends this way (take the full archive). Errors
-/// are [`KeepTrying`] or such a reason.
+/// `target`, [`AT_ONCE`] batches at a time, each member into its own place.
+/// Nearby small members are coalesced into bounded HTTP Range requests while
+/// each member is still individually verified against its signed NARInfo.
 pub async fn stage(plan: &Plan, target: &Path) -> Result<()> {
+    stage_with_progress(plan, target, &|_, _| {}).await
+}
+
+/// [`stage`] with a progress callback `(received_bytes, total_bytes)`.
+pub async fn stage_with_progress(
+    plan: &Plan,
+    target: &Path,
+    on_progress: &(dyn Fn(u64, u64) + Send + Sync),
+) -> Result<()> {
     let partial = &plan.partial;
     let file = open_partial(partial)?;
     let slots = plan.slots()?;
     let done = resume(&file, plan, &slots)?;
-    let fetches: Vec<Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>> = plan
-        .wanted
-        .iter()
-        .zip(&slots)
-        .zip(done)
-        .filter(|(_, done)| !done)
-        .map(|((wanted, at), _)| {
-            Box::pin(fetch_member(plan, &file, wanted, *at))
+    let mut initial = plan.prefix.len() as u64;
+    let mut pending = Vec::new();
+    for ((wanted, &at), is_done) in plan.wanted.iter().zip(&slots).zip(&done) {
+        let info = plan.info(wanted)?;
+        let padded = 512 + info.file_size.div_ceil(512) * 512;
+        if *is_done {
+            initial = initial.saturating_add(padded);
+        } else {
+            pending.push(BatchItem {
+                wanted,
+                slot: at,
+                file_size: info.file_size,
+            });
+        }
+    }
+    let progress = AtomicU64::new(initial.min(plan.bytes));
+    on_progress(progress.load(Ordering::Relaxed), plan.bytes);
+    let batches = coalesce_batches(pending);
+    let fetches: Vec<Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>> = batches
+        .into_iter()
+        .map(|batch| {
+            Box::pin(fetch_batch(plan, &file, batch, &progress, on_progress))
                 as Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>
         })
         .collect();
     let mut keep_trying = None;
     // A member that does not verify, or a server that does not serve
-    // ranges, ends this way: no further member starts.
+    // ranges, ends this way: no further batch starts.
     let ends = |result: &Result<()>| {
         result
             .as_ref()
@@ -706,30 +734,112 @@ pub async fn stage(plan: &Plan, target: &Path) -> Result<()> {
         file.metadata()?.len() == plan.bytes,
         "the staged update has an unexpected size"
     );
+    on_progress(plan.bytes, plan.bytes);
     fs::rename(partial, target)?;
     super::sync_directory(target.parent().ok_or_else(|| anyhow!("inbox"))?)?;
     Ok(())
 }
 
-/// Fetch one member into its place `at` and check it.
-async fn fetch_member(plan: &Plan, file: &File, wanted: &Wanted, at: u64) -> Result<()> {
-    let info = plan.info(wanted)?;
-    let mut got = wanted.offset;
-    let mut cursor = at;
+struct BatchItem<'a> {
+    wanted: &'a Wanted,
+    slot: u64,
+    file_size: u64,
+}
+
+impl BatchItem<'_> {
+    fn tar_start(&self) -> u64 {
+        self.wanted.offset
+    }
+
+    fn tar_end(&self) -> u64 {
+        self.wanted.offset + 512 + self.file_size
+    }
+}
+
+struct Batch<'a> {
+    items: Vec<BatchItem<'a>>,
+    tar_start: u64,
+    tar_end: u64,
+}
+
+fn coalesce_batches(items: Vec<BatchItem<'_>>) -> Vec<Batch<'_>> {
+    let mut batches: Vec<Batch<'_>> = Vec::new();
+    for item in items {
+        let start = item.tar_start();
+        let end = item.tar_end();
+        if let Some(current) = batches.last_mut() {
+            let gap = start.saturating_sub(current.tar_end);
+            let combined_span = end.saturating_sub(current.tar_start);
+            if start >= current.tar_end
+                && gap <= MAX_COALESCE_GAP
+                && combined_span <= MAX_COALESCE_SPAN
+            {
+                current.tar_end = end;
+                current.items.push(item);
+                continue;
+            }
+        }
+        batches.push(Batch {
+            items: vec![item],
+            tar_start: start,
+            tar_end: end,
+        });
+    }
+    batches
+}
+
+/// Fetch one member or coalesced batch into each member's slot and verify every member.
+async fn fetch_batch(
+    plan: &Plan,
+    file: &File,
+    batch: Batch<'_>,
+    progress: &AtomicU64,
+    on_progress: &(dyn Fn(u64, u64) + Send + Sync),
+) -> Result<()> {
+    let mut got = batch.tar_start;
+    let mut written_tar_pos = batch.tar_start;
     plan.source
-        .fill(
-            &mut got,
-            wanted.offset + 512 + info.file_size,
-            &mut |bytes| {
-                file.write_all_at(bytes, cursor)?;
-                cursor += bytes.len() as u64;
-                Ok(())
-            },
-        )
+        .fill(&mut got, batch.tar_end, &mut |bytes| {
+            let chunk_start = written_tar_pos;
+            let chunk_end = chunk_start + bytes.len() as u64;
+            let mut written_for_progress = 0u64;
+            for item in &batch.items {
+                let item_start = item.tar_start();
+                let item_end = item.tar_end();
+                if item_end <= chunk_start || item_start >= chunk_end {
+                    continue;
+                }
+                let copy_start = chunk_start.max(item_start);
+                let copy_end = chunk_end.min(item_end);
+                let src_from = (copy_start - chunk_start) as usize;
+                let src_to = (copy_end - chunk_start) as usize;
+                let dst_offset = item.slot + (copy_start - item_start);
+                file.write_all_at(&bytes[src_from..src_to], dst_offset)?;
+                written_for_progress += copy_end - copy_start;
+            }
+            written_tar_pos = chunk_end;
+            if written_for_progress > 0 {
+                let total_received = progress
+                    .fetch_add(written_for_progress, Ordering::Relaxed)
+                    .saturating_add(written_for_progress)
+                    .min(plan.bytes);
+                on_progress(total_received, plan.bytes);
+            }
+            Ok(())
+        })
         .await?;
-    verify_entry(file, at, wanted, plan)?;
-    let padding = info.file_size.div_ceil(512) * 512 - info.file_size;
-    file.write_all_at(&vec![0; padding as usize], at + 512 + info.file_size)?;
+    for item in &batch.items {
+        verify_entry(file, item.slot, item.wanted, plan)?;
+        let padding = item.file_size.div_ceil(512) * 512 - item.file_size;
+        if padding > 0 {
+            file.write_all_at(&vec![0; padding as usize], item.slot + 512 + item.file_size)?;
+            let total_received = progress
+                .fetch_add(padding, Ordering::Relaxed)
+                .saturating_add(padding)
+                .min(plan.bytes);
+            on_progress(total_received, plan.bytes);
+        }
+    }
     Ok(())
 }
 

@@ -1,16 +1,145 @@
 //! Bounded, proxy-independent transport for signed public release artifacts.
 
-use std::{collections::BTreeSet, net::IpAddr, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io,
+    net::{IpAddr, SocketAddr},
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, anyhow, bail};
-use reqwest::{Client, Response, Url, header};
+use reqwest::{
+    Client, Response, StatusCode, Url,
+    dns::{Addrs, Name, Resolve, Resolving},
+    header,
+};
 use tokio::net::lookup_host;
 
 const MAX_REDIRECTS: usize = 5;
+const REDIRECT_CACHE_TTL: Duration = Duration::from_secs(120);
+const REDIRECT_CACHE_MAX_ENTRIES: usize = 16;
+
+/// Custom DNS resolver enforcing the public-network (or explicit development
+/// private-network) IP policy on every connection establishment inside a
+/// pooled `reqwest::Client`. Rejects disallowed addresses before TCP connect
+/// while letting keep-alive HTTP/1.1 and HTTP/2 connections stay pooled across
+/// Range requests.
+struct PolicyDnsResolver {
+    allow_private_urls: bool,
+}
+
+impl Resolve for PolicyDnsResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let host = name.as_str().to_string();
+        let allow_private_urls = self.allow_private_urls;
+        Box::pin(async move {
+            let addresses = lookup_host((host.as_str(), 0))
+                .await
+                .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)?
+                .collect::<BTreeSet<SocketAddr>>();
+            if addresses.is_empty()
+                || addresses
+                    .iter()
+                    .any(|address| !address_allowed(address.ip(), allow_private_urls))
+            {
+                return Err(Box::new(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "signed release artifact host resolved to a disallowed address",
+                ))
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+            let iter: Addrs = Box::new(addresses.into_iter());
+            Ok(iter)
+        })
+    }
+}
+
+fn pooled_client(allow_private_urls: bool) -> Result<Client> {
+    let build = || -> Result<Client> {
+        let mut builder = Client::builder()
+            .read_timeout(Duration::from_secs(90))
+            .connect_timeout(Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .dns_resolver(Arc::new(PolicyDnsResolver { allow_private_urls }));
+        if !allow_private_urls {
+            builder = builder
+                .https_only(true)
+                .min_tls_version(reqwest::tls::Version::TLS_1_2);
+        }
+        builder.build().context("build pooled release HTTP client")
+    };
+    if allow_private_urls {
+        static PRIVATE: OnceLock<Client> = OnceLock::new();
+        if let Some(client) = PRIVATE.get() {
+            return Ok(client.clone());
+        }
+        let client = build()?;
+        let _ = PRIVATE.set(client.clone());
+        Ok(client)
+    } else {
+        static PUBLIC: OnceLock<Client> = OnceLock::new();
+        if let Some(client) = PUBLIC.get() {
+            return Ok(client.clone());
+        }
+        let client = build()?;
+        let _ = PUBLIC.set(client.clone());
+        Ok(client)
+    }
+}
+
+#[derive(Clone)]
+struct CachedRedirect {
+    target: Url,
+    expires_at: Instant,
+}
+
+fn redirect_cache() -> &'static Mutex<BTreeMap<(bool, String), CachedRedirect>> {
+    static CACHE: OnceLock<Mutex<BTreeMap<(bool, String), CachedRedirect>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn cached_redirect_target(allow_private_urls: bool, origin: &str) -> Option<Url> {
+    let mut guard = redirect_cache().lock().ok()?;
+    let key = (allow_private_urls, origin.to_string());
+    let now = Instant::now();
+    if let Some(entry) = guard.get(&key) {
+        if entry.expires_at > now {
+            return Some(entry.target.clone());
+        }
+        guard.remove(&key);
+    }
+    None
+}
+
+fn store_redirect_target(allow_private_urls: bool, origin: &str, target: Url) {
+    if let Ok(mut guard) = redirect_cache().lock() {
+        let now = Instant::now();
+        guard.retain(|_, entry| entry.expires_at > now);
+        if guard.len() >= REDIRECT_CACHE_MAX_ENTRIES {
+            guard.clear();
+        }
+        guard.insert(
+            (allow_private_urls, origin.to_string()),
+            CachedRedirect {
+                target,
+                expires_at: now + REDIRECT_CACHE_TTL,
+            },
+        );
+    }
+}
+
+fn invalidate_redirect_target(allow_private_urls: bool, origin: &str) {
+    if let Ok(mut guard) = redirect_cache().lock() {
+        guard.remove(&(allow_private_urls, origin.to_string()));
+    }
+}
 
 /// Fetch a signed release artifact while re-applying the public-network policy
-/// to every redirect hop. DNS answers are pinned into the hop-specific client,
-/// so a second lookup cannot redirect the connection to a private address.
+/// to every redirect hop. DNS resolution is validated on every connect inside
+/// a pooled client, so connections stay alive across Range requests while
+/// private addresses remain blocked.
 pub(crate) async fn get(
     value: &str,
     allow_private_urls: bool,
@@ -44,20 +173,46 @@ async fn request(
     timeout: Duration,
     range: Option<String>,
 ) -> Result<Response> {
-    let mut url = Url::parse(value).context("parse signed release artifact URL")?;
-    for redirects in 0..=MAX_REDIRECTS {
-        let (client, pinned_url) = client_for_url(url, allow_private_urls, timeout).await?;
-        let mut request = client
-            .get(pinned_url.clone())
-            .header(header::ACCEPT_ENCODING, "identity");
-        if let Some(range) = &range {
-            request = request.header(header::RANGE, range);
+    let origin_url = Url::parse(value).context("parse signed release artifact URL")?;
+    validate_url(&origin_url, allow_private_urls)?;
+    if follow_redirects {
+        if let Some(cached_target) = cached_redirect_target(allow_private_urls, value) {
+            if validate_url(&cached_target, allow_private_urls).is_ok() {
+                if let Ok(response) = send_once(
+                    &cached_target,
+                    allow_private_urls,
+                    timeout,
+                    range.as_deref(),
+                )
+                .await
+                {
+                    let status = response.status();
+                    if !status.is_redirection()
+                        && !matches!(
+                            status,
+                            StatusCode::UNAUTHORIZED
+                                | StatusCode::FORBIDDEN
+                                | StatusCode::NOT_FOUND
+                                | StatusCode::GONE
+                        )
+                    {
+                        return Ok(response);
+                    }
+                }
+                invalidate_redirect_target(allow_private_urls, value);
+            }
         }
-        let response = request
-            .send()
-            .await
-            .context("download signed release artifact")?;
+    }
+
+    let mut url = origin_url;
+    let mut redirected = false;
+    for redirects in 0..=MAX_REDIRECTS {
+        validate_url(&url, allow_private_urls)?;
+        let response = send_once(&url, allow_private_urls, timeout, range.as_deref()).await?;
         if !response.status().is_redirection() || !follow_redirects {
+            if redirected && (response.status().is_success()) {
+                store_redirect_target(allow_private_urls, value, url);
+            }
             return Ok(response);
         }
         if redirects == MAX_REDIRECTS {
@@ -69,18 +224,36 @@ async fn request(
             .ok_or_else(|| anyhow!("signed release artifact redirect omitted Location"))?
             .to_str()
             .context("signed release artifact redirect Location is invalid")?;
-        url = pinned_url
+        url = url
             .join(location)
             .context("resolve signed release artifact redirect Location")?;
+        redirected = true;
     }
     unreachable!("bounded release redirect loop always returns")
 }
 
-async fn client_for_url(
-    url: Url,
+async fn send_once(
+    url: &Url,
     allow_private_urls: bool,
     timeout: Duration,
-) -> Result<(Client, Url)> {
+    range: Option<&str>,
+) -> Result<Response> {
+    validate_url(url, allow_private_urls)?;
+    let client = pooled_client(allow_private_urls)?;
+    let mut request = client
+        .get(url.clone())
+        .timeout(timeout)
+        .header(header::ACCEPT_ENCODING, "identity");
+    if let Some(range) = range {
+        request = request.header(header::RANGE, range);
+    }
+    request
+        .send()
+        .await
+        .context("download signed release artifact")
+}
+
+fn validate_url(url: &Url, allow_private_urls: bool) -> Result<()> {
     if (!allow_private_urls && url.scheme() != "https")
         || (allow_private_urls && !matches!(url.scheme(), "http" | "https"))
         || url.host_str().is_none()
@@ -90,6 +263,30 @@ async fn client_for_url(
     {
         bail!("signed release artifact redirect URL is unsafe");
     }
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("signed release artifact URL has no host"))?;
+    let _port = url
+        .port_or_known_default()
+        .ok_or_else(|| anyhow!("signed release artifact URL has no usable port"))?;
+    // Literal IP hosts bypass DNS resolution in hyper/reqwest, so validate them
+    // explicitly here before sending the request.
+    let trimmed = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = trimmed.parse::<IpAddr>() {
+        if !address_allowed(ip, allow_private_urls) {
+            bail!("signed release artifact host resolved to a disallowed address");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+async fn client_for_url(
+    url: Url,
+    allow_private_urls: bool,
+    _timeout: Duration,
+) -> Result<(Client, Url)> {
+    validate_url(&url, allow_private_urls)?;
     let host = url
         .host_str()
         .ok_or_else(|| anyhow!("signed release artifact URL has no host"))?;
@@ -107,20 +304,7 @@ async fn client_for_url(
     {
         bail!("signed release artifact host resolved to a disallowed address");
     }
-    let addresses = addresses.into_iter().collect::<Vec<_>>();
-    let mut builder = Client::builder()
-        .timeout(timeout)
-        .read_timeout(Duration::from_secs(90))
-        .connect_timeout(Duration::from_secs(15))
-        .redirect(reqwest::redirect::Policy::none())
-        .no_proxy()
-        .resolve_to_addrs(host, &addresses);
-    if !allow_private_urls {
-        builder = builder
-            .https_only(true)
-            .min_tls_version(reqwest::tls::Version::TLS_1_2);
-    }
-    Ok((builder.build()?, url))
+    Ok((pooled_client(allow_private_urls)?, url))
 }
 
 pub(crate) fn public_ip(ip: IpAddr) -> bool {
@@ -294,5 +478,90 @@ mod tests {
         }
         assert!(!address_allowed("10.0.0.1".parse().unwrap(), false));
         assert!(address_allowed("8.8.8.8".parse().unwrap(), false));
+    }
+
+    #[tokio::test]
+    async fn redirect_cache_reuses_target_and_invalidates_on_forbidden() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let target_hits = Arc::new(AtomicUsize::new(0));
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_url = format!(
+            "http://{}/artifact-v1",
+            target_listener.local_addr().unwrap()
+        );
+        let hits = target_hits.clone();
+        let target_server = tokio::spawn(async move {
+            for attempt in 0..3 {
+                let (mut stream, _) = target_listener.accept().await.unwrap();
+                let mut req = [0_u8; 4096];
+                let _ = stream.read(&mut req).await.unwrap();
+                hits.fetch_add(1, Ordering::SeqCst);
+                let body = if attempt == 2 {
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .as_slice()
+                } else {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                        .as_slice()
+                };
+                stream.write_all(body).await.unwrap();
+            }
+        });
+
+        let fresh_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fresh_url = format!(
+            "http://{}/artifact-v2",
+            fresh_listener.local_addr().unwrap()
+        );
+        let fresh_server = tokio::spawn(one_response(
+            fresh_listener,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nnew".to_vec(),
+        ));
+
+        let redirect_hits = Arc::new(AtomicUsize::new(0));
+        let redirect_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let start_url = format!("http://{}/signed", redirect_listener.local_addr().unwrap());
+        let rhits = redirect_hits.clone();
+        let redirect_server = tokio::spawn(async move {
+            for location in [&target_url, &fresh_url] {
+                let (mut stream, _) = redirect_listener.accept().await.unwrap();
+                let mut req = [0_u8; 4096];
+                let _ = stream.read(&mut req).await.unwrap();
+                rhits.fetch_add(1, Ordering::SeqCst);
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        // 1st request: resolves redirect and caches target.
+        let r1 = get(&start_url, true, true, Duration::from_secs(5), None)
+            .await
+            .unwrap();
+        assert_eq!(r1.bytes().await.unwrap().as_ref(), b"ok");
+        assert_eq!(redirect_hits.load(Ordering::SeqCst), 1);
+
+        // 2nd request: hits cached target directly, skipping redirect server.
+        let r2 = get(&start_url, true, true, Duration::from_secs(5), None)
+            .await
+            .unwrap();
+        assert_eq!(r2.bytes().await.unwrap().as_ref(), b"ok");
+        assert_eq!(redirect_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(target_hits.load(Ordering::SeqCst), 2);
+
+        // 3rd request: cached target returns 403 -> invalidates cache and re-resolves redirect.
+        let r3 = get(&start_url, true, true, Duration::from_secs(5), None)
+            .await
+            .unwrap();
+        assert_eq!(r3.bytes().await.unwrap().as_ref(), b"new");
+        assert_eq!(redirect_hits.load(Ordering::SeqCst), 2);
+
+        target_server.await.unwrap();
+        fresh_server.await.unwrap();
+        redirect_server.await.unwrap();
     }
 }
