@@ -100,8 +100,26 @@ cleanup() { rm -rf -- "$work_dir"; }
 trap cleanup EXIT
 archive_name="$revision.tar"
 archive="$work_dir/$archive_name"
-git -c tar.umask=0022 -C "$source_dir" \
-  archive --format=tar --output="$archive" "$revision"
+pathspecs=()
+if [[ "$(git -C "$source_dir" cat-file -t "$revision:deploy/nixos/manage-source-paths.txt" 2>/dev/null || true)" == "blob" ]]; then
+  while IFS= read -r raw_line; do
+    line="${raw_line#"${raw_line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    pathspecs+=("$line")
+  done < <(git -C "$source_dir" show "$revision:deploy/nixos/manage-source-paths.txt")
+  if [[ "${#pathspecs[@]}" -eq 0 ]]; then
+    echo "error: deploy/nixos/manage-source-paths.txt declared no pathspecs" >&2
+    exit 1
+  fi
+fi
+if [[ "${#pathspecs[@]}" -gt 0 ]]; then
+  git -c tar.umask=0022 -C "$source_dir" \
+    archive --format=tar --output="$archive" "$revision" -- "${pathspecs[@]}"
+else
+  git -c tar.umask=0022 -C "$source_dir" \
+    archive --format=tar --output="$archive" "$revision"
+fi
 embedded_revision="$(git get-tar-commit-id < "$archive")"
 if [[ "$embedded_revision" != "$revision" ]]; then
   echo "error: deterministic Tiaris source archive lost its exact commit identity" >&2
