@@ -73,7 +73,9 @@ in {
     networking.useDHCP = false;
     networking.useNetworkd = true;
     networking.networkmanager.enable = lib.mkForce false;
-    networking.firewall.enable = false; # owned atomic nftables SSH policy, PXE stays reachable
+    networking.firewall.enable = false; # owned atomic default-deny nftables input allowlist (tiaris-nest-firewall)
+    boot.kernelModules = [ "nf_conntrack_tftp" ];
+    boot.kernel.sysctl."net.netfilter.nf_conntrack_helper" = 0;
     systemd.network.enable = true;
     services.resolved.enable = true;
     services.timesyncd.enable = true;

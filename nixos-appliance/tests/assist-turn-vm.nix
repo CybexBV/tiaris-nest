@@ -127,6 +127,9 @@ import (nixpkgs + "/nixos/tests/make-test-python.nix") ({ pkgs, ... }: {
     appliance.fail(f"systemctl is-active {unit}")
     appliance.succeed("systemd-run --unit=turn-fixture $(command -v python3) /etc/assist-turn-fixture.py config-server")
     appliance.wait_for_open_port(8085, addr="100.64.50.12")
+    # The default-deny appliance firewall blocks non-production ports; open only
+    # the test fixture's peer->config-server port inside this VM test.
+    appliance.succeed("nft insert rule inet tiaris_nest input ip saddr 100.64.50.20 ip daddr 100.64.50.12 tcp dport 8085 accept")
     peer.succeed(f"{fixture} keygen")
     peer.succeed("systemd-run --unit=turn-peer $(command -v turnutils_peer) -L 100.64.50.20 -p 5000")
     peer.succeed("systemd-run --unit=turn-low-peer $(command -v turnutils_peer) -L 100.64.50.20 -p 900")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replace the complete support SSH boundary atomically in one nft transaction."""
+"""Replace the complete appliance default-deny input firewall atomically in one nft transaction."""
 import ipaddress
 from pathlib import Path
 import subprocess
@@ -11,7 +11,27 @@ def render(content, existing):
     if len(addresses) > 128:
         raise ValueError('too many management CIDRs')
     rules = ['delete table inet tiaris_nest'] if existing else []
-    rules += ['table inet tiaris_nest {', 'chain input {', 'type filter hook input priority -10; policy accept;']
+    rules += [
+        'table inet tiaris_nest {',
+        'ct helper tftp4 {',
+        'type "tftp" protocol udp',
+        'l3proto ip',
+        '}',
+        'chain input {',
+        'type filter hook input priority -10; policy drop;',
+        'iifname "lo" accept',
+        'ct state invalid drop',
+        'ct state established,related accept',
+        'ip protocol icmp icmp type { echo-request, echo-reply, destination-unreachable, time-exceeded, parameter-problem } accept',
+        'ip6 nexthdr icmpv6 icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem, echo-request, echo-reply, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert } accept',
+        'tcp dport 80 accept',
+        'udp dport { 67, 68, 4011 } accept',
+        'meta nfproto ipv4 udp dport 69 ct helper set "tftp4" accept',
+        'udp dport 123 accept',
+        # TURN traffic passes through to inet tiaris_nest_turn (priority -5),
+        # which restricts it to private IPv4 sources and the active LAN IP.
+        'udp dport { 3478, 61000-61040 } accept',
+    ]
     for version, family in ((4, 'ip'), (6, 'ip6')):
         selected = [str(address) for address in addresses if address.version == version]
         if selected:

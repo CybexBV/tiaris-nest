@@ -495,10 +495,19 @@ class NetworkPolicy(unittest.TestCase):
         with self.assertRaises(ValueError):
             network.render(config)
 
-    def test_atomic_firewall_preserves_other_ports_and_denies_other_ssh(self):
+    def test_atomic_firewall_enforces_default_deny_allowlist_and_ssh_boundary(self):
         rules = firewall.render('192.0.2.0/24\n2001:db8::/32\n', True)
         self.assertTrue(rules.startswith('delete table inet tiaris_nest\n'))
-        self.assertIn('policy accept;', rules)
+        self.assertIn('type filter hook input priority -10; policy drop;', rules)
+        self.assertIn('ct helper tftp4 {', rules)
+        self.assertIn('iifname "lo" accept', rules)
+        self.assertIn('ct state invalid drop', rules)
+        self.assertIn('ct state established,related accept', rules)
+        self.assertIn('tcp dport 80 accept', rules)
+        self.assertIn('udp dport { 67, 68, 4011 } accept', rules)
+        self.assertIn('meta nfproto ipv4 udp dport 69 ct helper set "tftp4" accept', rules)
+        self.assertIn('udp dport 123 accept', rules)
+        self.assertIn('udp dport { 3478, 61000-61040 } accept', rules)
         self.assertIn('ip saddr { 192.0.2.0/24 } tcp dport 22 accept', rules)
         self.assertIn('ip6 saddr { 2001:db8::/32 } tcp dport 22 accept', rules)
         self.assertTrue(rules.endswith('tcp dport 22 drop\n}\n}\n'))
