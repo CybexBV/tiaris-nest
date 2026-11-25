@@ -75,5 +75,11 @@
   fileSystems."/nix" = { device = "/var/cache/tiaris-nest/nix"; fsType = "none"; options = [ "bind" "nodev" "nosuid" ]; neededForBoot = true; depends = [ "/" ]; };
   fileSystems."/var/lib/tiaris-nest/control" = { device = "/var/lib/tiaris-nest/state/control"; fsType = "none"; options = [ "bind" "nodev" "nosuid" ]; depends = [ "/var/lib/tiaris-nest/state" ]; };
   fileSystems."/var/lib/tiaris-nest/status" = { device = "/var/lib/tiaris-nest/state/status"; fsType = "none"; options = [ "bind" "nodev" "nosuid" ]; depends = [ "/var/lib/tiaris-nest/state" ]; };
-  swapDevices = [ { device = "/dev/disk/by-label/TIARIS_SWAP"; } ];
+  swapDevices = [ { device = "/dev/disk/by-label/TIARIS_SWAP"; priority = 10; } ];
+  zramSwap = {
+    enable = true;
+    algorithm = "zstd";
+    memoryPercent = 25;
+    priority = 100;
+  };
 }

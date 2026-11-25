@@ -142,6 +142,19 @@ import (nixpkgs + "/nixos/tests/make-test-python.nix") ({ pkgs, lib, ... }: {
     ):
         allowed.succeed(f"SSH_AUTH_SOCK=/root/ssh-fixture/agent.sock {agent_base} -A -o CertificateFile=/root/ssh-fixture/{cert}-cert.pub tiaris-support@192.168.1.10 {shlex.quote(command)}")
 
+    # Verify default-deny drops unexpected inbound ports while allowlisted
+    # appliance ports (HTTP 80) stay reachable and SSH obeys management-cidrs.
+    appliance.succeed("install -d -m0755 /run/fw-probe; printf 'ok\\n' > /run/fw-probe/index.html")
+    appliance.succeed("systemd-run --unit=qualification-unexpected-port ${pkgs.python3}/bin/python3 -m http.server 8089 --bind 192.168.1.10 --directory /run/fw-probe")
+    appliance.succeed("systemd-run --unit=qualification-http-port ${pkgs.python3}/bin/python3 -m http.server 80 --bind 192.168.1.10 --directory /run/fw-probe")
+    appliance.wait_for_open_port(8089, addr="192.168.1.10")
+    appliance.wait_for_open_port(80, addr="192.168.1.10")
+    allowed.fail("nc -z -w 3 192.168.1.10 8089")
+    denied.fail("nc -z -w 3 192.168.1.10 8089")
+    allowed.succeed("nc -z -w 3 192.168.1.10 80")
+    denied.succeed("nc -z -w 3 192.168.1.10 80")
+    appliance.succeed("systemctl stop qualification-unexpected-port qualification-http-port")
+
     # Change the protected CIDR source, atomically replace the real nft table,
     # and prove policy reverses for both independent VMs without touching sshd.
     appliance.succeed("printf '192.168.1.30/32\\n' > /var/lib/tiaris-nest/control/management-cidrs.txt; /usr/lib/tiaris-nest/tiaris-nest-firewall")
