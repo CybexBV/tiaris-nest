@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::{Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Extra free space required beyond the expected write size, so a preflighted
 /// operation cannot itself fill the filesystem to the brim.
@@ -25,7 +25,7 @@ pub fn free_space_floor(build: &crate::config::BuildConfig) -> u64 {
         .saturating_add(DISK_HEADROOM_BYTES)
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DiskStats {
     pub path: String,
     pub total_bytes: u64,

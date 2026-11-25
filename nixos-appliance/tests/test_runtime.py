@@ -1303,6 +1303,25 @@ class ManageSourceAndExportTests(unittest.TestCase):
             self.assertEqual([row['path'] for row in manifest['store_paths']],
                              sorted(row['path'] for row in graph['closure']))
 
+    def test_disk_health_script_classifies_nvme_ata_and_unknown_smart(self):
+        disk_health = script('tiaris-nest-disk-health')
+        nvme_ok = {'smart_status': {'passed': True}, 'nvme_smart_health_information_log': {'critical_warning': 0, 'percentage_used': 12, 'temperature': 38}}
+        self.assertEqual(disk_health.parse_smartctl_json(nvme_ok, 0), {'status': 'ok', 'wear_percent': 12, 'temperature_celsius': 38})
+        nvme_warn = {'smart_status': {'passed': True}, 'nvme_smart_health_information_log': {'critical_warning': 0, 'percentage_used': 88, 'temperature': 45}}
+        self.assertEqual(disk_health.parse_smartctl_json(nvme_warn, 0)['status'], 'warning')
+        nvme_fail = {'smart_status': {'passed': True}, 'nvme_smart_health_information_log': {'critical_warning': 1, 'percentage_used': 50, 'temperature': 40}}
+        self.assertEqual(disk_health.parse_smartctl_json(nvme_fail, 0)['status'], 'failing')
+        ata_warn = {'smart_status': {'passed': True}, 'ata_smart_attributes': {'table': [{'id': 5, 'raw': {'value': 4}}, {'id': 194, 'raw': {'value': 36}}]}}
+        parsed_ata = disk_health.parse_smartctl_json(ata_warn, 0)
+        self.assertEqual(parsed_ata['status'], 'warning')
+        self.assertEqual(parsed_ata['reallocated_sectors'], 4)
+        self.assertEqual(parsed_ata['temperature_celsius'], 36)
+        self.assertEqual(disk_health.parse_smartctl_json({'device': {'type': 'scsi'}}, 2), {'status': 'unknown'})
+        self.assertEqual(disk_health.parse_nvme_smart_log_json({'critical_warning': 0, 'percent_used': 96, 'temperature': 315})['status'], 'failing')
+        storage = disk_health.collect_storage({'root': '/'})
+        self.assertIn('root', storage)
+        self.assertGreater(storage['root']['total_bytes'], 0)
+
 
 if __name__ == '__main__':
     unittest.main()

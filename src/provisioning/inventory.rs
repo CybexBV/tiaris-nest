@@ -39,6 +39,18 @@ pub struct NestProvisioningEthernetInterface {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct NestProvisioningDiskSmartHealth {
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wear_percent: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reallocated_sectors: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature_celsius: Option<i16>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct NestProvisioningDisk {
     pub id: String,
     pub path: String,
@@ -74,12 +86,16 @@ pub struct NestProvisioningInventory {
     #[serde(default)]
     pub disks: Vec<NestProvisioningDisk>,
     /// Paths of disks left out of `disks` because they have no serial number
-    /// and so no name that stays the same across restarts (a VirtIO Block
-    /// disk on Proxmox). The approved disk is found again by that name
-    /// before it is erased, so such a disk can never be approved. Never sent
-    /// to Tiaris; the hardware check on this server's screen names it.
-    #[serde(skip)]
+    /// and so no name that stays the same across restarts (e.g., a VirtIO Block
+    /// disk on Proxmox). Sent to Manage so the Console can show actionable
+    /// remediation, while remaining excluded from `hardware_digest`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disks_without_serial: Vec<String>,
+    /// Best-effort pre-approval SMART health per eligible disk id. Kept outside
+    /// `NestProvisioningDisk` so signed install plans and disk identity checks
+    /// never depend on volatile SMART telemetry.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub disk_smart_health: BTreeMap<String, NestProvisioningDiskSmartHealth>,
 }
 
 pub(crate) async fn collect_inventory() -> Result<NestProvisioningInventory> {
@@ -87,6 +103,14 @@ pub(crate) async fn collect_inventory() -> Result<NestProvisioningInventory> {
     ethernet_interfaces.sort_by(|left, right| left.id.cmp(&right.id));
     let (mut disks, disks_without_serial) = collect_disks().await?;
     disks.sort_by(|left, right| left.id.cmp(&right.id));
+    let mut disk_smart_health = BTreeMap::new();
+    for disk in &disks {
+        if disk.eligible {
+            if let Some(health) = probe_disk_smart_health(&disk.path).await {
+                disk_smart_health.insert(disk.id.clone(), health);
+            }
+        }
+    }
     Ok(NestProvisioningInventory {
         manufacturer: clean(&read_trimmed("/sys/class/dmi/id/sys_vendor"), 256),
         model: clean(&read_trimmed("/sys/class/dmi/id/product_name"), 256),
@@ -109,6 +133,7 @@ pub(crate) async fn collect_inventory() -> Result<NestProvisioningInventory> {
         ethernet_interfaces,
         disks,
         disks_without_serial,
+        disk_smart_health,
     })
 }
 
@@ -1054,6 +1079,153 @@ fn disk_id_priority(name: &str) -> u8 {
     }
 }
 
+async fn probe_disk_smart_health(disk_path: &str) -> Option<NestProvisioningDiskSmartHealth> {
+    let mut cmd = Command::new("smartctl");
+    cmd.args(["-j", "-H", "-A", disk_path]).kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(4), cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    if output.stdout.is_empty() || output.stdout.len() > 256 * 1024 {
+        return None;
+    }
+    let payload: Value = serde_json::from_slice(&output.stdout).ok()?;
+    let exit_code = output.status.code().unwrap_or(0);
+    parse_smartctl_disk_health(&payload, exit_code)
+}
+
+fn parse_smartctl_disk_health(
+    payload: &Value,
+    exit_code: i32,
+) -> Option<NestProvisioningDiskSmartHealth> {
+    let passed = payload
+        .get("smart_status")
+        .and_then(|v| v.get("passed"))
+        .and_then(Value::as_bool);
+    let nvme = payload
+        .get("nvme_smart_health_information_log")
+        .and_then(Value::as_object);
+    let ata_table = payload
+        .get("ata_smart_attributes")
+        .and_then(|v| v.get("table"))
+        .and_then(Value::as_array);
+    if passed.is_none() && nvme.is_none() && ata_table.is_none() {
+        return None;
+    }
+
+    let mut status = "ok";
+    if passed == Some(false) || (exit_code & 0x08) != 0 {
+        status = "failing";
+    }
+    let mut wear_percent: Option<u8> = None;
+    let mut reallocated_sectors: Option<u64> = None;
+    let mut temperature_celsius: Option<i16> = payload
+        .get("temperature")
+        .and_then(|v| v.get("current"))
+        .and_then(Value::as_i64)
+        .and_then(|t| i16::try_from(t).ok())
+        .filter(|t| (-40..=150).contains(t));
+
+    if let Some(nvme) = nvme {
+        if nvme
+            .get("critical_warning")
+            .and_then(Value::as_u64)
+            .is_some_and(|w| w != 0)
+        {
+            status = "failing";
+        }
+        if let Some(used) = nvme.get("percentage_used").and_then(Value::as_u64) {
+            wear_percent = Some(used.min(100) as u8);
+            if used >= 95 {
+                status = "failing";
+            } else if used >= 85 && status == "ok" {
+                status = "warning";
+            }
+        }
+        if nvme
+            .get("media_errors")
+            .and_then(Value::as_u64)
+            .is_some_and(|m| m > 0)
+            && status == "ok"
+        {
+            status = "warning";
+        }
+        if temperature_celsius.is_none() {
+            temperature_celsius = nvme
+                .get("temperature")
+                .and_then(Value::as_i64)
+                .and_then(|t| i16::try_from(t).ok())
+                .filter(|t| (-40..=150).contains(t));
+        }
+    }
+
+    if let Some(rows) = ata_table {
+        for row in rows {
+            let Some(id) = row.get("id").and_then(Value::as_u64) else {
+                continue;
+            };
+            let raw_val = row
+                .get("raw")
+                .and_then(|r| r.get("value"))
+                .and_then(Value::as_u64);
+            match id {
+                5 => {
+                    if let Some(val) = raw_val {
+                        reallocated_sectors = Some(val);
+                        if val >= 50 {
+                            status = "failing";
+                        } else if val > 0 && status == "ok" {
+                            status = "warning";
+                        }
+                    }
+                }
+                197 | 198 => {
+                    if raw_val.is_some_and(|v| v > 0) && status == "ok" {
+                        status = "warning";
+                    }
+                }
+                177 | 231 | 233 => {
+                    if wear_percent.is_none() {
+                        if let Some(norm) = row.get("value").and_then(Value::as_u64) {
+                            if norm <= 100 {
+                                let used = (100 - norm) as u8;
+                                wear_percent = Some(used);
+                                if used >= 95 {
+                                    status = "failing";
+                                } else if used >= 85 && status == "ok" {
+                                    status = "warning";
+                                }
+                            }
+                        }
+                    }
+                }
+                190 | 194 => {
+                    if temperature_celsius.is_none() {
+                        if let Some(raw) = raw_val {
+                            let temp = (raw & 0xFF) as i16;
+                            if (0..=150).contains(&temp) {
+                                temperature_celsius = Some(temp);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if temperature_celsius.is_some_and(|t| t >= 70) && status == "ok" {
+        status = "warning";
+    }
+
+    Some(NestProvisioningDiskSmartHealth {
+        status: status.to_string(),
+        wear_percent,
+        reallocated_sectors,
+        temperature_celsius,
+    })
+}
+
 fn has_mountpoint(value: &Value) -> bool {
     let mounted_here = value
         .get("mountpoints")
@@ -1244,7 +1416,68 @@ mod tests {
                 blocker_codes: Vec::new(),
             }],
             disks_without_serial: Vec::new(),
+            disk_smart_health: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn disks_without_serial_and_smart_health_serialize_without_changing_hardware_digest() {
+        let mut inv = stable_inventory_fixture();
+        let baseline_digest = hardware_digest(&inv).unwrap();
+        let empty_json = serde_json::to_value(&inv).unwrap();
+        assert!(empty_json.get("disks_without_serial").is_none());
+        assert!(empty_json.get("disk_smart_health").is_none());
+
+        inv.disks_without_serial = vec!["/dev/vda".into()];
+        inv.disk_smart_health.insert(
+            "scsi-qualification".into(),
+            NestProvisioningDiskSmartHealth {
+                status: "warning".into(),
+                wear_percent: Some(88),
+                reallocated_sectors: Some(2),
+                temperature_celsius: Some(44),
+            },
+        );
+        assert_eq!(hardware_digest(&inv).unwrap(), baseline_digest);
+        let with_fields = serde_json::to_value(&inv).unwrap();
+        assert_eq!(with_fields["disks_without_serial"], json!(["/dev/vda"]));
+        assert_eq!(
+            with_fields["disk_smart_health"]["scsi-qualification"]["status"],
+            "warning"
+        );
+    }
+
+    #[test]
+    fn smartctl_json_parser_classifies_nvme_ata_and_virtual_disks() {
+        let nvme_warn = json!({
+            "smart_status": {"passed": true},
+            "nvme_smart_health_information_log": {
+                "critical_warning": 0,
+                "percentage_used": 90,
+                "temperature": 42
+            }
+        });
+        let parsed = parse_smartctl_disk_health(&nvme_warn, 0).unwrap();
+        assert_eq!(parsed.status, "warning");
+        assert_eq!(parsed.wear_percent, Some(90));
+        assert_eq!(parsed.temperature_celsius, Some(42));
+
+        let ata_fail = json!({
+            "smart_status": {"passed": false},
+            "ata_smart_attributes": {
+                "table": [
+                    {"id": 5, "raw": {"value": 64}},
+                    {"id": 194, "raw": {"value": 39}}
+                ]
+            }
+        });
+        let parsed = parse_smartctl_disk_health(&ata_fail, 8).unwrap();
+        assert_eq!(parsed.status, "failing");
+        assert_eq!(parsed.reallocated_sectors, Some(64));
+        assert_eq!(parsed.temperature_celsius, Some(39));
+
+        // Virtual disks without SMART return None.
+        assert!(parse_smartctl_disk_health(&json!({"device": {"type": "scsi"}}), 2).is_none());
     }
 
     #[test]

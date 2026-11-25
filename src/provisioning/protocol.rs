@@ -1147,6 +1147,7 @@ pub(crate) mod tests {
             ethernet_interfaces: vec![interface.clone()],
             disks: vec![disk.clone()],
             disks_without_serial: Vec::new(),
+            disk_smart_health: Default::default(),
         };
         let provisioning_fingerprint = sha256_hex(
             derive_provisioning_key(&media_secret)

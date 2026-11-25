@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""Collect root-level SMART disk health and EFI/state/root storage statistics.
+
+Runs as a bounded root oneshot so tiaris-nest.service keeps PrivateDevices=true.
+Writes /run/tiaris-nest/disk-health.json atomically (mode 0644, <= 8 KiB).
+"""
+import datetime
+import json
+import os
+from pathlib import Path
+import subprocess
+
+from appliance_state import GID, UID, canonical, directory, write
+
+OUTPUT = Path('/run/tiaris-nest/disk-health.json')
+MAX_BYTES = 8192
+STORAGE_PATHS = {
+    'efi': '/boot',
+    'state': '/var/lib/tiaris-nest/state',
+    'root': '/',
+}
+COMMAND_TIMEOUT_SECONDS = 5
+
+
+def statvfs_entry(path):
+    try:
+        st = os.statvfs(path)
+    except OSError:
+        return None
+    if st.f_frsize <= 0 or st.f_blocks <= 0:
+        return None
+    return {
+        'path': path,
+        'total_bytes': int(st.f_blocks) * int(st.f_frsize),
+        'available_bytes': int(st.f_bavail) * int(st.f_frsize),
+    }
+
+
+def collect_storage(paths=None):
+    mapping = paths if paths is not None else STORAGE_PATHS
+    result = {}
+    for key, path in mapping.items():
+        entry = statvfs_entry(path)
+        if entry is not None:
+            result[key] = entry
+    return result
+
+
+def resolve_root_disk():
+    """Return the backing whole-disk /dev/... path for /, or None."""
+    try:
+        src = subprocess.run(
+            ['findmnt', '-no', 'SOURCE', '/'],
+            capture_output=True, text=True, timeout=COMMAND_TIMEOUT_SECONDS, check=True,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if not src.startswith('/dev/'):
+        return None
+    try:
+        pkname = subprocess.run(
+            ['lsblk', '-no', 'PKNAME', src],
+            capture_output=True, text=True, timeout=COMMAND_TIMEOUT_SECONDS, check=True,
+        ).stdout.strip().splitlines()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    parent = next((line.strip() for line in pkname if line.strip()), '')
+    if not parent or '/' in parent:
+        return None
+    disk = Path('/dev') / parent
+    return str(disk) if disk.exists() else None
+
+
+def parse_smartctl_json(payload, returncode=0):
+    """Parse `smartctl -j -H -A` output into bounded disk_health telemetry."""
+    if not isinstance(payload, dict):
+        return {'status': 'unknown'}
+
+    # Bit 0/1: command line or device open failure -> unknown unless payload has data.
+    smart_status = payload.get('smart_status')
+    passed = smart_status.get('passed') if isinstance(smart_status, dict) else None
+    nvme = payload.get('nvme_smart_health_information_log')
+    ata = payload.get('ata_smart_attributes')
+    ata_table = ata.get('table') if isinstance(ata, dict) else None
+
+    if passed is None and not isinstance(nvme, dict) and not isinstance(ata_table, list):
+        return {'status': 'unknown'}
+
+    status = 'ok'
+    if passed is False or (returncode & 0x08):
+        status = 'failing'
+
+    wear_percent = None
+    reallocated_sectors = None
+    temperature_celsius = None
+
+    temp_obj = payload.get('temperature')
+    if isinstance(temp_obj, dict) and isinstance(temp_obj.get('current'), (int, float)):
+        temp = int(round(temp_obj['current']))
+        if -40 <= temp <= 150:
+            temperature_celsius = temp
+
+    if isinstance(nvme, dict):
+        crit = nvme.get('critical_warning')
+        if isinstance(crit, int) and crit != 0:
+            status = 'failing'
+        used = nvme.get('percentage_used')
+        if isinstance(used, int) and 0 <= used <= 255:
+            wear_percent = min(used, 100)
+            if used >= 95:
+                status = 'failing'
+            elif used >= 85 and status == 'ok':
+                status = 'warning'
+        media_errors = nvme.get('media_errors')
+        if isinstance(media_errors, int) and media_errors > 0 and status == 'ok':
+            status = 'warning'
+        if temperature_celsius is None and isinstance(nvme.get('temperature'), (int, float)):
+            temp = int(round(nvme['temperature']))
+            if -40 <= temp <= 150:
+                temperature_celsius = temp
+
+    if isinstance(ata_table, list):
+        by_id = {}
+        for row in ata_table:
+            if isinstance(row, dict) and isinstance(row.get('id'), int):
+                by_id[row['id']] = row
+        # Attribute 5: Reallocated_Sector_Ct
+        if 5 in by_id:
+            raw_val = (by_id[5].get('raw') or {}).get('value')
+            if isinstance(raw_val, int) and raw_val >= 0:
+                reallocated_sectors = raw_val
+                if raw_val >= 50:
+                    status = 'failing'
+                elif raw_val > 0 and status == 'ok':
+                    status = 'warning'
+        # Attributes 197 (Current_Pending_Sector), 198 (Offline_Uncorrectable)
+        for attr_id in (197, 198):
+            if attr_id in by_id:
+                raw_val = (by_id[attr_id].get('raw') or {}).get('value')
+                if isinstance(raw_val, int) and raw_val > 0 and status == 'ok':
+                    status = 'warning'
+        # SSD wear indicators (normalized value starts at 100 and counts down)
+        for attr_id in (231, 233, 177):
+            if wear_percent is None and attr_id in by_id:
+                val = by_id[attr_id].get('value')
+                if isinstance(val, int) and 0 <= val <= 100:
+                    used = 100 - val
+                    wear_percent = used
+                    if used >= 95:
+                        status = 'failing'
+                    elif used >= 85 and status == 'ok':
+                        status = 'warning'
+        # Temperature (194 or 190)
+        if temperature_celsius is None:
+            for attr_id in (194, 190):
+                if attr_id in by_id:
+                    raw_val = (by_id[attr_id].get('raw') or {}).get('value')
+                    if isinstance(raw_val, int):
+                        temp = raw_val & 0xFF
+                        if 0 <= temp <= 150:
+                            temperature_celsius = temp
+                            break
+
+    if temperature_celsius is not None and temperature_celsius >= 70 and status == 'ok':
+        status = 'warning'
+
+    result = {'status': status}
+    if wear_percent is not None:
+        result['wear_percent'] = wear_percent
+    if reallocated_sectors is not None:
+        result['reallocated_sectors'] = reallocated_sectors
+    if temperature_celsius is not None:
+        result['temperature_celsius'] = temperature_celsius
+    return result
+
+
+def parse_nvme_smart_log_json(payload):
+    """Fallback parser for `nvme smart-log -o json`."""
+    if not isinstance(payload, dict):
+        return {'status': 'unknown'}
+    if not any(key in payload for key in ('critical_warning', 'percent_used', 'temperature')):
+        return {'status': 'unknown'}
+    status = 'ok'
+    crit = payload.get('critical_warning')
+    if isinstance(crit, int) and crit != 0:
+        status = 'failing'
+    wear_percent = None
+    used = payload.get('percent_used')
+    if isinstance(used, int) and 0 <= used <= 255:
+        wear_percent = min(used, 100)
+        if used >= 95:
+            status = 'failing'
+        elif used >= 85 and status == 'ok':
+            status = 'warning'
+    media_errors = payload.get('media_errors')
+    if isinstance(media_errors, int) and media_errors > 0 and status == 'ok':
+        status = 'warning'
+    temperature_celsius = None
+    temp = payload.get('temperature')
+    if isinstance(temp, (int, float)):
+        # nvme-cli reports Kelvin in JSON (e.g. 310 -> 37 C) or Celsius on some versions
+        celsius = int(round(temp - 273.15)) if temp > 200 else int(round(temp))
+        if -40 <= celsius <= 150:
+            temperature_celsius = celsius
+            if celsius >= 70 and status == 'ok':
+                status = 'warning'
+    result = {'status': status}
+    if wear_percent is not None:
+        result['wear_percent'] = wear_percent
+    if temperature_celsius is not None:
+        result['temperature_celsius'] = temperature_celsius
+    return result
+
+
+def probe_smart(disk):
+    if not disk:
+        return {'status': 'unknown'}
+    try:
+        proc = subprocess.run(
+            ['smartctl', '-j', '-H', '-A', disk],
+            capture_output=True, text=True, timeout=COMMAND_TIMEOUT_SECONDS,
+        )
+        if proc.stdout:
+            parsed = parse_smartctl_json(json.loads(proc.stdout), proc.returncode)
+            if parsed.get('status') != 'unknown':
+                return parsed
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+
+    if Path(disk).name.startswith('nvme'):
+        try:
+            proc = subprocess.run(
+                ['nvme', 'smart-log', '-o', 'json', disk],
+                capture_output=True, text=True, timeout=COMMAND_TIMEOUT_SECONDS,
+            )
+            if proc.returncode == 0 and proc.stdout:
+                return parse_nvme_smart_log_json(json.loads(proc.stdout))
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+
+    return {'status': 'unknown'}
+
+
+def main():
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')
+    disk = resolve_root_disk()
+    smart = probe_smart(disk)
+    smart['checked_at'] = now
+    document = {
+        'schema': 'tiaris.nest.disk-health.v1',
+        'checked_at': now,
+        'storage': collect_storage(),
+        'disk_health': smart,
+    }
+    body = canonical(document) + b'\n'
+    if len(body) > MAX_BYTES:
+        raise ValueError('disk-health document exceeds 8 KiB bound')
+    directory(OUTPUT.parent, 0o755, UID, GID)
+    write(OUTPUT, body, mode=0o644, group=0)
+
+
+if __name__ == '__main__':
+    main()

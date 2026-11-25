@@ -81,6 +81,24 @@ enum Command {
         )]
         provisioning_keys: PathBuf,
     },
+    /// Interactive guided pre-claim static IPv4 configuration on tty2 (no shell).
+    ConfigureSetupNetwork,
+    /// Verify and apply a signed post-install network reconfiguration with
+    /// automatic revert if Manage cannot be reached.
+    ApplyNetworkReconfigure {
+        #[arg(
+            long,
+            default_value = "/var/lib/tiaris-nest/state/agent/network-reconfigure.json"
+        )]
+        inbox: PathBuf,
+        #[arg(long, default_value = "/var/lib/tiaris-nest/control")]
+        control_dir: PathBuf,
+        #[arg(
+            long,
+            default_value = "/run/tiaris-nest/network-reconfigure-status.json"
+        )]
+        status_path: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -153,6 +171,22 @@ async fn main() -> Result<()> {
         } => {
             require_root()?;
             validate_legacy_state_promotion(&state_mount, &config, &provisioning_keys)
+        }
+        Command::ConfigureSetupNetwork => {
+            require_root()?;
+            tiaris_nest::provisioning::preclaim_network::run_interactive_tty()
+        }
+        Command::ApplyNetworkReconfigure {
+            inbox,
+            control_dir,
+            status_path,
+        } => {
+            require_root()?;
+            tiaris_nest::network_reconfigure::apply_reconfiguration_as_root(
+                &inbox,
+                &control_dir,
+                &status_path,
+            )
         }
     }
 }

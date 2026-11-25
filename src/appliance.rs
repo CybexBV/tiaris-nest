@@ -410,31 +410,123 @@ async fn local_health(readiness: crate::readiness::ApplianceReadiness) -> Value 
         } else {
             "degraded"
         };
-    let state_storage = crate::disk::stats(Path::new(STATE_DIR)).ok();
+    let disk_health_snapshot = read_disk_health_snapshot(Path::new(DISK_HEALTH_PATH));
+    let state_storage = crate::disk::stats(Path::new(STATE_DIR)).ok().or_else(|| {
+        disk_health_snapshot
+            .as_ref()
+            .and_then(|s| s.storage.state.clone())
+    });
+    let efi_storage = disk_health_snapshot
+        .as_ref()
+        .and_then(|s| s.storage.efi.clone())
+        .or_else(|| crate::disk::stats(Path::new(EFI_DIR)).ok());
+    let root_storage = disk_health_snapshot
+        .as_ref()
+        .and_then(|s| s.storage.root.clone())
+        .or_else(|| crate::disk::stats(Path::new(ROOT_DIR)).ok());
+    let disk_health = disk_health_snapshot.as_ref().map(|s| s.disk_health.clone());
     let sync = crate::manage::sync_health();
-    let attention = health_attention(state_storage.as_ref(), &sync);
-    json!({
+    let attention = health_attention_full(
+        state_storage.as_ref(),
+        efi_storage.as_ref(),
+        root_storage.as_ref(),
+        disk_health.as_ref(),
+        &sync,
+    );
+    let mut storage = serde_json::Map::new();
+    storage.insert("state".to_string(), json!(state_storage));
+    if let Some(efi) = efi_storage {
+        storage.insert("efi".to_string(), json!(efi));
+    }
+    if let Some(root) = root_storage {
+        storage.insert("root".to_string(), json!(root));
+    }
+    let mut body = json!({
         "status":status,"checks":checks,"pxe_discovery":pxe,"resources":crate::resources::latest(),
         // Facts Manage alerts on; none of them changes `status` (which gates
         // Nest updates), so a full STATE or a failing subsystem never blocks
         // the update that would fix it.
-        "storage":{"state":state_storage},
+        "storage":Value::Object(storage),
         "sync":sync,
         "database":crate::schema_evolution::status(),
         "attention":attention,
-    })
+    });
+    if let Some(health) = disk_health {
+        if let Some(map) = body.as_object_mut() {
+            map.insert("disk_health".to_string(), json!(health));
+        }
+    }
+    body
 }
 
 /// The STATE partition of an installed Nest.
 const STATE_DIR: &str = "/var/lib/tiaris-nest/state";
+const EFI_DIR: &str = "/boot";
+const ROOT_DIR: &str = "/";
+const DISK_HEALTH_PATH: &str = "/run/tiaris-nest/disk-health.json";
+const MAX_DISK_HEALTH_BYTES: u64 = 8 * 1024;
 /// STATE (16 GiB: database, identity, receipts) below this is attention.
 const STATE_STORAGE_LOW_BYTES: u64 = 512 * 1024 * 1024;
+/// EFI (1 GiB: boot entries and kernels) below this or 10% free is attention.
+const EFI_STORAGE_LOW_BYTES: u64 = 64 * 1024 * 1024;
+/// ROOT (Nix store, build work, delivery cache) below this or 5% free is attention.
+const ROOT_STORAGE_LOW_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 /// Failed sync cycles (about 30 s apart, then backing off) before attention.
 const SYNC_FAILING_CYCLES: u32 = 3;
 
-/// Bounded codes for what needs a person even while the Nest still reports.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct DiskHealthStorageSnapshot {
+    #[serde(default)]
+    efi: Option<crate::disk::DiskStats>,
+    #[serde(default)]
+    state: Option<crate::disk::DiskStats>,
+    #[serde(default)]
+    root: Option<crate::disk::DiskStats>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct DiskHealthSummary {
+    status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wear_percent: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reallocated_sectors: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    temperature_celsius: Option<i16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checked_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct DiskHealthSnapshot {
+    schema: String,
+    #[serde(default)]
+    storage: DiskHealthStorageSnapshot,
+    disk_health: DiskHealthSummary,
+}
+
+fn read_disk_health_snapshot(path: &Path) -> Option<DiskHealthSnapshot> {
+    let snapshot: DiskHealthSnapshot = read_optional_bounded_json(path, MAX_DISK_HEALTH_BYTES)?;
+    if snapshot.schema != "tiaris.nest.disk-health.v1" {
+        return None;
+    }
+    Some(snapshot)
+}
+
+#[cfg(test)]
 fn health_attention(
     state: Option<&crate::disk::DiskStats>,
+    sync: &crate::manage::SyncHealth,
+) -> Vec<&'static str> {
+    health_attention_full(state, None, None, None, sync)
+}
+
+/// Bounded codes for what needs a person even while the Nest still reports.
+fn health_attention_full(
+    state: Option<&crate::disk::DiskStats>,
+    efi: Option<&crate::disk::DiskStats>,
+    root: Option<&crate::disk::DiskStats>,
+    disk_health: Option<&DiskHealthSummary>,
     sync: &crate::manage::SyncHealth,
 ) -> Vec<&'static str> {
     let mut codes = Vec::new();
@@ -447,6 +539,29 @@ fn health_attention(
         }
         None => codes.push("state_storage_unknown"),
         _ => {}
+    }
+    if let Some(efi) = efi {
+        if efi.total_bytes > 0
+            && (efi.available_bytes < EFI_STORAGE_LOW_BYTES
+                || efi.available_bytes.saturating_mul(10) < efi.total_bytes)
+        {
+            codes.push("efi_storage_low");
+        }
+    }
+    if let Some(root) = root {
+        if root.total_bytes > 0
+            && (root.available_bytes < ROOT_STORAGE_LOW_BYTES
+                || root.available_bytes.saturating_mul(20) < root.total_bytes)
+        {
+            codes.push("root_storage_low");
+        }
+    }
+    if let Some(health) = disk_health {
+        match health.status.as_str() {
+            "failing" => codes.push("disk_smart_failing"),
+            "warning" => codes.push("disk_smart_warning"),
+            _ => {}
+        }
     }
     if sync.consecutive_failures >= SYNC_FAILING_CYCLES {
         codes.push("sync_failing");
@@ -548,6 +663,45 @@ mod tests {
             "boot configuration and report"
         );
         assert_eq!(reported["last_success_at"], "2026-11-13T10:00:00Z");
+    }
+
+    #[test]
+    fn local_health_flags_low_efi_root_and_smart_warnings() {
+        let mib = 1024 * 1024;
+        let gib = 1024 * mib;
+        let ok_state = crate::disk::DiskStats {
+            path: STATE_DIR.into(),
+            total_bytes: 16 * gib,
+            available_bytes: 10 * gib,
+        };
+        let low_efi = crate::disk::DiskStats {
+            path: EFI_DIR.into(),
+            total_bytes: gib,
+            available_bytes: 40 * mib,
+        };
+        let low_root = crate::disk::DiskStats {
+            path: ROOT_DIR.into(),
+            total_bytes: 200 * gib,
+            available_bytes: 8 * gib,
+        };
+        let failing_smart = DiskHealthSummary {
+            status: "failing".into(),
+            wear_percent: Some(98),
+            reallocated_sectors: Some(10),
+            temperature_celsius: Some(45),
+            checked_at: None,
+        };
+        let quiet = crate::manage::SyncHealth::default();
+        assert_eq!(
+            health_attention_full(
+                Some(&ok_state),
+                Some(&low_efi),
+                Some(&low_root),
+                Some(&failing_smart),
+                &quiet,
+            ),
+            ["efi_storage_low", "root_storage_low", "disk_smart_failing"]
+        );
     }
 
     fn test_directory(label: &str) -> std::path::PathBuf {
