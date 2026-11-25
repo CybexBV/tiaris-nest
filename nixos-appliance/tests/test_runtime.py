@@ -552,7 +552,34 @@ class PermissionLayout(unittest.TestCase):
         self.assertEqual((cache / 'www/cache').stat().st_mode & 0o777, 0o755)
         for name in ('build', 'build-outputs'):
             self.assertEqual((cache / name).stat().st_mode & 0o777, 0o750)
+        self.assertEqual((cache / 'vulnix').stat().st_mode & 0o777, 0o700)
         self.assertEqual((cache / 'tftp').stat().st_mode & 0o777, 0o755)
+
+    def test_netplan_activate_skips_reconfigure_only_when_file_matches_and_selected(self):
+        runtime = self.root / 'run'
+        target = runtime / 'systemd/network/10-tiaris-nest.network'
+        target.parent.mkdir(parents=True)
+        body = b'[Match]\nName=eth0\nMACAddress=52:54:00:12:01:01\n\n[Network]\nIPv6AcceptRA=no\nLinkLocalAddressing=no\nDHCP=ipv4\n'
+        target.write_bytes(body)
+        target.chmod(0o640)
+        with patch.object(network.os, 'fstat') as mock_fstat:
+            real_stat = target.stat()
+            fake_meta = type('Meta', (), {
+                'st_mode': (real_stat.st_mode & ~0o777) | 0o640,
+                'st_uid': 0,
+                'st_gid': 42,
+                'st_nlink': 1,
+            })()
+            mock_fstat.return_value = fake_meta
+            self.assertTrue(network.target_matches(target, body, 42))
+            self.assertFalse(network.target_matches(target, body + b'extra', 42))
+            self.assertFalse(network.target_matches(target, body, 99))
+        selected = subprocess.CompletedProcess(['networkctl'], 0, stdout=f'  Network File: {target}\n', stderr='')
+        unselected = subprocess.CompletedProcess(['networkctl'], 0, stdout='  Network File: /etc/systemd/network/other.network\n', stderr='')
+        with patch.object(network.subprocess, 'run', return_value=selected):
+            self.assertTrue(network.profile_selected('eth0', target))
+        with patch.object(network.subprocess, 'run', return_value=unselected):
+            self.assertFalse(network.profile_selected('eth0', target))
 
     def test_public_runtime_and_source_directories_repair_only_owned_ordinary_paths(self):
         runtime = self.root / 'run'

@@ -1256,3 +1256,14 @@ async fn scan_records_are_bounded_and_hints_follow_their_jobs() {
         ["kept-job"]
     );
 }
+
+#[test]
+fn vulnix_cache_lives_on_cache_root_not_state_partition() {
+    let mut config = AppConfig::default();
+    config.paths.data_dir = PathBuf::from("/var/lib/tiaris-nest/state/agent");
+    config.build.work_dir = PathBuf::from("/var/cache/tiaris-nest/build");
+    assert_eq!(
+        vulnix_cache_dir(&config),
+        PathBuf::from("/var/cache/tiaris-nest/vulnix")
+    );
+}

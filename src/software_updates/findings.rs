@@ -488,13 +488,26 @@ impl Scanner {
         Self {
             nix: config.build.nix_binary.clone(),
             vulnix: "vulnix".to_string(),
-            vulnix_cache: config.paths.data_dir.join(VULNIX_CACHE_DIR),
+            vulnix_cache: vulnix_cache_dir(config),
             public_cache: PUBLIC_CACHE.to_string(),
             software_cache: crate::software_cache::current_access(&config.paths.data_dir),
             memory_limit_bytes: VULNIX_MEMORY_LIMIT_BYTES,
             rebuild: None,
         }
     }
+}
+
+/// Keeps vulnix's disposable NVD database on the large cache filesystem
+/// (`/var/cache/tiaris-nest/vulnix` on an appliance) instead of the small
+/// `TIARIS_STATE` partition (`paths.data_dir`).
+pub(crate) fn vulnix_cache_dir(config: &AppConfig) -> PathBuf {
+    config
+        .build
+        .work_dir
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty() && *parent != Path::new("/"))
+        .map(|parent| parent.join(VULNIX_CACHE_DIR))
+        .unwrap_or_else(|| config.paths.data_dir.join(VULNIX_CACHE_DIR))
 }
 
 #[derive(Clone, Debug, FromRow)]

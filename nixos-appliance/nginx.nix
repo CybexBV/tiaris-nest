@@ -7,7 +7,7 @@
 # locations, and each takes only the exact names the daemon hands over.
 { pxeMenu }:
 let
-  daemon = "http://127.0.0.1:8080";
+  daemon = "http://tiaris_nest";
   # Nix base32: 0-9 and a-z without e, o, t and u.
   base32 = "[0-9a-df-np-sv-z]";
   # Content-Type and Cache-Control come from the daemon's answer (nginx keeps
@@ -25,6 +25,10 @@ let
 in {
   enable = true;
   defaultListenAddresses = [ "0.0.0.0" ];
+  upstreams.tiaris_nest = {
+    servers."127.0.0.1:8080" = { };
+    extraConfig = "keepalive 64;";
+  };
   virtualHosts."_" = {
     default = true;
     # The daemon tells a computer from the Nest's own readiness check by
@@ -33,6 +37,8 @@ in {
     # download nginx sends for it until that connection closes
     # (src/activity.rs).
     extraConfig = ''
+      proxy_http_version 1.1;
+      proxy_set_header Connection "";
       proxy_set_header X-Forwarded-For $remote_addr;
       proxy_set_header X-Tiaris-Client-Port $remote_port;
     '';
