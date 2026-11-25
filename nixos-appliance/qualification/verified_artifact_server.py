@@ -312,6 +312,8 @@ class ArtifactServer(ThreadingHTTPServer):
         self.slots = threading.BoundedSemaphore(MAX_WORKERS)
         self.sockets = {}
         self.sockets_lock = threading.Lock()
+        self.stats_lock = threading.Lock()
+        self.request_counts = {'full': 0, 'open_range': 0, 'bounded_range': 0}
         uid = 0 if _test_uid is None else _test_uid
         anchor = Path('/') if _test_anchor is None else Path(_test_anchor)
         try:
@@ -477,23 +479,36 @@ class Handler(BaseHTTPRequestHandler):
                     self.respond(200, self.server.ready_body)
                 return
             size, offset = source.identity['size'], 0
+            end = size - 1
             ranges = self.headers.get_all('Range', [])
+            request_kind = 'full'
             if ranges:
-                match = re.fullmatch(r'bytes=(0|[1-9][0-9]{0,19})-', ranges[0]) if len(ranges) == 1 else None
-                if match is None or int(match[1]) >= size:
+                match = re.fullmatch(r'bytes=(0|[1-9][0-9]{0,19})-(0|[1-9][0-9]{0,19})?', ranges[0]) if len(ranges) == 1 else None
+                if match is None:
                     self.respond(416, b'', content_range=f'bytes */{size}')
                     return
                 offset = int(match[1])
-            self.respond(206 if ranges else 200, b'', length=size - offset,
-                         content_range=f'bytes {offset}-{size - 1}/{size}' if ranges else None)
+                requested_end = int(match[2]) if match[2] is not None else size - 1
+                if offset >= size or requested_end < offset:
+                    self.respond(416, b'', content_range=f'bytes */{size}')
+                    return
+                end = min(requested_end, size - 1)
+                request_kind = 'bounded_range' if match[2] is not None else 'open_range'
+            with self.server.stats_lock:
+                self.server.request_counts[request_kind] += 1
+            length = end - offset + 1
+            self.respond(206 if ranges else 200, b'', length=length,
+                         content_range=f'bytes {offset}-{end}/{size}' if ranges else None)
             if self.command == 'HEAD':
                 return
-            while offset < size:
-                body = source.read(offset, min(CHUNK, size - offset))
+            remaining = length
+            while remaining > 0:
+                body = source.read(offset, min(CHUNK, remaining))
                 if not body:
                     raise ValueError('artifact truncated during response')
                 self.wfile.write(body)
                 offset += len(body)
+                remaining -= len(body)
         except (OSError, ValueError):
             # Once headers/body started, closing yields a visibly truncated
             # response; never append an error document to signed artifact bytes.
