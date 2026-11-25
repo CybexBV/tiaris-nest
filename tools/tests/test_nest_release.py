@@ -2287,6 +2287,39 @@ class NestReleaseToolTests(unittest.TestCase):
         finally:
             os.chown(self.private_key, 0, 0)
 
+    @unittest.skipUnless(shutil.which("zstd"), "zstd is required")
+    def test_manifest_and_verify_accept_downloads_cdn_closure_and_runtime_urls(self) -> None:
+        package_arguments, _ = self.network_package_arguments()
+        workstation_arguments, _, _ = self.workstation_arguments()
+        pkg_url_index = package_arguments.index("--appliance-package-snapshot-url") + 1
+        pkg_name = package_arguments[pkg_url_index].rsplit("/", 1)[-1]
+        package_arguments[pkg_url_index] = (
+            f"https://downloads.tiaris.com/production/closures/1.2.3/{pkg_name}"
+        )
+        ws_url_index = workstation_arguments.index("--workstation-netboot-url") + 1
+        ws_name = workstation_arguments[ws_url_index].rsplit("/", 1)[-1]
+        workstation_arguments[ws_url_index] = (
+            f"https://downloads.tiaris.com/production/runtimes/1.2.3/{ws_name}"
+        )
+        output = self.directory / "cdn-release.json"
+        signed = self.run_tool(
+            *self.manifest_arguments(output),
+            *package_arguments,
+            *workstation_arguments,
+        )
+        self.assertEqual(signed.returncode, 0, signed.stderr.decode())
+        manifest = json.loads(output.read_text(encoding="utf-8"))
+        self.assertTrue(
+            manifest["appliance_release_v1"]["tiaris_repository_snapshot"]["url"].startswith(
+                "https://downloads.tiaris.com/production/closures/1.2.3/"
+            )
+        )
+        self.assertTrue(
+            manifest["workstation_netboot"]["url"].startswith(
+                "https://downloads.tiaris.com/production/runtimes/1.2.3/"
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

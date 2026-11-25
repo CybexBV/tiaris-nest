@@ -305,9 +305,13 @@ jobs:
           size="$(sed -n 's/^size_bytes=//p' <<<"$plan")"
           test "$(sed -n 's/^bundle_name=//p' <<<"$plan")" = "$RUNTIME_BUNDLE"
           # The reused runtime keeps the URL it was signed with, perhaps under
-          # this repository's former name.
-          [[ "$(python3 -B tools/github_repositories.py url "$GITHUB_REPOSITORY" "$url")" == \
-            "https://github.com/$GITHUB_REPOSITORY/releases/download/v"*"/$RUNTIME_BUNDLE" ]]
+          # this repository's former name or on downloads.tiaris.com.
+          if [[ "$url" =~ ^https://downloads\.tiaris\.com/(production|beta|development)/runtimes/[^/]+/"$RUNTIME_BUNDLE"$ ]]; then
+            :
+          else
+            [[ "$(python3 -B tools/github_repositories.py url "$GITHUB_REPOSITORY" "$url")" == \
+              "https://github.com/$GITHUB_REPOSITORY/releases/download/v"*"/$RUNTIME_BUNDLE" ]]
+          fi
           install -d -m 0755 dist
           part="dist/.$RUNTIME_BUNDLE.download"
           curl -4 --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
@@ -484,13 +488,23 @@ jobs:
           for key in "${provisioning_keys[@]}"; do
             template_args+=(--provisioning-public-key "$key")
           done
+          closure_url="$artifact_base/tiaris-nest-appliance-closure-$version-x86_64-linux.tar.zst"
+          runtime_url="$artifact_base/${{ steps.workstation-source.outputs.bundle_name }}"
+          if [ -n "${TIARIS_NEST_DOWNLOADS_CDN_ENV:-}" ]; then
+            case "$TIARIS_NEST_DOWNLOADS_CDN_ENV" in
+              production|beta|development) ;;
+              *) echo "Invalid TIARIS_NEST_DOWNLOADS_CDN_ENV: $TIARIS_NEST_DOWNLOADS_CDN_ENV" >&2; exit 1 ;;
+            esac
+            closure_url="https://downloads.tiaris.com/$TIARIS_NEST_DOWNLOADS_CDN_ENV/closures/$version/tiaris-nest-appliance-closure-$version-x86_64-linux.tar.zst"
+            runtime_url="https://downloads.tiaris.com/$TIARIS_NEST_DOWNLOADS_CDN_ENV/runtimes/$version/${{ steps.workstation-source.outputs.bundle_name }}"
+          fi
           if [ "${{ steps.workstation-runtime.outputs.reuse }}" = true ]; then
             workstation_args=(--reuse-workstation-netboot "$RUNNER_TEMP/tiaris-nest-predecessor/tiaris-nest-release.json")
           else
             workstation_args=(
               --workstation-netboot-bundle "dist/${{ steps.workstation-source.outputs.bundle_name }}"
               --workstation-netboot-tree "$RUNNER_TEMP/tiaris-workstation-netboot-tree"
-              --workstation-netboot-url "$artifact_base/${{ steps.workstation-source.outputs.bundle_name }}"
+              --workstation-netboot-url "$runtime_url"
             )
           fi
           python3 -B tools/pack-system-closure.py \
@@ -511,7 +525,7 @@ jobs:
             --appliance-source-revision "$(git rev-parse HEAD)" \
             --appliance-system-closure "dist/tiaris-nest-appliance-closure-$version-x86_64-linux.tar.zst" \
             --appliance-system-closure-metadata "$RUNNER_TEMP/tiaris-nest-appliance-closure-metadata.json" \
-            --appliance-system-closure-url "$artifact_base/tiaris-nest-appliance-closure-$version-x86_64-linux.tar.zst" \
+            --appliance-system-closure-url "${closure_url:-$artifact_base/tiaris-nest-appliance-closure-$version-x86_64-linux.tar.zst}" \
             "${workstation_args[@]}" \
             --usb-installer-image "dist/tiaris-usb-installer-$version.img" \
             --usb-installer-image-url "$artifact_base/tiaris-usb-installer-$version.img" \
