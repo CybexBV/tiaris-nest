@@ -97,11 +97,23 @@ impl ClosurePrefetch {
         let shown = progress.clone();
         let closure_sha256 = release.system_closure.sha256.clone();
         let task = tokio::spawn(async move {
-            if let Some(members) =
-                nixos_install::stage_members(&release, &key, &transport, available).await?
+            let member_progress = shown.clone();
+            if let Some(members) = nixos_install::stage_members(
+                &release,
+                &key,
+                &transport,
+                available,
+                &move |received, total| {
+                    member_progress.0.store(received, Ordering::Relaxed);
+                    member_progress.1.store(total, Ordering::Relaxed);
+                },
+            )
+            .await?
             {
                 return Ok(Prefetched::Members(members));
             }
+            shown.0.store(0, Ordering::Relaxed);
+            shown.1.store(0, Ordering::Relaxed);
             nixos_install::ensure_ram_budget(&release, available)?;
             nixos::download_with_progress(
                 &release,

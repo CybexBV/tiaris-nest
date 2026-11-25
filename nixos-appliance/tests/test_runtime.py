@@ -1212,5 +1212,88 @@ class SelfCacheTrust(unittest.TestCase):
                 self.assertEqual(include.read_text(), '')
 
 
+class ManageSourceAndExportTests(unittest.TestCase):
+    def test_build_manage_source_archive_uses_pathspecs_manifest_when_present(self):
+        script = RUNTIME.parent / 'build-manage-source-archive.sh'
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / 'tiaris'
+            repo.mkdir()
+            git = ['git', '-C', str(repo), '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid']
+            subprocess.run([*git, 'init', '-q'], check=True)
+            required = [
+                'agent/tiaris-agent/Cargo.toml',
+                'agent/tiaris-agent/Cargo.lock',
+                'agent/tiaris-agent/src/hardware_inventory.rs',
+                'agent/tiaris-agent/src/installer_boot.rs',
+                'agent/tiaris-agent/src/lib.rs',
+                'agent/tiaris-agent/src/main.rs',
+                'agent/tiaris-agent/src/managed_wifi.rs',
+                'deploy/nixos/tiaris-agent-module.nix',
+                'deploy/nixos/tiaris-apply-blueprint.sh',
+                'deploy/nixos/tiaris-authd-packages.nix',
+                'deploy/nixos/tiaris-authd.nix',
+                'deploy/nixos/tiaris-blueprints.nix',
+                'deploy/nixos/tiaris-himmelblau-packages.nix',
+                'deploy/nixos/tiaris-himmelblau.nix',
+                'deploy/nixos/tiaris-ldap.nix',
+            ]
+            for rel in [*required, 'deploy/nixos/tests/ignored.nix', 'web/src/ignored.tsx']:
+                path = repo / rel
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('fixture\n')
+            (repo / 'deploy/nixos/manage-source-paths.txt').write_text(
+                '# comment\nagent/\ndeploy/nixos/\n:(exclude)deploy/nixos/tests/\n'
+            )
+            subprocess.run([*git, 'add', '-A'], check=True)
+            subprocess.run([*git, 'commit', '-q', '-m', 'fixture'], check=True)
+            rev = subprocess.check_output([*git, 'rev-parse', 'HEAD'], text=True).strip()
+            out = root / 'out'
+            archive = Path(subprocess.check_output([
+                'bash', str(script), '--source-dir', str(repo), '--revision', rev, '--output-dir', str(out)
+            ], text=True).strip())
+            with archive.open('rb') as stream:
+                embedded = subprocess.check_output(['git', 'get-tar-commit-id'], stdin=stream, text=True).strip()
+            self.assertEqual(embedded, rev)
+            entries = set(subprocess.check_output(['tar', '-tf', str(archive)], text=True).splitlines())
+            self.assertIn('deploy/nixos/tiaris-blueprints.nix', entries)
+            self.assertNotIn('deploy/nixos/tests/ignored.nix', entries)
+            self.assertNotIn('web/src/ignored.tsx', entries)
+
+    def test_export_cache_parallel_output_is_deterministic_and_bounded(self):
+        loader = SourceFileLoader('export_cache', str(RUNTIME.parent / 'export-cache.py'))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        export_cache = importlib.util.module_from_spec(spec)
+        loader.exec_module(export_cache)
+        self.assertGreaterEqual(export_cache.worker_count(), 1)
+        self.assertLessEqual(export_cache.worker_count(), export_cache.MAX_WORKERS)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / 'bin'
+            fake_bin.mkdir()
+            (fake_bin / 'nix-store').write_text('#!/usr/bin/env sh\nprintf "nar:%s\\n" "$2"\n')
+            (fake_bin / 'nix-store').chmod(0o755)
+            graph = {
+                'closure': [
+                    {'path': f'/nix/store/{"a" * 32}-zeta', 'narHash': 'sha256:' + '0' * 52, 'narSize': 1024, 'references': []},
+                    {'path': f'/nix/store/{"b" * 32}-alpha', 'narHash': 'sha256:' + '1' * 52, 'narSize': 2048, 'references': []},
+                ]
+            }
+            metadata = {'manage_origin': 'https://example.invalid', 'release_id': '0.0.1'}
+            graph_file, meta_file = root / 'graph.json', root / 'meta.json'
+            graph_file.write_text(json.dumps(graph))
+            meta_file.write_text(json.dumps(metadata))
+            out_a, out_b = root / 'out-a', root / 'out-b'
+            env = {**os.environ, 'PATH': f'{fake_bin}:{os.environ["PATH"]}', 'NIX_BUILD_CORES': '2'}
+            subprocess.run([sys.executable, str(RUNTIME.parent / 'export-cache.py'), str(graph_file), str(meta_file), str(out_a)],
+                           check=True, env=env)
+            subprocess.run([sys.executable, str(RUNTIME.parent / 'export-cache.py'), str(graph_file), str(meta_file), str(out_b)],
+                           check=True, env={**env, 'NIX_BUILD_CORES': '1'})
+            self.assertEqual((out_a / 'manifest.json').read_bytes(), (out_b / 'manifest.json').read_bytes())
+            manifest = json.loads((out_a / 'manifest.json').read_text())
+            self.assertEqual([row['path'] for row in manifest['store_paths']],
+                             sorted(row['path'] for row in graph['closure']))
+
+
 if __name__ == '__main__':
     unittest.main()

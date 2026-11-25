@@ -492,7 +492,7 @@ async fn members_fetched_at_once_land_in_their_places() {
     // Incompressible, so each payload crosses a block.
     let mut state = 0x2545_f491_4f6c_dd1d_u64;
     let mut noise = |bytes: usize| noise(&mut state, bytes);
-    let paths: Vec<String> = (2..8)
+    let paths: Vec<String> = (2..10)
         .map(|digit| format!("/nix/store/{}-member", digit.to_string().repeat(32)))
         .collect();
     let extra: Vec<(&str, Vec<u8>)> = paths
@@ -506,13 +506,15 @@ async fn members_fetched_at_once_land_in_their_places() {
     fixture.bind(&archive);
     let key = fixture.key.verifying_key();
     let manifest = fixture.verify(&archive).unwrap();
-    // The system and every other store path after it are missing.
+    // Hold system, source, and every other extra member so 4 missing members
+    // are separated by >= 150 KiB gaps (larger than MAX_COALESCE_GAP) and
+    // must be fetched concurrently.
     let present: Present = manifest
         .store_paths
         .iter()
-        .skip(1)
-        .step_by(2)
-        .map(|path| (path.path.clone(), path.nar_hash.clone()))
+        .enumerate()
+        .filter(|(index, _)| *index < 2 || index % 2 == 1)
+        .map(|(_, path)| (path.path.clone(), path.nar_hash.clone()))
         .collect();
     let (url, _, server) = serve(archive.clone(), true, false, 0).await;
     let inbox = temporary("tiaris-members-at-once");
@@ -576,4 +578,74 @@ fn an_install_leaves_out_only_members_whose_closure_it_holds() {
     let mut changed = both.clone();
     changed.insert(source.path.clone(), system.nar_hash.clone());
     assert!(held(&manifest, &changed, true).is_empty());
+}
+
+#[tokio::test]
+async fn nearby_small_members_coalesce_into_one_range_request_and_report_progress() {
+    let mut paths: Vec<String> = (2..8)
+        .map(|digit| format!("/nix/store/{}-small", digit.to_string().repeat(32)))
+        .collect();
+    // Place one large held path at the end so member fetches save >50% of bytes,
+    // while 4 small wanted paths sit adjacent/near each other with one tiny held gap.
+    paths.sort();
+    let extra: Vec<(&str, Vec<u8>)> = paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let payload = if index == 5 {
+                vec![b'L'; 300_000]
+            } else {
+                format!("small-payload-{index}").into_bytes()
+            };
+            (path.as_str(), payload)
+        })
+        .collect();
+    let mut fixture = Fixture::with(&extra);
+    let tar = fixture.tar();
+    let archive = raw_frame(&tar);
+    fixture.bind(&archive);
+    let key = fixture.key.verifying_key();
+    let manifest = fixture.verify(&archive).unwrap();
+    // Hold the two base paths, one tiny middle path (gap <= MAX_COALESCE_GAP),
+    // and the large trailing path so 4 small wanted members coalesce into 1 Range GET.
+    let large_path = paths[5].as_str();
+    let tiny_gap_path = paths[2].as_str();
+    let present: Present = manifest
+        .store_paths
+        .iter()
+        .enumerate()
+        .filter(|(index, entry)| {
+            matches!(index, 0 | 1) || entry.path == large_path || entry.path == tiny_gap_path
+        })
+        .map(|(_, path)| (path.path.clone(), path.nar_hash.clone()))
+        .collect();
+    let (url, seen, server) = serve(archive.clone(), true, false, 0).await;
+    let inbox = temporary("tiaris-members-coalesce");
+    let mut plan = plan(&fixture.release, &key, &url, true, &inbox, &present)
+        .await
+        .unwrap()
+        .unwrap();
+    plan.source.pause = Duration::ZERO;
+    assert_eq!(plan.members(), 4);
+    let metadata_requests = seen.lock().unwrap().len();
+    let target = inbox.join("coalesced.members.tar");
+    let progress_samples = Arc::new(Mutex::new(Vec::new()));
+    let samples = progress_samples.clone();
+    stage_with_progress(&plan, &target, &move |received, total| {
+        samples.lock().unwrap().push((received, total));
+    })
+    .await
+    .unwrap();
+    server.abort();
+    // All 4 nearby small members were fetched in a single coalesced Range request.
+    let member_requests = seen.lock().unwrap().len() - metadata_requests;
+    assert_eq!(member_requests, 1);
+    let samples = progress_samples.lock().unwrap();
+    assert!(!samples.is_empty());
+    assert_eq!(samples.last().copied(), Some((plan.bytes, plan.bytes)));
+    assert!(samples.windows(2).all(|w| w[0].0 <= w[1].0));
+    let limit = Layout::of(archive.len() as u64).unwrap().tar_bytes;
+    let cache = inbox.join("cache");
+    verify_staged_file(&target, limit, &fixture, &cache, &present, &mut None).unwrap();
+    fs::remove_dir_all(inbox).unwrap();
 }

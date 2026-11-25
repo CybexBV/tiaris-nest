@@ -1,6 +1,6 @@
 { config, lib, pkgs, appliance, ... }:
 {
-  imports = [ ./module.nix ];
+  imports = [ ./module.nix ./firmware.nix ];
   services.qemuGuest.enable = true;
   virtualisation.incus.agent.enable = true;
   systemd.services.incus-agent.unitConfig.ConditionPathExists = "/dev/virtio-ports/org.linuxcontainers.incus";
@@ -67,7 +67,6 @@
   };
   boot.initrd.systemd.services.emergency.serviceConfig.ExecStart = lib.mkForce [ "" "${pkgs.systemd}/bin/systemctl --no-block reboot" ];
   boot.kernelParams = [ "panic=30" "console=ttyS0,115200n8" "console=tty0" ];
-  hardware.enableRedistributableFirmware = true;
   hardware.cpu.intel.updateMicrocode = true;
   hardware.cpu.amd.updateMicrocode = true;
   fileSystems."/" = { device = "/dev/disk/by-label/TIARIS_ROOT"; fsType = "ext4"; };

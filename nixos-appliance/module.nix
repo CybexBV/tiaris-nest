@@ -2,7 +2,13 @@
 let
   cfg = config.services.tiaris-nest;
   a = cfg.appliance;
-  runtime = import ./runtime.nix { inherit pkgs; inherit (a) package; };
+  bootstrapPackage = a.bootstrap or (a.package.bootstrap or a.package);
+  runtime = import ./runtime.nix { inherit pkgs; inherit (a) package; bootstrap = bootstrapPackage; };
+  # Override vulnix's nix input to nix.out so build-time -dev headers (boost-dev,
+  # nix-dev: ~212 MiB unpacked) never leak into the Nest appliance closure.
+  vulnix = (pkgs.vulnix.override { nix = pkgs.nix.out; }).overrideAttrs (_: {
+    disallowedReferences = [ pkgs.boost.dev pkgs.nix.dev ];
+  });
   coturn = pkgs.coturn.overrideAttrs (previous: {
     patches = (previous.patches or [ ]) ++ [ ./coturn-max-allocation-lifetime.patch ];
   });
@@ -17,7 +23,7 @@ let
     nixpkgs_revision = a.nixpkgsRevision; manage_origin = a.manageOrigin;
     required_system_versions = { kernel = config.boot.kernelPackages.kernel.version; linux-firmware = pkgs.linux-firmware.version; nix = config.nix.package.version; tiaris-nest = a.package.version; systemd-boot = config.systemd.package.version; };
   });
-  baseUnit = { path = [ pkgs.coreutils pkgs.curl pkgs.jq pkgs.util-linux pkgs.systemd pkgs.nix pkgs.python3 a.package runtime ]; };
+  baseUnit = { path = [ pkgs.coreutils pkgs.curl pkgs.jq pkgs.util-linux pkgs.systemd pkgs.nix pkgs.python3 a.package bootstrapPackage runtime ]; };
   rootService = name: {
     description = "Tiaris Nest ${name}";
     serviceConfig = { Type = "oneshot"; ExecStart = command name; UMask = "0077"; };
@@ -119,7 +125,13 @@ in {
     # Include daemon-side builders in diagnostics. No throttling/OOM limits:
     # smaller budgets require the performance qualification gate first.
     systemd.services.nix-daemon.serviceConfig.MemoryAccounting = true;
-    environment.systemPackages = [ a.package runtime pkgs.iproute2 pkgs.iputils pkgs.curl pkgs.jq pkgs.nftables pkgs.dnsmasq pkgs.openssh pkgs.python3 pkgs.tftp-hpa ];
+    documentation.enable = lib.mkForce false;
+    documentation.man.enable = lib.mkForce false;
+    documentation.doc.enable = lib.mkForce false;
+    documentation.info.enable = lib.mkForce false;
+    documentation.nixos.enable = lib.mkForce false;
+    environment.defaultPackages = lib.mkForce [ ];
+    environment.systemPackages = [ a.package bootstrapPackage runtime pkgs.iproute2 pkgs.iputils pkgs.curl pkgs.jq pkgs.nftables pkgs.dnsmasq pkgs.openssh pkgs.python3 pkgs.tftp-hpa ];
     services.openssh = {
       enable = true;
       settings = { PasswordAuthentication = false; KbdInteractiveAuthentication = false; PermitRootLogin = "no"; PubkeyAuthentication = true; AllowUsers = [ "tiaris-support" ]; TrustedUserCAKeys = "/etc/ssh/tiaris-nest-ca.pub"; AuthorizedPrincipalsFile = "/etc/ssh/tiaris-nest-principals"; AllowAgentForwarding = true; AllowTcpForwarding = "yes"; GatewayPorts = "no"; PermitTunnel = "no"; X11Forwarding = false; };
@@ -165,7 +177,7 @@ in {
         install -m0644 -o root -g root ${./autoexec.ipxe} /usr/share/tiaris-nest/autoexec.ipxe
         ln -sfn ${pkgs.tzdata}/share/zoneinfo /usr/share/zoneinfo
         ln -sfn ${a.package}/bin/tiaris-nest /usr/bin/tiaris-nest
-        ln -sfn ${a.package}/bin/tiaris-nest-bootstrap /usr/lib/tiaris-nest/tiaris-nest-bootstrap
+        ln -sfn ${bootstrapPackage}/bin/tiaris-nest-bootstrap /usr/lib/tiaris-nest/tiaris-nest-bootstrap
         ln -sfn ${pkgs.nix}/bin/nix /usr/bin/nix
         ln -sfn ${pkgs.iproute2}/bin/ip /usr/sbin/ip
         ln -sfn ${pkgs.dnsmasq}/bin/dnsmasq /usr/sbin/dnsmasq
@@ -236,7 +248,7 @@ in {
       environment = { HOME = "/var/cache/tiaris-nest/agent/home"; XDG_CACHE_HOME = "/var/cache/tiaris-nest/agent/cache"; XDG_CONFIG_HOME = "/var/cache/tiaris-nest/agent/config"; XDG_STATE_HOME = "/var/cache/tiaris-nest/agent/state"; TMPDIR = "/var/cache/tiaris-nest/agent/tmp"; NIX_USER_CONF_FILES = "/dev/null"; };
       # vulnix scans update candidates (src/software_updates/findings.rs); its
       # NVD database is cached in /var/cache/tiaris-nest/vulnix on TIARIS_ROOT.
-      path = [ pkgs.nix pkgs.git pkgs.openssh pkgs.coreutils pkgs.iproute2 pkgs.systemd pkgs.vulnix ];
+      path = [ pkgs.nix pkgs.gitMinimal pkgs.openssh pkgs.coreutils pkgs.iproute2 pkgs.systemd vulnix ];
       serviceConfig = { MemoryAccounting = true; Type = "notify"; NotifyAccess = "main"; WatchdogSec = "5min"; User = "tiaris-nest"; Group = "tiaris-nest"; ExecStart = "${a.package}/bin/tiaris-nest --config /etc/tiaris-nest/config.toml serve"; Restart = "always"; RestartSec = "3s"; UMask = "0077"; NoNewPrivileges = true; PrivateTmp = true; PrivateDevices = true; ProtectSystem = "strict"; ProtectHome = true; ProtectKernelTunables = true; ProtectKernelModules = true; ProtectControlGroups = true; CapabilityBoundingSet = ""; AmbientCapabilities = ""; RestrictAddressFamilies = [ "AF_UNIX" "AF_INET" "AF_INET6" "AF_NETLINK" ]; ReadWritePaths = [ "/var/lib/tiaris-nest/state/agent" "/var/lib/tiaris-nest/state/inbox" "/var/cache/tiaris-nest" "/run/lock/tiaris-nest/maintenance.lock" "/run/tiaris-nest" ];
         # Public console projection (console-status.json, 0644) for the root
         # tty1 kiosk. Preserved across restarts so a stopped daemon leaves a

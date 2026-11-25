@@ -17,7 +17,7 @@ use std::{
         ffi::OsStrExt,
         fs::{MetadataExt, PermissionsExt},
     },
-    path::{Path, PathBuf},
+    path::Path,
     process::Command,
 };
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -25,19 +25,18 @@ const STAGING: &str = "/run/tiaris-appliance-closure";
 pub(super) const ARCHIVE: &str = "/run/tiaris-appliance-closure/closure.tar.zst";
 /// The members the ISO lacks (`members::stage`), and their verified cache.
 const STAGED_MEMBERS: &str = "/run/tiaris-appliance-closure/closure.members.tar";
-const MEMBERS_CACHE: &str = "/run/tiaris-appliance-closure/cache";
 pub(super) const TARGET: &str = "/mnt";
 
 /// The approved closure, verified before anything touches the disk.
 pub(super) enum StagedClosure {
     /// The whole archive, extracted onto the disk at install.
     Archive(closure::VerifiedArchive),
-    /// The members the ISO's own store lacks, verified and extracted into
-    /// RAM, and the members the ISO carries with their signed NAR hash
-    /// (`members::plan_install`: 571 of 1149, 1,186 of 1,727 MiB for
-    /// 0.2.182-dev.1), copied from it with their closures.
+    /// The members the ISO's own store lacks, verified in a streaming pass
+    /// without duplicating them in RAM, and extracted straight onto the target
+    /// disk at install; the members the ISO carries with their signed NAR hash
+    /// (`members::plan_install`) are copied from the ISO store with their closures.
     Members {
-        manifest: closure::ClosureManifest,
+        staged: closure::VerifiedStagedMembers,
         iso: closure::Present,
     },
 }
@@ -134,7 +133,11 @@ pub(super) async fn stage_closure(
         status.step(InstallStep::StageRelease);
         fs::remove_file(archive)?;
     }
-    if let Some(members) = stage_members(release, &key, transport, available).await? {
+    if let Some(members) = stage_members(release, &key, transport, available, &|received, total| {
+        status.download_progress(received, total)
+    })
+    .await?
+    {
         status.step(InstallStep::VerifyRelease);
         return verify_members(release, &key, &members);
     }
@@ -161,6 +164,7 @@ pub(super) async fn stage_members(
     key: &ed25519_dalek::VerifyingKey,
     transport: &str,
     available: u64,
+    on_progress: &(dyn Fn(u64, u64) + Send + Sync),
 ) -> Result<Option<members::Plan>> {
     let whole = |error: anyhow::Error| {
         if error.is::<members::KeepTrying>() {
@@ -190,8 +194,8 @@ pub(super) async fn stage_members(
         Ok(None) => return Ok(None),
         Err(error) => return whole(error),
     };
-    // Members and their cache take twice their bytes in RAM; when they do
-    // not fit, the whole archive (once in RAM, extracted onto the disk) may.
+    // Members are verified via a streaming pass in RAM and extracted directly
+    // onto the target disk after formatting, so tmpfs only needs 1x `plan.bytes`.
     let staged = plan.bytes - plan.remaining_bytes();
     let tmpfs = crate::disk::stats(Path::new(STAGING)).map_or(0, |stats| stats.available_bytes);
     if !members_fit(plan.bytes, staged, available, tmpfs) {
@@ -205,70 +209,50 @@ pub(super) async fn stage_members(
         reused = plan.present().len(),
         "setup fetches only the closure members this ISO does not carry"
     );
-    match members::stage(&plan, Path::new(STAGED_MEMBERS)).await {
+    match members::stage_with_progress(&plan, Path::new(STAGED_MEMBERS), on_progress).await {
         Ok(()) => Ok(Some(plan)),
         Err(error) => whole(error),
     }
 }
 
-/// Whether `bytes` of staged members (`staged` of them there already) and
-/// their extracted cache fit: in memory beside a bounded runtime, and in the
-/// tmpfs that holds them (`/run`, often smaller than the memory).
+/// Whether `bytes` of staged members (`staged` of them there already) fit in
+/// memory beside a bounded runtime and in the tmpfs that holds them (`/run`).
+/// Verification streams without duplicating the cache in tmpfs, so 1x suffices.
 fn members_fit(bytes: u64, staged: u64, available: u64, tmpfs_available: u64) -> bool {
-    let needed = bytes.saturating_mul(2);
-    available.saturating_add(staged) >= needed.saturating_add(2 * GIB)
-        && tmpfs_available.saturating_add(staged) >= needed
+    available.saturating_add(staged) >= bytes.saturating_add(2 * GIB)
+        && tmpfs_available.saturating_add(staged) >= bytes
 }
 
-/// The staged members' one verification pass, extracting their binary cache
-/// into RAM; the members it leaves out are the ISO's, each with its signed
-/// NAR hash.
+/// The staged members' one streaming verification pass in RAM; extraction onto
+/// the target disk happens in [`install`] after approval and formatting.
 fn verify_members(
     release: &NixosRelease,
     key: &ed25519_dalek::VerifyingKey,
     members: &members::Plan,
 ) -> Result<StagedClosure> {
-    let manifest = verify_staged_members(
-        release,
-        key,
-        members.present(),
-        Path::new(STAGED_MEMBERS),
-        Path::new(MEMBERS_CACHE),
-    )?;
+    let staged = verify_staged_members(release, key, members.present(), Path::new(STAGED_MEMBERS))?;
     Ok(StagedClosure::Members {
-        manifest,
+        staged,
         iso: members.present().clone(),
     })
 }
 
-/// The staged stream goes either way, and so does the cache of a pass that
-/// fails: the next try may take the whole archive, which needs that RAM.
+/// Stream-verify the staged members file without writing any cache files to
+/// tmpfs; remove the staged file immediately on error so a fallback full
+/// archive download reclaims that RAM.
 fn verify_staged_members(
     release: &NixosRelease,
     key: &ed25519_dalek::VerifyingKey,
     present: &closure::Present,
     staged: &Path,
-    cache: &Path,
-) -> Result<closure::ClosureManifest> {
-    if fs::symlink_metadata(cache).is_ok() {
-        fs::remove_dir_all(cache)?;
-    }
+) -> Result<closure::VerifiedStagedMembers> {
     let verified = members::open_staged(staged, release).and_then(|(stream, limit)| {
-        closure::verify_staged(
-            stream,
-            limit,
-            release,
-            key,
-            cache,
-            present,
-            |_, _, _| Ok(()),
-        )
+        closure::verify_staged_stream(stream, limit, release, key, present)
     });
-    let _ = fs::remove_file(staged);
     if verified.is_err() {
-        let _ = fs::remove_dir_all(cache);
+        let _ = fs::remove_file(staged);
     }
-    Ok(verified?.manifest)
+    verified
 }
 
 /// Copy the ISO's own members of the closure, with their closures (all
@@ -278,11 +262,11 @@ fn verify_staged_members(
 /// NAR hash, size and references), then a copy that requires the release
 /// key and hashes every NAR against its record. The installed store then
 /// holds every member signed, as from the archive.
-async fn copy_iso_members(iso: &closure::Present, trust: &str) -> Result<()> {
+async fn copy_iso_members(iso: &closure::Present, trust: &str, cache_dir: &Path) -> Result<()> {
     if iso.is_empty() {
         return Ok(());
     }
-    let cache = format!("file://{MEMBERS_CACHE}");
+    let cache = format!("file://{}", cache_dir.display());
     let mut arguments = vec![
         "--extra-experimental-features",
         "nix-command",
@@ -573,10 +557,28 @@ pub(super) async fn install(
             staged.extract(&release, &key, &cache)?;
             cache
         }
-        StagedClosure::Members { manifest, iso } => {
-            nixos::ensure_space(target, manifest.total_nar_bytes)?;
-            copy_iso_members(iso, &trust).await?;
-            PathBuf::from(MEMBERS_CACHE)
+        StagedClosure::Members { staged, iso } => {
+            nixos::ensure_space(
+                target,
+                staged
+                    .manifest
+                    .total_nar_bytes
+                    .checked_add(staged.cache_bytes)
+                    .ok_or_else(|| anyhow!("install space overflow"))?,
+            )?;
+            let cache = target.join(format!("var/cache/tiaris-nest/.install-{}", state.plan.id));
+            if cache.exists() {
+                let old = fs::symlink_metadata(&cache)?;
+                ensure!(
+                    old.is_dir() && old.uid() == 0,
+                    "unsafe interrupted installation cache"
+                );
+                fs::remove_dir_all(&cache)?;
+            }
+            staged.extract(&release, &key, iso, &cache)?;
+            let _ = fs::remove_file(STAGED_MEMBERS);
+            copy_iso_members(iso, &trust, &cache).await?;
+            cache
         }
     };
     storage::run_checked(
@@ -1060,18 +1062,19 @@ mod tests {
     use super::*;
 
     /// Members that do not fit take the whole archive instead of ending the
-    /// setup; the tmpfs that holds them counts as well as the memory.
+    /// setup; the tmpfs that holds them counts as well as the memory (1x, since
+    /// verification streams without duplicating the cache in tmpfs).
     #[test]
     fn members_fit_in_memory_and_in_the_tmpfs_that_holds_them() {
-        assert!(members_fit(GIB, 0, 4 * GIB, 2 * GIB));
-        assert!(!members_fit(GIB, 0, 3 * GIB, 8 * GIB));
-        assert!(!members_fit(GIB, 0, 8 * GIB, GIB));
+        assert!(members_fit(GIB, 0, 3 * GIB, GIB));
+        assert!(!members_fit(GIB, 0, 2 * GIB, 8 * GIB));
+        assert!(!members_fit(GIB, 0, 8 * GIB, GIB - 1));
         // What an earlier try staged is there already.
-        assert!(members_fit(GIB, GIB / 2, 8 * GIB, 3 * GIB / 2));
+        assert!(members_fit(GIB, GIB / 2, 8 * GIB, GIB / 2));
     }
 
-    /// The members' cache lives in RAM; the next try may need that RAM for
-    /// the whole archive.
+    /// Streaming verification writes nothing into tmpfs and cleans up the
+    /// staged file on failure so a fallback full archive download reclaims RAM.
     #[test]
     fn a_failed_member_check_leaves_no_cache_behind() {
         let mut fixture = crate::appliance::closure::full_archive_tests::Fixture::new();
@@ -1081,15 +1084,24 @@ mod tests {
         fixture.bind(&vec![0; 6 + 3 + tar.len()]);
         let dir = std::env::temp_dir().join(format!("nest-members-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&dir).unwrap();
-        let (staged, cache) = (dir.join("closure.members.tar"), dir.join("cache"));
-        // Cut short: the pass has started extracting when it fails.
+        let staged = dir.join("closure.members.tar");
         fs::write(&staged, &tar[..tar.len() / 2]).unwrap();
         let key = fixture.key.verifying_key();
         let present = closure::Present::new();
-        let verified = verify_staged_members(&fixture.release, &key, &present, &staged, &cache);
+        let verified = verify_staged_members(&fixture.release, &key, &present, &staged);
         assert!(verified.is_err());
         assert!(!staged.exists());
+
+        // Valid staged members verify cleanly in a streaming pass, then extract on demand.
+        fs::write(&staged, &tar).unwrap();
+        let mut verified =
+            verify_staged_members(&fixture.release, &key, &present, &staged).unwrap();
+        let cache = dir.join("disk-cache");
         assert!(!cache.exists());
+        verified
+            .extract(&fixture.release, &key, &present, &cache)
+            .unwrap();
+        assert!(cache.join("manifest.json").is_file());
         fs::remove_dir_all(dir).unwrap();
     }
 

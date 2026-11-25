@@ -536,9 +536,12 @@ enum Payloads<'a> {
     Verify,
     /// Only [`VerifiedArchive::extract`]: the same file passed `Verify`.
     Copy,
-    /// Only [`verify_staged`]: the payloads of exactly the members the
-    /// store lacks, verified as `Verify` does.
+    /// Only [`verify_staged`] and [`verify_staged_stream`]: the payloads of
+    /// exactly the members the store lacks, verified as `Verify` does.
     Missing(&'a Present),
+    /// Only [`VerifiedStagedMembers::extract`]: the same open file passed
+    /// `Missing(present)`.
+    CopyMissing(&'a Present),
     /// Only [`read_metadata`]: the stream ends before the first payload.
     None,
 }
@@ -546,7 +549,9 @@ impl Payloads<'_> {
     /// Whether the stream carries the payload of `info`.
     fn carries(self, info: &NarInfo) -> bool {
         match self {
-            Self::Missing(present) => present.get(&info.entry.path) != Some(&info.entry.nar_hash),
+            Self::Missing(present) | Self::CopyMissing(present) => {
+                present.get(&info.entry.path) != Some(&info.entry.nar_hash)
+            }
             Self::None => false,
             Self::Verify | Self::Copy => true,
         }
@@ -631,6 +636,101 @@ pub fn read_metadata(
     Ok(Metadata {
         manifest: read.manifest,
         infos: read.infos,
+    })
+}
+
+/// A staged member stream that passed [`verify_staged_stream`], still open so
+/// setup can verify in RAM before approval and extract straight onto the target
+/// disk after formatting (1x tmpfs instead of 2x).
+#[derive(Debug)]
+pub struct VerifiedStagedMembers {
+    file: File,
+    state: FileState,
+    limit: u64,
+    pub manifest: ClosureManifest,
+    /// The bytes its binary cache takes once extracted onto the target disk.
+    pub cache_bytes: u64,
+    /// The NAR bytes of the members the ISO store lacks.
+    pub missing_nar_bytes: u64,
+}
+
+impl VerifiedStagedMembers {
+    /// Extract the already-verified staged member stream onto `output`.
+    pub fn extract(
+        &mut self,
+        release: &NixosRelease,
+        key: &VerifyingKey,
+        present: &Present,
+        output: &Path,
+    ) -> Result<()> {
+        release.verify(key)?;
+        ensure!(
+            FileState::of(&self.file)? == self.state,
+            "staged member stream changed during installation"
+        );
+        self.file.rewind()?;
+        let mut tar = Counting::unhashed(io::BufReader::new(&mut self.file), self.limit);
+        let read = read_tar(
+            &mut tar,
+            release,
+            key,
+            Some(output),
+            Payloads::CopyMissing(present),
+            &mut |_, _| Ok(()),
+        )?;
+        ensure!(
+            FileState::of(&self.file)? == self.state,
+            "staged member stream changed during extraction"
+        );
+        ensure!(
+            read.cache_bytes == self.cache_bytes
+                && read.manifest.total_nar_bytes == self.manifest.total_nar_bytes,
+            "staged member stream differs from its verification"
+        );
+        Ok(())
+    }
+}
+
+/// Verify an open staged member stream in one streaming pass without writing
+/// any extracted cache files, keeping the verified open file handle for later
+/// extraction onto the target disk.
+pub fn verify_staged_stream(
+    mut file: File,
+    limit: u64,
+    release: &NixosRelease,
+    key: &VerifyingKey,
+    present: &Present,
+) -> Result<VerifiedStagedMembers> {
+    release.verify(key)?;
+    let state = FileState::of(&file)?;
+    file.rewind()?;
+    let mut tar = Counting::unhashed(io::BufReader::new(&mut file), limit);
+    let read = read_tar(
+        &mut tar,
+        release,
+        key,
+        None,
+        Payloads::Missing(present),
+        &mut |_, _| Ok(()),
+    )?;
+    ensure!(
+        FileState::of(&file)? == state,
+        "staged member stream changed during verification"
+    );
+    let missing_nar_bytes = read
+        .manifest
+        .store_paths
+        .iter()
+        .filter(|path| present.get(&path.path) != Some(&path.nar_hash))
+        .map(|path| path.nar_size)
+        .sum::<u64>();
+    Ok(VerifiedStagedMembers {
+        file,
+        state,
+        limit,
+        manifest: read.manifest,
+        cache_bytes: read.cache_bytes,
+        missing_nar_bytes,
     })
 }
 
@@ -874,13 +974,15 @@ fn read_tar<R: Read>(
                         None
                     },
                 )?,
-                (Payloads::Copy, Some(mut target)) => {
+                (Payloads::Copy | Payloads::CopyMissing(_), Some(mut target)) => {
                     ensure!(
                         io::copy(&mut entry, &mut target)? == length,
                         "short archive member"
                     );
                 }
-                (Payloads::Copy, None) => bail!("extraction needs a directory"),
+                (Payloads::Copy | Payloads::CopyMissing(_), None) => {
+                    bail!("extraction needs a directory")
+                }
                 (Payloads::None, _) => unreachable!("metadata carries no payload"),
             }
             payloads.insert(name);
@@ -898,7 +1000,7 @@ fn read_tar<R: Read>(
         infos.len() == paths.len() && saw_cache,
         "incomplete closure archive"
     );
-    if !payload_started && matches!(mode, Payloads::Missing(_)) {
+    if !payload_started && matches!(mode, Payloads::Missing(_) | Payloads::CopyMissing(_)) {
         // Every member is in the store already: admission still decides.
         cache_bytes = start_payloads(&manifest, &infos, cache_bytes, mode, admit)?;
     }

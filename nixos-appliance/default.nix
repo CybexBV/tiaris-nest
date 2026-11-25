@@ -83,6 +83,7 @@ let
     });
   common = {
     inherit package sourceArchive migrations workstationAgent workstationCacheSeeds installerKiosk sourceRevision manageSourceRevision manageOrigin sourceDateEpoch releasePublicKey;
+    bootstrap = package.bootstrap;
     sourceArchiveFile = archiveInput;
     provisioningPublicKeys = publicKeys;
     nixpkgsRevision = pin.revision;
@@ -142,6 +143,7 @@ assert builtins.length publicKeys >= 1 && builtins.length publicKeys <= 8;
 assert publicKeys == lib.sort builtins.lessThan (lib.unique publicKeys);
 {
   inherit package unsignedCache buildMetadata workstationAgent workstationCacheSeeds installerKiosk;
+  bootstrap = package.bootstrap;
   # The stick image, exported beside the template ISO (RELEASES.md).
   inherit usbInstaller;
   workstationCacheSeedPaths = map toString workstationCacheSeeds.packages;
