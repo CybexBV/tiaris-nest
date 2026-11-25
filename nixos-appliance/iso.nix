@@ -1,6 +1,7 @@
 { config, lib, pkgs, modulesPath, appliance, ... }:
 let
   a = appliance;
+  bootstrap = a.bootstrap or (a.package.bootstrap or a.package);
   slot = pkgs.runCommand "tiaris-provisioning-slot" {} ''
     dd if=/dev/zero of=$out bs=8192 count=1 status=none
   '';
@@ -8,22 +9,49 @@ let
   keys = pkgs.writeText "provisioning-public-keys" (lib.concatStringsSep "\n" a.provisioningPublicKeys + "\n");
   setupStatus = "/run/tiaris-nest-setup/status.json";
 in {
-  disabledModules = [ "installer/cd-dvd/iso-image.nix" ];
   imports = [
-    (modulesPath + "/installer/cd-dvd/installation-cd-minimal.nix")
+    (modulesPath + "/profiles/minimal.nix")
+    (modulesPath + "/installer/scan/detected.nix")
+    (modulesPath + "/installer/scan/not-detected.nix")
     (import ./single-menu-iso-module.nix { nixpkgs = appliance.nixpkgsPath; })
+    ./firmware.nix
   ];
   networking.hostName = "tiaris-nest-setup";
   system.stateVersion = "26.05";
-  system.installer.channel.enable = false;
   system.tools.nixos-rebuild.enable = false;
-  hardware.enableRedistributableFirmware = true;
+  documentation.enable = lib.mkForce false;
+  documentation.man.enable = lib.mkForce false;
+  documentation.doc.enable = lib.mkForce false;
+  documentation.info.enable = lib.mkForce false;
+  documentation.nixos.enable = lib.mkForce false;
+  fonts.fontconfig.enable = lib.mkForce false;
+  programs.git.enable = lib.mkForce false;
+  environment.defaultPackages = lib.mkForce [ ];
   hardware.cpu.intel.updateMicrocode = true;
   hardware.cpu.amd.updateMicrocode = true;
+  swapDevices = lib.mkImageMediaOverride [ ];
+  fileSystems = lib.mkImageMediaOverride config.lib.isoFileSystems;
+  boot.initrd.luks.devices = lib.mkImageMediaOverride { };
+  boot.supportedFilesystems = lib.mkForce [ "ext4" "vfat" ];
+  boot.initrd.availableKernelModules = [
+    "xhci_pci" "xhci-hcd" "ehci-pci" "ohci-pci" "uhci-hcd"
+    "ahci" "ata_piix" "ata_generic" "nvme" "vmd"
+    "virtio_pci" "virtio_blk" "virtio_scsi" "sd_mod" "sr_mod"
+    "usbhid" "usb_storage" "uas"
+    "megaraid_sas" "mpt3sas" "mpi3mr" "smartpqi" "hpsa" "aacraid" "mptsas" "mptspi"
+    "hv_vmbus" "hv_storvsc" "vmw_pvscsi" "xen-blkfront"
+    "mmc_block" "sdhci" "sdhci-pci" "sdhci-acpi"
+  ];
   boot.initrd.systemd.enable = true;
-  boot.zfs.forceImportRoot = false;
+  boot.kernel.sysctl."vm.overcommit_memory" = "1";
+  environment.variables.GC_INITIAL_HEAP_SIZE = "1M";
+  environment.etc."systemd/pstore.conf".text = ''
+    [PStore]
+    Unlink=no
+  '';
   boot.kernelParams = [ "console=ttyS0,115200n8" "console=tty0" "panic=30" ];
   boot.loader.timeout = lib.mkForce 3;
+  boot.loader.grub.memtest86.enable = lib.mkForce false;
   isoImage = {
     makeEfiBootable = true;
     makeUsbBootable = true;
@@ -41,7 +69,7 @@ in {
       { source = key; target = "/tiaris/release-public-key"; }
       { source = keys; target = "/tiaris/provisioning-public-keys"; }
       { source = pkgs.writeText "nixos-appliance" "3\n"; target = "/tiaris/nixos-appliance"; }
-      { source = "${a.package}/bin/tiaris-nest-bootstrap"; target = "/tiaris/bootstrap/tiaris-nest-bootstrap"; }
+      { source = "${bootstrap}/bin/tiaris-nest-bootstrap"; target = "/tiaris/bootstrap/tiaris-nest-bootstrap"; }
     ];
   };
   image.baseName = lib.mkForce "tiaris-nest-appliance-template-${a.package.version}-x86_64-linux";
@@ -58,17 +86,14 @@ in {
   services.timesyncd.enable = true;
   services.openssh.enable = lib.mkForce false;
   services.getty.autologinUser = lib.mkForce null;
-  # The installer profile gives root and "nixos" empty passwords and the
-  # kernel's console=ttyS0 starts a serial login prompt: anyone at the
-  # machine could log in. The setup ISO needs no login anywhere. Lock both
-  # accounts and start no serial getty; kernel messages still reach ttyS0,
-  # which is all qualification reads from it.
+  # Lock both accounts and start no serial getty; kernel messages still reach
+  # ttyS0, which is all qualification reads from it.
   users.users.root.initialHashedPassword = lib.mkForce "!";
-  users.users.nixos.initialHashedPassword = lib.mkForce "!";
+  users.users.nixos = { isNormalUser = true; initialHashedPassword = lib.mkForce "!"; };
   services.getty.helpLine = lib.mkForce "";
   security.sudo.wheelNeedsPassword = lib.mkForce true;
   systemd.services."serial-getty@ttyS0".enable = false;
-  environment.systemPackages = [ a.package pkgs.nix pkgs.nixos-install-tools pkgs.iputils pkgs.iproute2 pkgs.gptfdisk pkgs.e2fsprogs pkgs.dosfstools pkgs.util-linux pkgs.curl pkgs.jq pkgs.zstd pkgs.python3 ];
+  environment.systemPackages = [ bootstrap pkgs.nix pkgs.nixos-install-tools pkgs.iputils pkgs.iproute2 pkgs.gptfdisk pkgs.e2fsprogs pkgs.dosfstools pkgs.util-linux pkgs.curl pkgs.jq pkgs.zstd pkgs.python3 pkgs.smartmontools pkgs.nvme-cli ];
   nix.settings = { experimental-features = [ "nix-command" ]; substituters = lib.mkForce []; trusted-public-keys = lib.mkForce [ "tiaris-nest-appliance-1:${a.releasePublicKey}" ]; };
   systemd.services.tiaris-nest-bootstrap = {
     wantedBy = [ "multi-user.target" ]; after = [ "network-online.target" ]; wants = [ "network-online.target" ];
@@ -79,7 +104,7 @@ in {
     '';
     # The public setup projection for the tty1 kiosk. Preserve it across
     # restarts so a stopped or failed screen stays readable meanwhile.
-    serviceConfig = { Type = "simple"; ExecStart = "${a.package}/bin/tiaris-nest-bootstrap prepare --setup-status ${setupStatus}"; Restart = "on-failure"; RestartSec = "15s"; StandardOutput = "journal"; StandardError = "journal"; UMask = "0077"; TimeoutStartSec = "infinity"; RuntimeDirectory = "tiaris-nest-setup"; RuntimeDirectoryMode = "0755"; RuntimeDirectoryPreserve = "yes"; };
+    serviceConfig = { Type = "simple"; ExecStart = "${bootstrap}/bin/tiaris-nest-bootstrap prepare --setup-status ${setupStatus}"; Restart = "on-failure"; RestartSec = "15s"; StandardOutput = "journal"; StandardError = "journal"; UMask = "0077"; TimeoutStartSec = "infinity"; RuntimeDirectory = "tiaris-nest-setup"; RuntimeDirectoryMode = "0755"; RuntimeDirectoryPreserve = "yes"; };
   };
   systemd.services."getty@tty1".enable = false;
   # getty.target and logind use this alias, not getty@tty1. Mask the exact

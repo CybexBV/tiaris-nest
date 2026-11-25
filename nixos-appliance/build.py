@@ -156,6 +156,35 @@ def require_workstation_custom_cache(cache, outputs):
         raise ValueError('signed appliance cache omits current Blueprint custom outputs')
 
 
+# Release size budgets (guard against accidental closure regressions).
+ISO_SIZE_BUDGET_BYTES = 1024 * 1024 * 1024
+CLOSURE_SIZE_BUDGET_BYTES = 1500 * 1024 * 1024
+
+
+def report_closure_sizes(cache):
+    manifest = json.loads((cache / 'manifest.json').read_bytes())
+    nar_dir = cache / 'nar'
+    entries = []
+    for row in manifest['store_paths']:
+        store_hash = Path(row['path']).name.split('-', 1)[0]
+        archive = nar_dir / f'{store_hash}.nar.zst'
+        compressed = archive.stat().st_size if archive.is_file() else 0
+        entries.append((compressed, row['nar_size'], row['path']))
+    entries.sort(reverse=True)
+    total_compressed = sum(item[0] for item in entries)
+    total_nar = sum(item[1] for item in entries)
+    print(f'==> Closure size: {total_compressed / (1024 ** 2):.1f} MiB compressed '
+          f'({total_nar / (1024 ** 2):.1f} MiB NAR across {len(entries)} store paths)',
+          file=sys.stderr, flush=True)
+    for compressed, nar_size, path in entries[:15]:
+        print(f'    {compressed / (1024 ** 2):6.1f} MiB zst ({nar_size / (1024 ** 2):6.1f} MiB NAR)  {Path(path).name}',
+              file=sys.stderr, flush=True)
+    if total_compressed > CLOSURE_SIZE_BUDGET_BYTES:
+        raise ValueError(
+            f'system closure compressed size ({total_compressed} bytes) exceeds budget ({CLOSURE_SIZE_BUDGET_BYTES} bytes)'
+        )
+
+
 def build(args):
     manage = Path(args.manage_source_dir).absolute()
     repositories = github_repositories()
@@ -197,26 +226,30 @@ def build(args):
             if len(candidates) != 1:
                 raise ValueError('Nix ISO output must contain one image')
             iso = candidates[0]
-            package = nix('package')
-            offset = inspect_template(iso, package, args, work)
-            if iso.stat().st_size >= 2 * 1024 ** 3:
+            bootstrap = nix('bootstrap')
+            offset = inspect_template(iso, bootstrap, args, work)
+            iso_size = iso.stat().st_size
+            print(f'==> Setup ISO size: {iso_size / (1024 ** 2):.1f} MiB', file=sys.stderr, flush=True)
+            if iso_size >= 2 * 1024 ** 3:
                 raise ValueError('installer exceeds the GitHub per-asset publication limit')
+            if iso_size > ISO_SIZE_BUDGET_BYTES:
+                raise ValueError(f'setup ISO size ({iso_size} bytes) exceeds budget ({ISO_SIZE_BUDGET_BYTES} bytes)')
             pin_revision = run('nix-instantiate', '--eval', '--strict', '--json', '--expr',
                                '(import ' + str(REPO / 'release/nixpkgs.nix') + ').revision')
             metadata = dict(schema='tiaris.nest.installer-template-build.v3', version=version,
                             architecture='x86_64-linux', base_os='nixos', base_os_version='26.05',
                             manage_origin=args.expected_manage_origin, package_delivery='system-closure-v1',
-                            size_bytes=iso.stat().st_size, template_sha256=sha256(iso),
+                            size_bytes=iso_size, template_sha256=sha256(iso),
                             personalization_offset=offset, personalization_size=8192,
                             placeholder_sha256=hashlib.sha256(bytes(8192)).hexdigest(),
                             nixpkgs_revision=json.loads(pin_revision), provisioning_public_keys=keys,
                             envelope_max_validity_hours=int(run(
-                                package / 'bin/tiaris-nest-bootstrap',
+                                bootstrap / 'bin/tiaris-nest-bootstrap',
                                 'envelope-max-validity-hours')),
                             # Signed after the validity: this ISO can stay
                             # generic (all-zero slot) and be claimed.
                             setup_claim_protocol=int(run(
-                                package / 'bin/tiaris-nest-bootstrap',
+                                bootstrap / 'bin/tiaris-nest-bootstrap',
                                 'setup-claim-protocol')))
             name = 'tiaris-nest-appliance-template-' + version + '-x86_64-linux'
             metadata_file = work / 'template.json'
@@ -231,6 +264,7 @@ def build(args):
             custom_outputs = json.loads(run('nix-instantiate', '--eval', '--strict', '--json',
                                             expression, '-A', 'workstationCacheSeedPaths'))
             require_workstation_custom_cache(cache, custom_outputs)
+            report_closure_sizes(cache)
             if args.unsigned_output_dir:
                 # Ordinary files survive transfer into an isolated signing job.
                 shutil.copytree(cache, output / 'cache')

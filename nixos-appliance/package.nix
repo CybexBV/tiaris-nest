@@ -19,8 +19,15 @@ in pkgs.rustPlatform.buildRustPackage {
   cargoLock.lockFile = source + "/Cargo.lock";
   TIARIS_NEST_BUILD_MANAGE_ORIGIN = manageOrigin;
   buildFeatures = pkgs.lib.optional journeySystemRoots "journey-system-roots";
+  # Build only the daemon and bootstrap binaries (omit qualification helpers).
+  cargoBuildFlags = [ "--bin" "tiaris-nest" "--bin" "tiaris-nest-bootstrap" ];
+  # Split bootstrap into its own output so the setup ISO does not carry the
+  # 25 MiB tiaris-nest daemon binary.
+  outputs = [ "out" "bootstrap" ];
   doCheck = false; # Locked Rust tests are a separate release gate.
   postInstall = ''
+    mkdir -p "$bootstrap/bin"
+    mv "$out/bin/tiaris-nest-bootstrap" "$bootstrap/bin/tiaris-nest-bootstrap"
     install -Dm0444 ${source}/assets/pxe-menu.png $out/share/tiaris-nest/assets/pxe-menu.png
     install -Dm0444 -t $out/share/doc/tiaris-nest ${source}/LICENSE ${source}/NOTICE
   '';

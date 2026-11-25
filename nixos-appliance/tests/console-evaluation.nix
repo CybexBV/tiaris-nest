@@ -7,6 +7,7 @@ let
   setupConsole = setup.systemd.services.tiaris-nest-setup-console;
   installedConsole = installed.systemd.services.tiaris-nest-console;
   bootstrap = setup.systemd.services.tiaris-nest-bootstrap.serviceConfig;
+  bootstrapPackage = appliance.bootstrap or (appliance.package.bootstrap or appliance.package);
   daemon = installed.systemd.services.tiaris-nest.serviceConfig;
   kiosk = "${appliance.installerKiosk}/bin/tiaris-installer-kiosk";
   noAutomaticLogin = config: !(config.systemd.services."autovt@tty1".enable or true);
@@ -41,7 +42,7 @@ let
       && installedConsole.serviceConfig.Type == "idle";
     bootstrapPublishesSetupStatus = bootstrap.RuntimeDirectory == "tiaris-nest-setup"
       && bootstrap.RuntimeDirectoryMode == "0755" && bootstrap.RuntimeDirectoryPreserve == "yes"
-      && bootstrap.ExecStart == "${appliance.package}/bin/tiaris-nest-bootstrap prepare --setup-status /run/tiaris-nest-setup/status.json";
+      && bootstrap.ExecStart == "${bootstrapPackage}/bin/tiaris-nest-bootstrap prepare --setup-status /run/tiaris-nest-setup/status.json";
     daemonPublishesConsoleStatus = daemon.RuntimeDirectory == "tiaris-nest"
       && daemon.RuntimeDirectoryMode == "0755" && daemon.RuntimeDirectoryPreserve == "yes"
       && builtins.elem "/run/tiaris-nest" daemon.ReadWritePaths;
