@@ -121,7 +121,8 @@ def network_from(plan, interfaces, actual_mac):
     return {'interface': name, 'mac': expected_mac, 'address': str(selected.ip), 'cidr': str(selected.network)}
 
 def current_network():
-    raw = bounded(CONTROL / 'netplan-approved.json', root=True)
+    effective = Path('/run/tiaris-nest-network/netplan-approved.json')
+    raw = bounded(effective if effective.exists() else CONTROL / 'netplan-approved.json', root=True)
     marker = CONTROL / 'network-fallback-active'
     if marker.exists():
         fallback = read_json(marker, limit=256, root=True)

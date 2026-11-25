@@ -114,7 +114,8 @@ fn inventory_rows_follow_admission_minimums() {
     );
     assert!(hardware_stop(&checks).is_none());
 
-    inventory.memory_bytes = 8 * GIB;
+    // Realistic 8 GiB hardware MemTotal (~7.75 GiB in an 8192 MiB KVM guest).
+    inventory.memory_bytes = 8_327_565_312;
     let eight_gb_checks = inventory_checks(
         &inventory,
         LinkFacts::default(),
@@ -122,6 +123,16 @@ fn inventory_rows_follow_admission_minimums() {
     );
     assert_eq!(eight_gb_checks[2].state, CheckState::Done);
     assert_eq!(eight_gb_checks[2].value, "8 GiB");
+
+    // Just below the 7.25 GiB usable floor fails truthfully as needing 8 GiB.
+    inventory.memory_bytes = 7_424 * 1024 * 1024 - 1;
+    let below_floor = inventory_checks(
+        &inventory,
+        LinkFacts::default(),
+        (CheckState::Queued, "Queued"),
+    );
+    assert_eq!(below_floor[2].state, CheckState::Error);
+    assert!(below_floor[2].value.ends_with(" · needs 8 GiB"));
 
     inventory.memory_bytes = 4 * GIB;
     inventory.cpu_cores = 2;

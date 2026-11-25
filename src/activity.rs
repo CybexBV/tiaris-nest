@@ -123,6 +123,20 @@ pub fn quiet_for(now: DateTime<Utc>) -> Option<chrono::Duration> {
     }
 }
 
+/// Whether the Nest has served no computer requests for at least
+/// `min_quiet_seconds` and has no active requests in flight. Non-NixOS hosts
+/// (unit tests and standalone setups) do not spawn the activity tracker and
+/// return `true`.
+pub fn is_idle_for_maintenance(min_quiet_seconds: i64) -> bool {
+    if !crate::appliance::nixos::is_nixos() {
+        return true;
+    }
+    if SERVED.in_flight.load(Ordering::SeqCst) > 0 {
+        return false;
+    }
+    quiet_for(Utc::now()).is_some_and(|quiet| quiet.num_seconds() >= min_quiet_seconds)
+}
+
 /// Counts one request from its first byte until its body is finished or
 /// dropped, so a long SquashFS or cache download keeps the Nest busy.
 struct Served(&'static Counter);

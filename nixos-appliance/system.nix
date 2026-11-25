@@ -31,9 +31,11 @@
   boot.initrd.availableKernelModules = [
     "xhci_pci" "xhci-hcd" "ehci-pci" "ohci-pci" "uhci-hcd"
     "ahci" "ata_piix" "ata_generic" "nvme" "vmd"
+    "sata_sil24" "sata_via" "sata_nv" "sata_promise"
     "virtio_pci" "virtio_blk" "virtio_scsi" "sd_mod" "sr_mod"
     "usbhid" "usb_storage" "uas"
     "megaraid_sas" "mpt3sas" "mpi3mr" "smartpqi" "hpsa" "aacraid" "mptsas" "mptspi"
+    "3w-9xxx" "arcmsr" "aic79xx"
     "hv_vmbus" "hv_storvsc" "vmw_pvscsi" "xen-blkfront"
     "mmc_block" "sdhci" "sdhci-pci" "sdhci-acpi"
     "iTCO_wdt" "lpc_ich" "i2c-i801" "sp5100_tco"
@@ -65,7 +67,11 @@
       sleep 3
     '';
   };
-  boot.initrd.systemd.services.emergency.serviceConfig.ExecStart = lib.mkForce [ "" "${pkgs.systemd}/bin/systemctl --no-block reboot" ];
+  boot.initrd.systemd.services.emergency = {
+    wants = [ "tiaris-nest-disk-missing.service" ];
+    after = [ "tiaris-nest-disk-missing.service" ];
+    serviceConfig.ExecStart = lib.mkForce [ "" "${pkgs.systemd}/bin/systemctl --no-block reboot" ];
+  };
   boot.kernelParams = [ "panic=30" "console=ttyS0,115200n8" "console=tty0" ];
   hardware.cpu.intel.updateMicrocode = true;
   hardware.cpu.amd.updateMicrocode = true;

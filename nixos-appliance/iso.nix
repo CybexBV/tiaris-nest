@@ -36,9 +36,11 @@ in {
   boot.initrd.availableKernelModules = [
     "xhci_pci" "xhci-hcd" "ehci-pci" "ohci-pci" "uhci-hcd"
     "ahci" "ata_piix" "ata_generic" "nvme" "vmd"
+    "sata_sil24" "sata_via" "sata_nv" "sata_promise"
     "virtio_pci" "virtio_blk" "virtio_scsi" "sd_mod" "sr_mod"
     "usbhid" "usb_storage" "uas"
     "megaraid_sas" "mpt3sas" "mpi3mr" "smartpqi" "hpsa" "aacraid" "mptsas" "mptspi"
+    "3w-9xxx" "arcmsr" "aic79xx"
     "hv_vmbus" "hv_storvsc" "vmw_pvscsi" "xen-blkfront"
     "mmc_block" "sdhci" "sdhci-pci" "sdhci-acpi"
   ];
@@ -93,8 +95,24 @@ in {
   services.getty.helpLine = lib.mkForce "";
   security.sudo.wheelNeedsPassword = lib.mkForce true;
   systemd.services."serial-getty@ttyS0".enable = false;
-  environment.systemPackages = [ bootstrap pkgs.nix pkgs.nixos-install-tools pkgs.iputils pkgs.iproute2 pkgs.gptfdisk pkgs.e2fsprogs pkgs.dosfstools pkgs.util-linux pkgs.curl pkgs.jq pkgs.zstd pkgs.python3 pkgs.smartmontools pkgs.nvme-cli ];
+  environment.systemPackages = [ bootstrap pkgs.nix pkgs.nixos-install-tools pkgs.iputils pkgs.iproute2 pkgs.gptfdisk pkgs.parted pkgs.efibootmgr pkgs.e2fsprogs pkgs.dosfstools pkgs.util-linux pkgs.curl pkgs.jq pkgs.zstd pkgs.python3 pkgs.smartmontools pkgs.nvme-cli ];
+  systemd.tmpfiles.rules = [
+    "d /run/systemd/network 0755 root root -"
+  ];
   nix.settings = { experimental-features = [ "nix-command" ]; substituters = lib.mkForce []; trusted-public-keys = lib.mkForce [ "tiaris-nest-appliance-1:${a.releasePublicKey}" ]; };
+  systemd.services.tiaris-nest-preclaim-network = {
+    description = "Apply pre-claim static IPv4 from USB before networkd starts";
+    wantedBy = [ "network-pre.target" ];
+    before = [ "systemd-networkd.service" "network-pre.target" ];
+    after = [ "systemd-udevd.service" "local-fs.target" "systemd-tmpfiles-setup.service" ];
+    path = [ pkgs.util-linux pkgs.systemd pkgs.iproute2 ];
+    unitConfig.DefaultDependencies = false;
+    serviceConfig = {
+      Type = "oneshot";
+      ExecStart = "${bootstrap}/bin/tiaris-nest-bootstrap apply-preclaim-usb --no-reload";
+      UMask = "0077";
+    };
+  };
   systemd.services.tiaris-nest-bootstrap = {
     wantedBy = [ "multi-user.target" ]; after = [ "network-online.target" ]; wants = [ "network-online.target" ];
     path = config.environment.systemPackages;

@@ -326,7 +326,7 @@ pub fn validate_installed_state(
     }
 
     let supersession_path = control.join(crate::network_reconfigure::SUPERSESSION_FILE);
-    let active_supersession = match fs::symlink_metadata(&supersession_path) {
+    match fs::symlink_metadata(&supersession_path) {
         Ok(_) => {
             let body = read_bounded_nofollow(
                 &supersession_path,
@@ -335,32 +335,31 @@ pub fn validate_installed_state(
             )?;
             let raw: serde_json::Value =
                 serde_json::from_slice(&body).context("parse committed network supersession")?;
-            Some(crate::network_reconfigure::verify_supersession_value(
+            let trusted_b64s: Vec<String> = keys
+                .iter()
+                .map(|key| protocol::standard_base64(key.to_bytes()))
+                .collect();
+            let _ = crate::network_reconfigure::verify_supersession_value_any_key(
                 &raw,
-                &durable.management_signing_public_key_b64,
+                &trusted_b64s,
                 &plan,
                 false,
                 Utc::now(),
-            )?)
+            )?;
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("inspect committed network supersession"),
-    };
-    let expected_network = active_supersession
-        .as_ref()
-        .map_or(&plan.network, |doc| &doc.network);
-    let expected_cidrs = active_supersession
-        .as_ref()
-        .map_or(plan.management_cidrs.as_slice(), |doc| {
-            doc.management_cidrs.as_slice()
-        });
+    }
 
+    // control/netplan-approved.json and control/management-cidrs.txt stay bound
+    // to the original install plan so predecessor generation rollbacks validate
+    // cleanly; any committed supersession is projected into /run/tiaris-nest-network/.
     let approved: serde_json::Value = serde_json::from_slice(&read_bounded_nofollow(
         &control.join("netplan-approved.json"),
         1024 * 1024,
         "promoted approved Netplan",
     )?)?;
-    if approved != storage::netplan(expected_network, &plan) {
+    if approved != storage::netplan(&plan.network, &plan) {
         bail!("approved Netplan is not derived from the authenticated installation")
     }
     let fallback_plan = protocol::NestProvisioningNetworkPlan {
@@ -383,7 +382,7 @@ pub fn validate_installed_state(
         64 * 1024,
         "promoted Management CIDRs",
     )?;
-    if cidrs != format!("{}\n", expected_cidrs.join("\n")).as_bytes() {
+    if cidrs != format!("{}\n", plan.management_cidrs.join("\n")).as_bytes() {
         bail!("promoted Management CIDRs are not derived from the authenticated plan")
     }
     Ok(())
@@ -484,7 +483,7 @@ async fn prepare_verified(
     status.media_verified(&verified.envelope.manage_origin);
 
     let provisioning_key = protocol::derive_provisioning_key(&verified.envelope.media_secret)?;
-    let inventory = inventory::collect_inventory().await?;
+    let mut inventory = inventory::collect_inventory().await?;
     status.inventory_collected(&inventory);
     let hardware_digest = inventory::hardware_digest(&inventory)?;
     let client = protocol::ProvisioningClient::new(
@@ -497,7 +496,7 @@ async fn prepare_verified(
         &client,
         &verified,
         &provisioning_key,
-        &inventory,
+        &mut inventory,
         &hardware_digest,
     )
     .await

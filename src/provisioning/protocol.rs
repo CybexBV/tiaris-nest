@@ -692,6 +692,36 @@ impl ProvisioningClient {
         self.validate_session_response(response)
     }
 
+    /// Claim against Manage, falling back once without `disk_smart_health` /
+    /// `disks_without_serial` if an older Manage server with `deny_unknown_fields`
+    /// rejects those additive fields. Keeps `inventory` synchronized so later
+    /// `inventory_sha256` verification matches the signed plan.
+    pub(crate) async fn claim_with_legacy_fallback(
+        &self,
+        media_secret: &str,
+        key: &SigningKey,
+        inventory: &mut NestProvisioningInventory,
+        hardware_digest: &str,
+    ) -> Result<AgentSessionResponse> {
+        match self
+            .claim(media_secret, key, inventory, hardware_digest)
+            .await
+        {
+            Ok(response) => Ok(response),
+            Err(error)
+                if unknown_optional_inventory_field(&error)
+                    && (!inventory.disk_smart_health.is_empty()
+                        || !inventory.disks_without_serial.is_empty()) =>
+            {
+                inventory.disk_smart_health.clear();
+                inventory.disks_without_serial.clear();
+                self.claim(media_secret, key, inventory, hardware_digest)
+                    .await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub(crate) async fn poll_plan(&self, key: &SigningKey) -> Result<AgentSessionResponse> {
         // Signed with the path; a Tiaris that predates the offer ignores it.
         let path = format!(
@@ -926,6 +956,14 @@ struct ProvisioningHttpError {
     diagnostic_code: Option<String>,
     /// `Retry-After` in seconds, when Management sent one.
     retry_after_seconds: Option<u64>,
+    /// True when an older Manage rejected additive optional inventory fields.
+    unknown_optional_inventory_field: bool,
+}
+
+fn unknown_optional_inventory_field(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<ProvisioningHttpError>()
+        .is_some_and(|error| error.unknown_optional_inventory_field)
 }
 
 /// Status and Management `error_code` of an HTTP refusal; `None` for a
@@ -986,12 +1024,19 @@ fn safe_http_error(status: StatusCode, body: &[u8]) -> anyhow::Error {
         .and_then(Value::as_str)
         .filter(|value| value.len() <= 64)
         .map(str::to_owned);
+    let text = std::str::from_utf8(body).unwrap_or("");
+    let unknown_optional_inventory_field = matches!(
+        status,
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
+    ) && text.contains("unknown field")
+        && (text.contains("disk_smart_health") || text.contains("disks_without_serial"));
     ProvisioningHttpError {
         status,
         code: code.to_owned(),
         error_code,
         diagnostic_code,
         retry_after_seconds: None,
+        unknown_optional_inventory_field,
     }
     .into()
 }

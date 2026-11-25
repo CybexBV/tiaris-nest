@@ -1018,7 +1018,10 @@ impl Default for BuildConfig {
             memory_per_build_bytes: 4 * 1024 * 1024 * 1024,
             serving_memory_reserve_bytes: 2 * 1024 * 1024 * 1024,
             memory_pressure_full_percent: 5,
-            minimum_memory_bytes: 8 * 1024 * 1024 * 1024,
+            // Usable MemTotal on a nominal 8 GiB machine is ~7.5-7.9 GiB after
+            // BIOS/ACPI/iGPU reservations; keep synchronized with setup_status
+            // and Manage's provisioning admission floor.
+            minimum_memory_bytes: 7_424 * 1024 * 1024,
             minimum_swap_bytes: 8 * 1024 * 1024 * 1024,
             timeout_seconds: 60 * 60,
             cancel_grace_seconds: 10,
@@ -1188,7 +1191,7 @@ mod tests {
         );
         assert_eq!(config.manage.http_timeout_seconds, 30);
         assert_eq!(config.build.max_build_cores, 4);
-        assert_eq!(config.build.minimum_memory_bytes, 8 * 1024 * 1024 * 1024);
+        assert_eq!(config.build.minimum_memory_bytes, 7_424 * 1024 * 1024);
         assert_eq!(config.build.minimum_swap_bytes, 8 * 1024 * 1024 * 1024);
         assert_eq!(
             config.build.manage_source_url_template,

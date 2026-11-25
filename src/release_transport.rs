@@ -188,6 +188,7 @@ async fn request(
                 {
                     let status = response.status();
                     if !status.is_redirection()
+                        && !status.is_server_error()
                         && !matches!(
                             status,
                             StatusCode::UNAUTHORIZED

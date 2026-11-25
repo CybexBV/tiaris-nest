@@ -114,6 +114,7 @@ def main():
     # and tiaris-nest-network-runtime.
     checking('The installed Nest does not pass its own check.')
     run('/usr/lib/tiaris-nest/tiaris-nest-bootstrap', 'validate-installed-state')
+    run('/usr/lib/tiaris-nest/tiaris-nest-bootstrap', 'materialize-effective-network')
     checking('The Nest settings are not valid.')
     run('/usr/bin/tiaris-nest', '--config', '/etc/tiaris-nest/config.toml', 'validate-appliance-config')
     checking('The remote support (SSH) settings are not valid.')

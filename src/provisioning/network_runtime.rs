@@ -13,6 +13,8 @@ use std::{
 
 const MAX_NETWORK_PLAN_BYTES: u64 = 1024 * 1024;
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+const DEFAULT_CONTROL_NETPLAN: &str = "/var/lib/tiaris-nest/control/netplan-approved.json";
+const EFFECTIVE_RUNTIME_NETPLAN: &str = "/run/tiaris-nest-network/netplan-approved.json";
 
 #[derive(Clone, Debug)]
 pub struct NetworkRuntimeOptions {
@@ -199,6 +201,18 @@ pub fn network_fallback_active() -> Result<bool> {
     fallback_marker_applies(&NetworkRuntimeOptions::default())
 }
 
+fn effective_approved_plan_path(options: &NetworkRuntimeOptions) -> &Path {
+    if options.network_plan_path == Path::new(DEFAULT_CONTROL_NETPLAN) {
+        let runtime = Path::new(EFFECTIVE_RUNTIME_NETPLAN);
+        if fs::symlink_metadata(runtime)
+            .is_ok_and(|meta| meta.file_type().is_file() && meta.len() > 0)
+        {
+            return runtime;
+        }
+    }
+    &options.network_plan_path
+}
+
 fn selected_network_plan_path(options: &NetworkRuntimeOptions) -> Result<&Path> {
     Ok(network_plan_path_for_fallback(
         options,
@@ -224,7 +238,7 @@ fn fallback_marker_applies(options: &NetworkRuntimeOptions) -> Result<bool> {
                 "Nest network fallback marker",
             )?;
             let approved = read_bounded_regular_file(
-                &options.network_plan_path,
+                effective_approved_plan_path(options),
                 MAX_NETWORK_PLAN_BYTES,
                 "approved Nest network plan",
             )?;
@@ -255,7 +269,7 @@ fn network_plan_path_for_fallback(options: &NetworkRuntimeOptions, fallback_acti
     if fallback_active {
         &options.fallback_network_plan_path
     } else {
-        &options.network_plan_path
+        effective_approved_plan_path(options)
     }
 }
 

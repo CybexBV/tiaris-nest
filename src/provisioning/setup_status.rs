@@ -26,8 +26,11 @@ pub const SETUP_STATUS_PATH: &str = "/run/tiaris-nest-setup/status.json";
 pub const SETUP_STATUS_SCHEMA: &str = "tiaris.nest-setup-status.v1";
 const MAX_STATUS_BYTES: usize = 16 * 1024;
 // Keep these synchronized with Tiaris's Nest provisioning admission.
+// Linux MemTotal on a nominal 8 GiB machine is ~7.5-7.9 GiB after BIOS/ACPI/iGPU
+// reservations; accept 7.25 GiB (7,424 MiB) usable RAM while displaying "8 GiB".
 const MIN_CPU_CORES: u32 = 4;
-const MIN_MEMORY_BYTES: u64 = 8 * GIB;
+const MIN_MEMORY_BYTES: u64 = 7_424 * 1024 * 1024;
+const ADVERTISED_MIN_MEMORY_BYTES: u64 = 8 * GIB;
 const GIB: u64 = 1024 * 1024 * 1024;
 const PROGRESS_PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_VALUE_CHARS: usize = 80;
@@ -403,7 +406,7 @@ pub(super) fn inventory_checks(
             format!(
                 "{} · needs {}",
                 format_insufficient_memory(inventory.memory_bytes),
-                format_memory(MIN_MEMORY_BYTES)
+                format_memory(ADVERTISED_MIN_MEMORY_BYTES)
             ),
         )
     });
@@ -480,10 +483,10 @@ pub(super) fn format_memory(bytes: u64) -> String {
 }
 
 /// Below the floor, rounding up could print the minimum itself. Show a
-/// truncated tenth instead so "7.6 GiB · needs 8 GiB" stays truthful.
+/// truncated tenth instead so "7.2 GiB · needs 8 GiB" stays truthful.
 fn format_insufficient_memory(bytes: u64) -> String {
     let rounded = (bytes + GIB / 2) / GIB;
-    if rounded * GIB < MIN_MEMORY_BYTES {
+    if rounded * GIB < ADVERTISED_MIN_MEMORY_BYTES {
         return format!("{rounded} GiB");
     }
     let tenths = bytes * 10 / GIB;

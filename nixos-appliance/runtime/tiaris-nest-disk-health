@@ -2,7 +2,7 @@
 """Collect root-level SMART disk health and EFI/state/root storage statistics.
 
 Runs as a bounded root oneshot so tiaris-nest.service keeps PrivateDevices=true.
-Writes /run/tiaris-nest/disk-health.json atomically (mode 0644, <= 8 KiB).
+Writes /run/tiaris-nest-disk-health/disk-health.json atomically (mode 0640 root:tiaris-nest, <= 8 KiB).
 """
 import datetime
 import json
@@ -10,9 +10,9 @@ import os
 from pathlib import Path
 import subprocess
 
-from appliance_state import GID, UID, canonical, directory, write
+from appliance_state import GID, canonical, directory, write
 
-OUTPUT = Path('/run/tiaris-nest/disk-health.json')
+OUTPUT = Path('/run/tiaris-nest-disk-health/disk-health.json')
 MAX_BYTES = 8192
 STORAGE_PATHS = {
     'efi': '/boot',
@@ -252,11 +252,11 @@ def main():
         'storage': collect_storage(),
         'disk_health': smart,
     }
-    body = canonical(document) + b'\n'
+    body = canonical(document)
     if len(body) > MAX_BYTES:
         raise ValueError('disk-health document exceeds 8 KiB bound')
-    directory(OUTPUT.parent, 0o755, UID, GID)
-    write(OUTPUT, body, mode=0o644, group=0)
+    directory(OUTPUT.parent, 0o750, 0, GID)
+    write(OUTPUT, body, mode=0o640, group=GID)
 
 
 if __name__ == '__main__':

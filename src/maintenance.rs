@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 const APPLIANCE_UPDATE_LOCK: &str = "/run/lock/tiaris-nest/appliance-update.lock";
 const CONTROL: &str = "/var/lib/tiaris-nest/control";
 
-fn generation_recovery_pending(control: &Path) -> bool {
+pub(crate) fn generation_recovery_pending(control: &Path) -> bool {
     [
         "system-prepare-intent.json",
         "pending-system-generation.json",

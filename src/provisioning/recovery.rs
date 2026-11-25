@@ -60,7 +60,7 @@ pub(super) async fn initial_session(
     client: &protocol::ProvisioningClient,
     verified: &protocol::VerifiedEnvelope,
     key: &SigningKey,
-    inventory: &NestProvisioningInventory,
+    inventory: &mut NestProvisioningInventory,
     hardware_digest: &str,
 ) -> Result<(protocol::AgentSessionResponse, bool)> {
     match client.poll_plan(key).await {
@@ -77,7 +77,7 @@ pub(super) async fn initial_session(
     // Never claim after a retired-key, transport or server error. An unclaimed
     // session still requires its media secret and explicit Console approval.
     let session = client
-        .claim(
+        .claim_with_legacy_fallback(
             &verified.envelope.media_secret,
             key,
             inventory,

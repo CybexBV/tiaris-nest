@@ -17,6 +17,9 @@ umask 077
 
 control_dir=/var/lib/tiaris-nest/control
 approved="$control_dir/netplan-approved.json"
+if [[ -s /run/tiaris-nest-network/netplan-approved.json ]]; then
+  approved=/run/tiaris-nest-network/netplan-approved.json
+fi
 fallback="$control_dir/netplan-dhcp-fallback.json"
 active=/etc/netplan/90-tiaris-nest.yaml
 plan="$control_dir/install-plan.json"
