@@ -114,7 +114,18 @@ enum Command {
         control_dir: PathBuf,
         #[arg(
             long,
-            default_value = "/run/tiaris-nest/network-reconfigure-status.json"
+            default_value = "/run/tiaris-nest-network/reconfigure-status.json"
+        )]
+        status_path: PathBuf,
+    },
+    /// Revert any candidate network left active by an interrupted or killed
+    /// `apply-network-reconfigure` run (`ExecStopPost` recovery handler).
+    RecoverNetworkReconfigure {
+        #[arg(long, default_value = "/var/lib/tiaris-nest/control")]
+        control_dir: PathBuf,
+        #[arg(
+            long,
+            default_value = "/run/tiaris-nest-network/reconfigure-status.json"
         )]
         status_path: PathBuf,
     },
@@ -223,6 +234,16 @@ async fn main() -> Result<()> {
             require_root()?;
             tiaris_nest::network_reconfigure::apply_reconfiguration_as_root(
                 &inbox,
+                &control_dir,
+                &status_path,
+            )
+        }
+        Command::RecoverNetworkReconfigure {
+            control_dir,
+            status_path,
+        } => {
+            require_root()?;
+            tiaris_nest::network_reconfigure::recover_interrupted_reconfiguration_as_root(
                 &control_dir,
                 &status_path,
             )

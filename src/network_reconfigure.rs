@@ -47,20 +47,26 @@ pub(crate) const SCHEMA: &str = "tiaris.nest.network-supersession.v1";
 pub(crate) const DOMAIN: &str = "TIARIS-NEST-NETWORK-SUPERSESSION-V1";
 pub(crate) const REPORT_SCHEMA: &str = "tiaris.nest.network-reconfigure-report.v1";
 const INBOX_FILE: &str = "network-reconfigure.json";
-const STATUS_DIR: &str = "/run/tiaris-nest";
-const STATUS_FILE: &str = "network-reconfigure-status.json";
+const STATUS_DIR: &str = "/run/tiaris-nest-network";
+const STATUS_FILE: &str = "reconfigure-status.json";
+const PENDING_REVERT_YAML: &str = "pending-revert.yaml";
+const PENDING_REVERT_META: &str = "pending-revert.json";
+const LAST_OUTCOME_FILE: &str = "network-reconfigure-last.json";
 pub(crate) const SUPERSESSION_FILE: &str = "network-supersession.json";
 pub(crate) const EFFECTIVE_NETWORK_DIR: &str = "/run/tiaris-nest-network";
 pub(crate) const PROVISIONING_KEYS_PATH: &str = "/usr/share/tiaris-nest/provisioning-public-keys";
 const ACTIVE_NETPLAN: &str = "/etc/netplan/90-tiaris-nest.yaml";
 const MAX_BYTES: u64 = 64 * 1024;
+const ADDRESS_WAIT_SECONDS: u64 = 20;
 const PROBE_DEADLINE_SECONDS: u64 = 90;
 const REVERT_PROBE_DEADLINE_SECONDS: u64 = 30;
-const MAX_APPLY_ITERATIONS: usize = 8;
+const MAX_APPLY_ITERATIONS: usize = 2;
+const MAX_DRAIN_START_ELAPSED_SECONDS: u64 = 240;
 
 pub(crate) fn shipped() -> bool {
     crate::appliance::nixos::is_nixos()
         && Path::new("/etc/systemd/system/tiaris-nest-network-reconfigure.service").is_file()
+        && Path::new("/var/lib/tiaris-nest/state/agent").is_dir()
 }
 
 /// Untyped outer wrapper so a malformed config lane never rejects unrelated
@@ -459,13 +465,32 @@ fn ensure_runtime_network_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PendingRevertMeta {
+    revision: i64,
+    applied_revision: Option<i64>,
+}
+
 /// Root execution entry point (`tiaris-nest-bootstrap apply-network-reconfigure`).
 pub fn apply_reconfiguration_as_root(
     inbox_path: &Path,
     control_dir: &Path,
     status_path: &Path,
 ) -> Result<()> {
-    for _ in 0..MAX_APPLY_ITERATIONS {
+    // Recover any interrupted candidate left behind by a prior hard crash or kill.
+    recover_interrupted_reconfiguration_in(
+        Path::new(EFFECTIVE_NETWORK_DIR),
+        control_dir,
+        status_path,
+    )?;
+    let started = Instant::now();
+    for iteration in 0..MAX_APPLY_ITERATIONS {
+        if iteration > 0
+            && started.elapsed() >= Duration::from_secs(MAX_DRAIN_START_ELAPSED_SECONDS)
+        {
+            break;
+        }
         let Some(raw_bytes) = read_inbox_bytes(inbox_path)? else {
             return Ok(());
         };
@@ -478,6 +503,66 @@ pub fn apply_reconfiguration_as_root(
         }
     }
     Ok(())
+}
+
+/// Recovery handler (`tiaris-nest-bootstrap recover-network-reconfigure`), wired
+/// as `ExecStopPost=` on `tiaris-nest-network-reconfigure.service`.
+///
+/// If a prior run was killed or timed out after activating a candidate Netplan
+/// and before committing `control/network-supersession.json`, this restores the
+/// snapshotted previous Netplan immediately so the Nest cannot be left stranded.
+pub fn recover_interrupted_reconfiguration_as_root(
+    control_dir: &Path,
+    status_path: &Path,
+) -> Result<()> {
+    recover_interrupted_reconfiguration_in(
+        Path::new(EFFECTIVE_NETWORK_DIR),
+        control_dir,
+        status_path,
+    )
+}
+
+fn recover_interrupted_reconfiguration_in(
+    runtime_dir: &Path,
+    control_dir: &Path,
+    status_path: &Path,
+) -> Result<()> {
+    let pending_yaml = runtime_dir.join(PENDING_REVERT_YAML);
+    let pending_meta = runtime_dir.join(PENDING_REVERT_META);
+    let previous = match read_bounded_nofollow(&pending_yaml, 1024 * 1024, "pending revert Netplan")
+    {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            let _ = fs::remove_file(&pending_meta);
+            return Ok(());
+        }
+    };
+    let meta: Option<PendingRevertMeta> =
+        read_bounded_nofollow(&pending_meta, 4096, "pending meta")
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+
+    let restore_result = atomic_write_root(Path::new(ACTIVE_NETPLAN), &previous, 0o600, 0)
+        .and_then(|()| run_netplan_activate());
+    let _ = fs::remove_file(&pending_yaml);
+    let _ = fs::remove_file(&pending_meta);
+    let _ = Command::new("/usr/lib/tiaris-nest/tiaris-nest-network-runtime").status();
+
+    if let Some(meta) = meta {
+        let reason = match &restore_result {
+            Ok(()) => "network reconfiguration was interrupted while testing the candidate network; reverted to previous network".to_string(),
+            Err(err) => format!("network reconfiguration was interrupted and automatic revert failed ({err})"),
+        };
+        let report = record_terminal_outcome(
+            control_dir,
+            meta.revision,
+            meta.applied_revision,
+            "reverted",
+            Some(&reason),
+        )?;
+        write_report(status_path, &report)?;
+    }
+    restore_result.context("revert interrupted candidate Netplan")
 }
 
 fn read_inbox_bytes(inbox_path: &Path) -> Result<Option<Vec<u8>>> {
@@ -544,6 +629,7 @@ fn apply_one_reconfiguration(
 
     let current_revision =
         load_current_supersession_revision(control_dir, &durable, &trusted_keys)?;
+    let last_outcome = load_last_outcome(control_dir);
 
     let raw_value: Value = match serde_json::from_slice(raw_bytes) {
         Ok(val) => val,
@@ -563,16 +649,23 @@ fn apply_one_reconfiguration(
         .and_then(Value::as_i64)
         .unwrap_or(0);
 
+    // Verify signature, identity binding, network, and CIDRs WITHOUT expiry first
+    // so an already-committed supersession never flips to "rejected: expired"
+    // after 7 days on reboot, and already-handled terminal outcomes are not retried.
+    let now = Utc::now();
     let doc = match verify_supersession_value_any_key(
         &raw_value,
         &trusted_keys,
         &durable.plan,
-        true,
-        Utc::now(),
+        false,
+        now,
     ) {
         Ok(doc) => doc,
         Err(err) => {
             if requested_revision > 0 {
+                if current_revision.is_some_and(|applied| requested_revision <= applied) {
+                    return Ok(());
+                }
                 write_status(
                     status_path,
                     requested_revision,
@@ -585,21 +678,57 @@ fn apply_one_reconfiguration(
         }
     };
 
+    // Already committed: re-run idempotent post-commit convergence steps so any
+    // earlier transient firewall/runtime failure is healed before reporting applied.
     if let Some(applied) = current_revision {
         if doc.revision <= applied {
+            if let Err(err) = converge_committed_network(control_dir) {
+                write_status(
+                    status_path,
+                    doc.revision,
+                    Some(applied),
+                    "pending",
+                    Some(&format!("post-commit service convergence pending: {err}")),
+                )?;
+                return Err(err);
+            }
             write_status(status_path, doc.revision, Some(applied), "applied", None)?;
             return Ok(());
         }
     }
 
+    // Already handled as terminal (`reverted` or `rejected`): re-project the
+    // durable outcome without re-applying the failed network on reboot.
+    if let Some(last) = last_outcome {
+        if doc.revision <= last.revision && matches!(last.status.as_str(), "reverted" | "rejected")
+        {
+            write_report(status_path, &last)?;
+            return Ok(());
+        }
+    }
+
+    // Enforce expiry only for genuinely new revisions that have not been applied or handled.
+    if now > doc.expires_at {
+        let report = record_terminal_outcome(
+            control_dir,
+            doc.revision,
+            current_revision,
+            "rejected",
+            Some("network supersession has expired"),
+        )?;
+        write_report(status_path, &report)?;
+        return Ok(());
+    }
+
     if crate::maintenance::generation_recovery_pending(control_dir) {
-        write_status(
-            status_path,
+        let report = record_terminal_outcome(
+            control_dir,
             doc.revision,
             current_revision,
             "rejected",
             Some("Nest is finishing a system update; retry once the update completes"),
         )?;
+        write_report(status_path, &report)?;
         return Ok(());
     }
 
@@ -607,13 +736,14 @@ fn apply_one_reconfiguration(
         match acquire_reconfigure_lease(control_dir)? {
             Some(lease) => Some(lease),
             None => {
-                write_status(
-                    status_path,
+                let report = record_terminal_outcome(
+                    control_dir,
                     doc.revision,
                     current_revision,
                     "rejected",
                     Some("Nest is busy with maintenance or a build; retry shortly"),
                 )?;
+                write_report(status_path, &report)?;
                 return Ok(());
             }
         }
@@ -623,8 +753,8 @@ fn apply_one_reconfiguration(
 
     // Pre-validate candidate management CIDRs with nft --check BEFORE switching live network.
     if let Err(err) = prevalidate_firewall_cidrs(control_dir, &doc.management_cidrs) {
-        write_status(
-            status_path,
+        let report = record_terminal_outcome(
+            control_dir,
             doc.revision,
             current_revision,
             "rejected",
@@ -632,14 +762,27 @@ fn apply_one_reconfiguration(
                 "candidate management CIDRs failed firewall validation: {err}"
             )),
         )?;
+        write_report(status_path, &report)?;
         return Ok(());
     }
 
     write_status(status_path, doc.revision, current_revision, "pending", None)?;
 
     // Snapshot the ACTUAL active Netplan (preserving DHCP fallback if active)
-    // before touching the live link.
+    // and persist the recovery marker BEFORE touching the live link so any
+    // kill/timeout/crash is automatically reverted by ExecStopPost or next start.
     let previous_netplan = snapshot_active_netplan(control_dir)?;
+    let runtime_dir = Path::new(EFFECTIVE_NETWORK_DIR);
+    ensure_runtime_network_dir(runtime_dir)?;
+    let pending_yaml = runtime_dir.join(PENDING_REVERT_YAML);
+    let pending_meta = runtime_dir.join(PENDING_REVERT_META);
+    atomic_write_root(&pending_yaml, &previous_netplan, 0o600, 0)?;
+    let meta_bytes = serde_json::to_vec(&PendingRevertMeta {
+        revision: doc.revision,
+        applied_revision: current_revision,
+    })?;
+    atomic_write_root(&pending_meta, &meta_bytes, 0o600, 0)?;
+
     let candidate_netplan =
         crate::provisioning::render_netplan_for_plan(&doc.network, &durable.plan);
     let candidate_bytes = serde_json::to_vec(&candidate_netplan)?;
@@ -647,8 +790,22 @@ fn apply_one_reconfiguration(
     let activated = atomic_write_root(Path::new(ACTIVE_NETPLAN), &candidate_bytes, 0o600, 0)
         .and_then(|()| run_netplan_activate());
 
-    let reachable = if activated.is_ok() {
-        probe_manage_reachable(origin, Duration::from_secs(PROBE_DEADLINE_SECONDS))
+    let probe_start = Instant::now();
+    let candidate_ip = if activated.is_ok() {
+        wait_for_candidate_ipv4(
+            &durable.plan.network_interface.name,
+            &doc.network,
+            Duration::from_secs(ADDRESS_WAIT_SECONDS),
+        )
+    } else {
+        None
+    };
+
+    let reachable = if let Some(ip) = candidate_ip {
+        let remaining =
+            Duration::from_secs(PROBE_DEADLINE_SECONDS).saturating_sub(probe_start.elapsed());
+        let budget = remaining.max(Duration::from_secs(15));
+        probe_manage_reachable(origin, Some(ip), budget)
     } else {
         false
     };
@@ -658,29 +815,40 @@ fn apply_one_reconfiguration(
         let restore_result =
             atomic_write_root(Path::new(ACTIVE_NETPLAN), &previous_netplan, 0o600, 0)
                 .and_then(|()| run_netplan_activate());
+        let _ = fs::remove_file(&pending_yaml);
+        let _ = fs::remove_file(&pending_meta);
+        let _ = Command::new("/usr/lib/tiaris-nest/tiaris-nest-network-runtime").status();
         let recovered = restore_result.is_ok()
-            && probe_manage_reachable(origin, Duration::from_secs(REVERT_PROBE_DEADLINE_SECONDS));
-        let reason = match (&activated, &restore_result, recovered) {
-            (Err(err), Ok(()), true) => {
+            && probe_manage_reachable(
+                origin,
+                None,
+                Duration::from_secs(REVERT_PROBE_DEADLINE_SECONDS),
+            );
+        let reason = match (&activated, candidate_ip, &restore_result, recovered) {
+            (Err(err), _, Ok(()), true) => {
                 format!("candidate network failed to activate ({err}); reverted to previous network")
             }
-            (Ok(()), Ok(()), true) => {
-                "Manage could not be reached on the new network within 90 seconds; reverted to previous network".to_string()
+            (Ok(()), None, Ok(()), true) => {
+                "candidate IPv4 address did not become active on the managed interface; reverted to previous network".to_string()
             }
-            (_, Ok(()), false) => {
+            (Ok(()), Some(_), Ok(()), true) => {
+                "Manage could not be reached from the candidate network within 90 seconds; reverted to previous network".to_string()
+            }
+            (_, _, Ok(()), false) => {
                 "candidate network could not reach Manage; restored previous network profile (Manage recovery pending)".to_string()
             }
-            (_, Err(restore_err), _) => {
+            (_, _, Err(restore_err), _) => {
                 format!("candidate network failed and revert activation failed ({restore_err})")
             }
         };
-        write_status(
-            status_path,
+        let report = record_terminal_outcome(
+            control_dir,
             doc.revision,
             current_revision,
             "reverted",
             Some(&reason),
         )?;
+        write_report(status_path, &report)?;
         if let Err(restore_err) = restore_result {
             return Err(restore_err).context("revert active Netplan after failed reconfiguration");
         }
@@ -691,15 +859,49 @@ fn apply_one_reconfiguration(
     // control/netplan-approved.json and control/management-cidrs.txt remain
     // unchanged so predecessor generation rollbacks validate cleanly.
     let supersession_bytes = serde_json::to_vec(&raw_value)?;
-    atomic_write_root(
+    if let Err(commit_err) = atomic_write_root(
         &control_dir.join(SUPERSESSION_FILE),
         &supersession_bytes,
         0o600,
         0,
-    )?;
+    ) {
+        let _ = atomic_write_root(Path::new(ACTIVE_NETPLAN), &previous_netplan, 0o600, 0)
+            .and_then(|()| run_netplan_activate());
+        let _ = fs::remove_file(&pending_yaml);
+        let _ = fs::remove_file(&pending_meta);
+        let _ = Command::new("/usr/lib/tiaris-nest/tiaris-nest-network-runtime").status();
+        return Err(commit_err).context("commit durable network supersession");
+    }
     let _ = fs::remove_file(control_dir.join("network-fallback-active"));
+    let _ = fs::remove_file(control_dir.join(LAST_OUTCOME_FILE));
     let _ = File::open(control_dir).and_then(|d| d.sync_all());
+    // Candidate is now durably committed; clear pending-revert marker so
+    // network-runtime reconciliation resumes on the committed projections.
+    let _ = fs::remove_file(&pending_yaml);
+    let _ = fs::remove_file(&pending_meta);
 
+    if let Err(err) = converge_committed_network(control_dir) {
+        write_status(
+            status_path,
+            doc.revision,
+            Some(doc.revision),
+            "pending",
+            Some(&format!("post-commit service convergence pending: {err}")),
+        )?;
+        return Err(err);
+    }
+
+    write_status(
+        status_path,
+        doc.revision,
+        Some(doc.revision),
+        "applied",
+        None,
+    )?;
+    Ok(())
+}
+
+fn converge_committed_network(control_dir: &Path) -> Result<()> {
     materialize_effective_network(
         control_dir,
         Path::new(EFFECTIVE_NETWORK_DIR),
@@ -719,15 +921,38 @@ fn apply_one_reconfiguration(
         "systemctl",
         &["--no-block", "start", "tiaris-nest-assist-turn.service"],
     )?;
-
-    write_status(
-        status_path,
-        doc.revision,
-        Some(doc.revision),
-        "applied",
-        None,
-    )?;
     Ok(())
+}
+
+fn load_last_outcome(control_dir: &Path) -> Option<Report> {
+    let bytes =
+        read_bounded_nofollow(&control_dir.join(LAST_OUTCOME_FILE), 8192, "last outcome").ok()?;
+    let report: Report = serde_json::from_slice(&bytes).ok()?;
+    if report.schema != REPORT_SCHEMA || report.revision <= 0 {
+        return None;
+    }
+    Some(report)
+}
+
+fn record_terminal_outcome(
+    control_dir: &Path,
+    revision: i64,
+    applied_revision: Option<i64>,
+    status: &str,
+    error: Option<&str>,
+) -> Result<Report> {
+    let report = Report {
+        schema: REPORT_SCHEMA.to_string(),
+        revision,
+        applied_revision,
+        status: status.to_string(),
+        error: error.map(|e| e.trim().chars().take(240).collect()),
+        checked_at: Utc::now(),
+    };
+    let mut body = serde_json::to_vec(&report)?;
+    body.push(b'\n');
+    atomic_write_root(&control_dir.join(LAST_OUTCOME_FILE), &body, 0o600, 0)?;
+    Ok(report)
 }
 
 fn snapshot_active_netplan(control_dir: &Path) -> Result<Vec<u8>> {
@@ -826,27 +1051,107 @@ fn is_valid_manage_health_body(body: &[u8]) -> bool {
         && value.get("service").and_then(Value::as_str) == Some("tiaris")
 }
 
-fn probe_manage_reachable(origin: &str, budget: Duration) -> bool {
+fn select_candidate_ipv4_from_ip_json(
+    stdout: &[u8],
+    network: &NestProvisioningNetworkPlan,
+) -> Option<Ipv4Addr> {
+    let devices: Value = serde_json::from_slice(stdout).ok()?;
+    let expected_static: Option<Ipv4Addr> = if network.mode == "static" {
+        network
+            .address_cidr
+            .as_deref()
+            .and_then(|cidr| cidr.split_once('/'))
+            .and_then(|(addr, _)| addr.parse::<Ipv4Addr>().ok())
+    } else {
+        None
+    };
+    for dev in devices.as_array()? {
+        let Some(infos) = dev.get("addr_info").and_then(Value::as_array) else {
+            continue;
+        };
+        for info in infos {
+            if info.get("family").and_then(Value::as_str) != Some("inet")
+                || info.get("scope").and_then(Value::as_str) != Some("global")
+            {
+                continue;
+            }
+            let Some(local) = info
+                .get("local")
+                .and_then(Value::as_str)
+                .and_then(|s| s.parse::<Ipv4Addr>().ok())
+            else {
+                continue;
+            };
+            if local.is_unspecified() || local.is_loopback() || local.is_link_local() {
+                continue;
+            }
+            if let Some(target) = expected_static {
+                if local == target {
+                    return Some(local);
+                }
+            } else if info.get("dynamic").and_then(Value::as_bool) == Some(true) {
+                return Some(local);
+            }
+        }
+    }
+    None
+}
+
+fn wait_for_candidate_ipv4(
+    interface_name: &str,
+    network: &NestProvisioningNetworkPlan,
+    budget: Duration,
+) -> Option<Ipv4Addr> {
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline {
+        if let Ok(output) = Command::new("ip")
+            .args([
+                "-j",
+                "-4",
+                "address",
+                "show",
+                "dev",
+                interface_name,
+                "scope",
+                "global",
+            ])
+            .output()
+        {
+            if output.status.success() {
+                if let Some(ip) = select_candidate_ipv4_from_ip_json(&output.stdout, network) {
+                    return Some(ip);
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    None
+}
+
+fn probe_manage_reachable(origin: &str, source_ip: Option<Ipv4Addr>, budget: Duration) -> bool {
     let deadline = Instant::now() + budget;
     let url = format!("{}/v1/health", origin.trim_end_matches('/'));
+    let bind_ip = source_ip.map(|ip| ip.to_string());
     while Instant::now() < deadline {
-        let output = Command::new("curl")
-            .args([
-                "--fail",
-                "--silent",
-                "--proto",
-                "=https",
-                "--tlsv1.2",
-                "--connect-timeout",
-                "5",
-                "--max-time",
-                "10",
-                "--noproxy",
-                "*",
-                &url,
-            ])
-            .output();
-        if let Ok(out) = output {
+        let mut cmd = Command::new("curl");
+        cmd.args([
+            "--fail",
+            "--silent",
+            "--proto",
+            "=https",
+            "--tlsv1.2",
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            "10",
+            "--noproxy",
+            "*",
+        ]);
+        if let Some(ip) = bind_ip.as_deref() {
+            cmd.args(["--interface", ip]);
+        }
+        cmd.arg(&url);
+        if let Ok(out) = cmd.output() {
             if out.status.success() && is_valid_manage_health_body(&out.stdout) {
                 return true;
             }
@@ -871,12 +1176,16 @@ fn write_status(
         error: error.map(|e| e.trim().chars().take(240).collect()),
         checked_at: Utc::now(),
     };
-    let mut body = serde_json::to_vec(&report)?;
+    write_report(path, &report)
+}
+
+fn write_report(path: &Path, report: &Report) -> Result<()> {
+    let mut body = serde_json::to_vec(report)?;
     body.push(b'\n');
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        ensure_runtime_network_dir(parent)?;
     }
-    atomic_write_root(path, &body, 0o644, 0)
+    atomic_write_root(path, &body, 0o640, 985)
 }
 
 fn atomic_write_root(path: &Path, body: &[u8], mode: u32, gid: u32) -> Result<()> {
@@ -1119,7 +1428,7 @@ mod tests {
         let durable = DurableProvisioningState {
             schema: "tiaris.nest.provisioning-state.v1".into(),
             session_id: plan.session_id,
-            manage_origin: "https://dev.tiaris.com".into(),
+            manage_origin: crate::provisioning::REQUIRED_MANAGE_ORIGIN.into(),
             management_signing_public_key_b64: pub_b64.clone(),
             device_private_key_b64: "priv".into(),
             device_public_key_b64: "pub".into(),
@@ -1200,6 +1509,159 @@ mod tests {
             eff_netplan["network"]["ethernets"]["tiaris-nest"]["addresses"][0],
             "10.20.30.40/24"
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn select_candidate_ipv4_matches_exact_static_or_dynamic_dhcp() {
+        let ip_json = br#"[
+            {
+                "ifname": "enp0s3",
+                "addr_info": [
+                    {"family": "inet", "local": "10.0.0.10", "scope": "global", "dynamic": false},
+                    {"family": "inet", "local": "10.20.30.40", "scope": "global", "dynamic": false},
+                    {"family": "inet", "local": "192.168.50.77", "scope": "global", "dynamic": true}
+                ]
+            }
+        ]"#;
+        let static_ok = NestProvisioningNetworkPlan {
+            mode: "static".into(),
+            interface_id: "pci-0000:00:03.0".into(),
+            address_cidr: Some("10.20.30.40/24".into()),
+            gateway: Some("10.20.30.1".into()),
+            dns_servers: vec!["1.1.1.1".into()],
+        };
+        assert_eq!(
+            select_candidate_ipv4_from_ip_json(ip_json, &static_ok),
+            Some(Ipv4Addr::new(10, 20, 30, 40))
+        );
+        let static_missing = NestProvisioningNetworkPlan {
+            address_cidr: Some("10.20.30.99/24".into()),
+            ..static_ok.clone()
+        };
+        assert_eq!(
+            select_candidate_ipv4_from_ip_json(ip_json, &static_missing),
+            None
+        );
+        let dhcp = NestProvisioningNetworkPlan {
+            mode: "dhcp".into(),
+            interface_id: "pci-0000:00:03.0".into(),
+            address_cidr: None,
+            gateway: None,
+            dns_servers: vec![],
+        };
+        assert_eq!(
+            select_candidate_ipv4_from_ip_json(ip_json, &dhcp),
+            Some(Ipv4Addr::new(192, 168, 50, 77))
+        );
+    }
+
+    #[test]
+    fn terminal_outcome_persists_across_reboots_and_prevents_replay() {
+        let root = std::env::temp_dir().join(format!("tiaris-net-last-{}", Uuid::new_v4()));
+        let control = root.join("control");
+        let status_dir = root.join("run");
+        fs::create_dir_all(&control).unwrap();
+        let status_path = status_dir.join(STATUS_FILE);
+
+        let key = SigningKey::from_bytes(&[13u8; 32]);
+        let pub_b64 = STANDARD.encode(key.verifying_key().to_bytes());
+        let plan = sample_plan();
+        let durable = DurableProvisioningState {
+            schema: "tiaris.nest.provisioning-state.v1".into(),
+            session_id: plan.session_id,
+            manage_origin: crate::provisioning::REQUIRED_MANAGE_ORIGIN.into(),
+            management_signing_public_key_b64: pub_b64.clone(),
+            device_private_key_b64: "priv".into(),
+            device_public_key_b64: "pub".into(),
+            device_public_key_fingerprint: "fp".into(),
+            next_event_sequence: 1,
+            identity_active: true,
+            installation_complete: true,
+            updated_at: Utc::now(),
+            plan: plan.clone(),
+        };
+        fs::write(
+            control.join("provisioning-state.json"),
+            serde_json::to_vec(&durable).unwrap(),
+        )
+        .unwrap();
+
+        // Persist a reverted outcome for revision 2.
+        let recorded = record_terminal_outcome(
+            &control,
+            2,
+            Some(1),
+            "reverted",
+            Some("Manage unreachable on candidate"),
+        )
+        .unwrap();
+        assert_eq!(recorded.revision, 2);
+        assert_eq!(recorded.status, "reverted");
+        assert_eq!(load_last_outcome(&control).unwrap().revision, 2);
+
+        // Replaying revision 2 from inbox (even if expired or still valid) re-projects
+        // the durable "reverted" outcome without attempting network activation.
+        let now = Utc::now();
+        let rev2 = sign_doc(
+            &key,
+            json!({
+                "schema": SCHEMA,
+                "organization_id": plan.organization_id,
+                "device_id": plan.reserved_device_id,
+                "device_incarnation_id": Uuid::new_v4(),
+                "provisioning_session_id": plan.session_id,
+                "revision": 2,
+                "issued_at": now - chrono::Duration::days(10),
+                "expires_at": now - chrono::Duration::days(3),
+                "network": {
+                    "mode": "static",
+                    "interface_id": plan.network_interface.id,
+                    "address_cidr": "10.20.30.40/24",
+                    "gateway": "10.20.30.1",
+                    "dns_servers": ["10.20.30.53"]
+                },
+                "management_cidrs": ["10.20.30.0/24"]
+            }),
+        );
+        let rev2_bytes = serde_json::to_vec(&rev2).unwrap();
+        apply_one_reconfiguration(&root.join("inbox"), &rev2_bytes, &control, &status_path)
+            .unwrap();
+        let projected = report_from(&status_dir).unwrap();
+        assert_eq!(projected.revision, 2);
+        assert_eq!(projected.status, "reverted");
+        assert_eq!(projected.applied_revision, Some(1));
+
+        // A genuinely new expired revision 3 is rejected and persisted durably.
+        let rev3 = sign_doc(
+            &key,
+            json!({
+                "schema": SCHEMA,
+                "organization_id": plan.organization_id,
+                "device_id": plan.reserved_device_id,
+                "device_incarnation_id": Uuid::new_v4(),
+                "provisioning_session_id": plan.session_id,
+                "revision": 3,
+                "issued_at": now - chrono::Duration::days(10),
+                "expires_at": now - chrono::Duration::days(3),
+                "network": {
+                    "mode": "dhcp",
+                    "interface_id": plan.network_interface.id,
+                    "address_cidr": null,
+                    "gateway": null,
+                    "dns_servers": []
+                },
+                "management_cidrs": ["10.20.30.0/24"]
+            }),
+        );
+        let rev3_bytes = serde_json::to_vec(&rev3).unwrap();
+        apply_one_reconfiguration(&root.join("inbox"), &rev3_bytes, &control, &status_path)
+            .unwrap();
+        let projected3 = report_from(&status_dir).unwrap();
+        assert_eq!(projected3.revision, 3);
+        assert_eq!(projected3.status, "rejected");
+        assert_eq!(load_last_outcome(&control).unwrap().revision, 3);
 
         let _ = fs::remove_dir_all(&root);
     }

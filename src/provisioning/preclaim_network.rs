@@ -194,7 +194,7 @@ pub fn apply_networkd_config_with_reload(
     let mut resolved = config.clone();
     if resolved.interface_mac.is_none() {
         let detected = wired_interfaces();
-        resolved.interface_mac = resolve_target_mac(None, &detected)?;
+        resolved.interface_mac = Some(resolve_target_mac(None, &detected)?);
     }
     apply_networkd_config_to(Path::new(NETWORKD_DIR), &resolved, reload)
 }
@@ -218,29 +218,28 @@ fn ensure_networkd_dir(networkd_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn resolve_target_mac(
-    requested: Option<&str>,
-    wired: &[(String, String, bool)],
-) -> Result<Option<String>> {
+fn resolve_target_mac(requested: Option<&str>, wired: &[(String, String, bool)]) -> Result<String> {
     if let Some(mac) = requested {
-        return Ok(Some(mac.to_string()));
+        return Ok(mac.to_string());
     }
     if wired.is_empty() {
-        return Ok(None);
+        bail!(
+            "no wired ethernet interface is visible yet; refusing wildcard static IPv4 assignment"
+        );
     }
     let up: Vec<&(String, String, bool)> = wired.iter().filter(|(_, _, link)| *link).collect();
     if up.len() == 1 && !up[0].1.is_empty() {
-        return Ok(Some(up[0].1.clone()));
+        return Ok(up[0].1.clone());
     }
     if up.is_empty() && wired.len() == 1 && !wired[0].1.is_empty() {
-        return Ok(Some(wired[0].1.clone()));
+        return Ok(wired[0].1.clone());
     }
     if wired.len() > 1 {
         bail!(
             "multiple wired interfaces detected; specify interface_mac to avoid duplicate static IP addresses"
         );
     }
-    Ok(None)
+    bail!("could not determine a unique wired interface MAC address")
 }
 
 fn apply_networkd_config_to(
@@ -248,6 +247,9 @@ fn apply_networkd_config_to(
     config: &ValidatedPreclaimNetwork,
     reload: bool,
 ) -> Result<()> {
+    if config.interface_mac.is_none() {
+        bail!("pre-claim static IPv4 requires a resolved interface MAC address");
+    }
     ensure_networkd_dir(networkd_dir)?;
     let target = networkd_dir.join(PRECLAIM_NETWORK_FILE);
     let body = config.render_networkd_unit();
@@ -695,6 +697,7 @@ dns_servers = ["1.1.1.1"]
         fs::create_dir_all(&dir).unwrap();
         let cfg = parse_and_validate_toml(
             r#"
+interface_mac = "52:54:00:00:00:01"
 address_cidr = "10.0.0.50/24"
 gateway = "10.0.0.1"
 dns_servers = ["10.0.0.1"]
@@ -705,20 +708,26 @@ dns_servers = ["10.0.0.1"]
         assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o755);
         apply_networkd_config_to(&dir, &cfg, false).unwrap();
         let content = fs::read_to_string(dir.join(PRECLAIM_NETWORK_FILE)).unwrap();
-        assert!(content.contains("Name=en* eth*"));
+        assert!(content.contains("MACAddress=52:54:00:00:00:01"));
         assert!(content.contains("Address=10.0.0.50/24"));
+        let unresolved = parse_and_validate_toml(
+            "address_cidr = \"10.0.0.50/24\"\ngateway = \"10.0.0.1\"\ndns_servers = [\"10.0.0.1\"]\n",
+        )
+        .unwrap();
+        assert!(apply_networkd_config_to(&dir, &unresolved, false).is_err());
         fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn target_mac_resolution_picks_single_up_nic_and_rejects_multi_nic_ambiguity() {
+        assert!(resolve_target_mac(None, &[]).is_err());
         let single_up = vec![
             ("eno1".into(), "52:54:00:00:00:01".into(), true),
             ("eno2".into(), "52:54:00:00:00:02".into(), false),
         ];
         assert_eq!(
-            resolve_target_mac(None, &single_up).unwrap().as_deref(),
-            Some("52:54:00:00:00:01")
+            resolve_target_mac(None, &single_up).unwrap(),
+            "52:54:00:00:00:01"
         );
         let two_up = vec![
             ("eno1".into(), "52:54:00:00:00:01".into(), true),
@@ -726,10 +735,8 @@ dns_servers = ["10.0.0.1"]
         ];
         assert!(resolve_target_mac(None, &two_up).is_err());
         assert_eq!(
-            resolve_target_mac(Some("52:54:00:00:00:02"), &two_up)
-                .unwrap()
-                .as_deref(),
-            Some("52:54:00:00:00:02")
+            resolve_target_mac(Some("52:54:00:00:00:02"), &two_up).unwrap(),
+            "52:54:00:00:00:02"
         );
         // Network/broadcast addresses must be rejected.
         assert!(parse_and_validate_toml(

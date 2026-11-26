@@ -103,12 +103,30 @@ pub(super) fn active_plan(
         .context("active recovery session omitted its signed plan")?;
     // Expiry may pass after acknowledgement. Tiaris's exact seq1/seq2 replay
     // fences below still reject expired unacknowledged or superseded authority.
-    let plan = protocol::verify_durable_install_plan(
-        value,
+    let plan = match protocol::verify_durable_install_plan(
+        value.clone(),
         &verified.signing_key,
         &verified.envelope,
         inventory,
-    )?;
+    ) {
+        Ok(plan) => plan,
+        Err(first_err)
+            if !inventory.disk_smart_health.is_empty()
+                || !inventory.disks_without_serial.is_empty() =>
+        {
+            let mut legacy = inventory.clone();
+            legacy.disk_smart_health.clear();
+            legacy.disks_without_serial.clear();
+            protocol::verify_durable_install_plan(
+                value,
+                &verified.signing_key,
+                &verified.envelope,
+                &legacy,
+            )
+            .map_err(|_| first_err)?
+        }
+        Err(err) => return Err(err),
+    };
     if plan.schema != protocol::INSTALL_PLAN_SCHEMA_V3 {
         bail!("missing-state recovery requires an exact NixOS V3 plan")
     }

@@ -517,3 +517,92 @@ async fn a_generic_setup_closed_while_waiting_for_a_retry_claims_again() {
     // The personalized path keeps waiting, as before.
     assert!(personalized.is_err());
 }
+
+#[tokio::test]
+async fn claim_falls_back_cleanly_on_pre_release_manage_generic_400_and_recovers_plan() {
+    let (plan, verified, mut inventory) = fixture();
+    // Populate additive fields emitted on real bare-metal / VirtIO hardware.
+    inventory.disk_smart_health.insert(
+        "scsi-1".into(),
+        crate::provisioning::inventory::NestProvisioningDiskSmartHealth {
+            status: "ok".into(),
+            wear_percent: Some(5),
+            temperature_celsius: Some(34),
+            reallocated_sectors: None,
+        },
+    );
+    inventory.disks_without_serial.push("virtio-1".into());
+    let key = protocol::derive_provisioning_key(&verified.envelope.media_secret).unwrap();
+    let hardware = inventory::hardware_digest(&inventory).unwrap();
+
+    let state = Arc::new(Mutex::new(Server {
+        replies: VecDeque::from([
+            // Poll says unclaimed (401).
+            (StatusCode::UNAUTHORIZED, json!({"error": "unauthorized"})),
+            // Exact pre-release Manage (864b83bbc) response when deny_unknown_fields rejects additive fields.
+            (
+                StatusCode::BAD_REQUEST,
+                json!({
+                    "error": "invalid json body",
+                    "error_code": "invalid_request",
+                    "diagnostic_code": null
+                }),
+            ),
+            // Retry without disk_smart_health / disks_without_serial succeeds.
+            (
+                StatusCode::OK,
+                json!({
+                    "session_id": verified.envelope.session_id,
+                    "state": "awaiting_approval",
+                    "session_revision": 1,
+                    "poll_after_seconds": 2,
+                    "plan": null
+                }),
+            ),
+        ]),
+        ..Default::default()
+    }));
+    let (client, handle) = server(state.clone(), verified.envelope.session_id).await;
+    let (session, recovering) =
+        initial_session(&client, &verified, &key, &mut inventory, &hardware)
+            .await
+            .unwrap();
+    handle.abort();
+    assert!(!recovering);
+    assert_eq!(session.state, "awaiting_approval");
+    // Inventory was synchronized in place so inventory_sha256 matches legacy Manage's plan.
+    assert!(inventory.disk_smart_health.is_empty());
+    assert!(inventory.disks_without_serial.is_empty());
+    let requests = state.lock().unwrap().requests.clone();
+    assert_eq!(requests.len(), 3);
+    assert!(
+        requests[1].1["inventory"]
+            .get("disk_smart_health")
+            .is_some()
+    );
+    assert!(
+        requests[2].1["inventory"]
+            .get("disk_smart_health")
+            .is_none()
+    );
+    assert!(
+        requests[2].1["inventory"]
+            .get("disks_without_serial")
+            .is_none()
+    );
+
+    // Also verify interrupted-install recovery (`active_plan`) accepts a legacy-signed
+    // plan even if fresh boot inventory re-populates SMART / disks_without_serial.
+    let mut repopulated = inventory.clone();
+    repopulated.disk_smart_health.insert(
+        "scsi-1".into(),
+        crate::provisioning::inventory::NestProvisioningDiskSmartHealth {
+            status: "ok".into(),
+            wear_percent: Some(6),
+            temperature_celsius: Some(35),
+            reallocated_sectors: None,
+        },
+    );
+    let recovered = active_plan(&response(&plan, "installing"), &verified, &repopulated).unwrap();
+    assert_eq!(recovered.session_id, verified.envelope.session_id);
+}

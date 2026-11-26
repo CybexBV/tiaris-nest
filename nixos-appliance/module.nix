@@ -342,12 +342,19 @@ in {
       path = baseUnit.path ++ [ pkgs.iproute2 pkgs.nftables ];
       wantedBy = [ "multi-user.target" ];
       requires = [ "tiaris-nest-first-boot.service" ];
-      after = [ "tiaris-nest-first-boot.service" "tiaris-nest-network-guard.service" "tiaris-nest-generation-commit.service" ];
+      after = [
+        "tiaris-nest-first-boot.service"
+        "tiaris-nest-network-guard.service"
+        "tiaris-nest-generation-commit.service"
+        "tiaris-nest-network-runtime.service"
+        "tiaris-nest.service"
+      ];
       unitConfig.ConditionPathExists = "/var/lib/tiaris-nest/state/agent/network-reconfigure.json";
       serviceConfig = {
         Type = "oneshot";
         ExecStart = "${bootstrapPackage}/bin/tiaris-nest-bootstrap apply-network-reconfigure";
-        TimeoutStartSec = "300s";
+        ExecStopPost = "+${bootstrapPackage}/bin/tiaris-nest-bootstrap recover-network-reconfigure";
+        TimeoutStartSec = "600s";
         UMask = "0077";
       };
     };
