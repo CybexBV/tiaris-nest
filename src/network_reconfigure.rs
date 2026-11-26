@@ -579,6 +579,12 @@ pub fn apply_reconfiguration_as_root(
     let runtime_dir = Path::new(EFFECTIVE_NETWORK_DIR);
     // Recover any interrupted candidate left behind by a prior hard crash or kill.
     recover_interrupted_reconfiguration_in(runtime_dir, control_dir, status_path)?;
+    // Finish any earlier committed revision's unfinished post-commit convergence
+    // before reading the inbox so a newer rejected/reverted revision cannot
+    // clear retry-pending while leaving the prior commit unconverged.
+    if runtime_dir.join(PXE_RESTART_PENDING_FILE).exists() {
+        converge_committed_network(control_dir)?;
+    }
     let started = Instant::now();
     let mut needs_retry = false;
     for iteration in 0..MAX_APPLY_ITERATIONS {
@@ -1277,11 +1283,12 @@ fn converge_committed_network_once(control_dir: &Path) -> Result<()> {
         }
         // Respect tiaris-nest-network-guard's active DHCP fallback on boot:
         // never overwrite a verified DHCP rescue profile with an unreachable
-        // committed static profile. (Live commits remove network-fallback-active
+        // committed static profile, and propagate errors instead of failing open
+        // on a corrupt fallback marker. (Live commits remove network-fallback-active
         // above before calling converge_committed_network.)
         let fallback_active =
             crate::provisioning::fallback_marker_matches_bytes(control_dir, &effective_bytes)
-                .unwrap_or(false);
+                .context("inspect Nest network fallback marker before convergence")?;
         if !fallback_active {
             let active_matches =
                 read_bounded_nofollow(Path::new(ACTIVE_NETPLAN), 1024 * 1024, "active Netplan")
@@ -1289,9 +1296,13 @@ fn converge_committed_network_once(control_dir: &Path) -> Result<()> {
                     .is_some_and(|active| active == effective_bytes);
             if !active_matches {
                 atomic_write_root(Path::new(ACTIVE_NETPLAN), &effective_bytes, 0o600, 0)?;
-                run_netplan_activate()?;
                 mark_pxe_restart_pending(effective_dir);
             }
+            // Invoke the activator idempotently (without FORCE_RELOAD): when
+            // ACTIVE_NETPLAN and .applied-sha256 already match, it is a fast
+            // no-op; if a previous attempt wrote ACTIVE_NETPLAN and failed
+            // during networkctl reload, the missing stamp forces activation.
+            run_checked_cmd("/usr/lib/tiaris-nest/tiaris-nest-netplan-activate", &[])?;
         }
     }
 

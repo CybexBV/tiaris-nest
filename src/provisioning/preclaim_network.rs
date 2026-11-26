@@ -109,6 +109,7 @@ pub fn validate_config(config: PreclaimNetworkConfig) -> Result<ValidatedPreclai
         .context("pre-claim gateway must be an IPv4 address")?;
     let gw_raw = u32::from(gateway);
     if gateway == address
+        || gateway.is_link_local()
         || !same_ipv4_subnet(address, gateway, prefix)
         || gw_raw == net
         || gw_raw == bcast
