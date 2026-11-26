@@ -90,12 +90,19 @@ nix-build nixos-appliance/tests/memory-vm.nix -A driver \
   --argstr candidateBinary /absolute/path/to/candidate \
   --out-link /absolute/path/to/memory-driver
 mkdir -p /absolute/path/to/evidence
-/absolute/path/to/memory-driver/bin/nixos-test-driver \
+# Inside `agent-resource run` on The Beast: keep the VM disks in the lease
+# workspace, not in /run/user/<uid>, which is held in memory.
+runtime=$(mktemp -d "$AGENT_RESOURCE_WORKSPACE/rt.XXXX")
+XDG_RUNTIME_DIR=$runtime /absolute/path/to/memory-driver/bin/nixos-test-driver \
   -o /absolute/path/to/evidence
 ```
 
 Run the driver as an account with KVM access; it explicitly rejects software
-CPU emulation. Its temporary runtime path must fit Unix socket length limits.
+CPU emulation. The driver writes each VM's disk (several GB) and the shared
+exchange folder into `XDG_RUNTIME_DIR`; left at its default that is the
+memory-backed `/run/user/<uid>`, where a finished run's 8 GB disk once stayed
+behind after its lease closed. The path must also fit Unix socket length
+limits, so keep the workspace path short.
 Use `--arg memoryMiB 8192` for the smaller-runtime experiment and
 `--arg freePageReporting true` for a guest-reporting variant. The default fixture
 runs five cycles per binary without a timed soak. Keep production settings until
