@@ -579,12 +579,6 @@ pub fn apply_reconfiguration_as_root(
     let runtime_dir = Path::new(EFFECTIVE_NETWORK_DIR);
     // Recover any interrupted candidate left behind by a prior hard crash or kill.
     recover_interrupted_reconfiguration_in(runtime_dir, control_dir, status_path)?;
-    // Finish any earlier committed revision's unfinished post-commit convergence
-    // before reading the inbox so a newer rejected/reverted revision cannot
-    // clear retry-pending while leaving the prior commit unconverged.
-    if runtime_dir.join(PXE_RESTART_PENDING_FILE).exists() {
-        converge_committed_network(control_dir)?;
-    }
     let started = Instant::now();
     let mut needs_retry = false;
     for iteration in 0..MAX_APPLY_ITERATIONS {
@@ -595,8 +589,7 @@ pub fn apply_reconfiguration_as_root(
             break;
         }
         let Some(raw_bytes) = read_inbox_bytes(inbox_path)? else {
-            clear_retry_pending(runtime_dir);
-            return Ok(());
+            break;
         };
         match apply_one_reconfiguration(
             inbox_path,
@@ -621,13 +614,20 @@ pub fn apply_reconfiguration_as_root(
                 }
                 continue;
             }
-            _ => {
-                clear_retry_pending(runtime_dir);
-                return Ok(());
-            }
+            _ => break,
         }
     }
-    if needs_retry {
+    // Drain any unfinished post-commit convergence AFTER processing the inbox so
+    // a newer valid signed repair is never blocked by a failing prior commit,
+    // while a rejected/reverted newer revision cannot clear retry-pending and
+    // strand the prior commit's firewall, runtime, or PXE convergence.
+    if runtime_dir.join(PXE_RESTART_PENDING_FILE).exists() {
+        if let Err(err) = converge_committed_network(control_dir) {
+            mark_retry_pending(runtime_dir);
+            return Err(err);
+        }
+    }
+    if needs_retry || runtime_dir.join(PXE_RESTART_PENDING_FILE).exists() {
         mark_retry_pending(runtime_dir);
     } else {
         clear_retry_pending(runtime_dir);
@@ -978,6 +978,7 @@ fn apply_one_reconfiguration(
         if doc.revision <= applied {
             if let Err(err) = converge_committed_network(control_dir) {
                 mark_retry_pending(runtime_dir);
+                mark_pxe_restart_pending(runtime_dir);
                 write_status(
                     status_path,
                     doc.revision,
