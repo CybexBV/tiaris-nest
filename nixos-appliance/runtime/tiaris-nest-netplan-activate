@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Render the historical signed network JSON directly to networkd, without Netplan."""
+import hashlib
 import ipaddress
 import json
 import os
@@ -12,6 +13,7 @@ import time
 
 ACTIVE = Path('/etc/netplan/90-tiaris-nest.yaml')
 TARGET = Path('/run/systemd/network/10-tiaris-nest.network')
+APPLIED_STAMP = Path('/run/systemd/network/.10-tiaris-nest.applied-sha256')
 
 
 def prepare_runtime_directory(root, uid=0, gid=0):
@@ -82,6 +84,38 @@ def profile_selected(name, target):
     return bool(re.search(r'Network File:\s*' + re.escape(str(target)) + r'\s*$', status.stdout, re.MULTILINE))
 
 
+def applied_stamp_matches(stamp, body):
+    expected = (hashlib.sha256(body).hexdigest() + '\n').encode('ascii')
+    try:
+        fd = os.open(stamp, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return False
+    try:
+        with os.fdopen(fd, 'rb') as stream:
+            meta = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(meta.st_mode) or meta.st_uid != 0
+                    or meta.st_nlink != 1 or stat.S_IMODE(meta.st_mode) != 0o600):
+                return False
+            return stream.read(len(expected) + 1) == expected
+    except OSError:
+        return False
+
+
+def write_applied_stamp(stamp, body):
+    digest = (hashlib.sha256(body).hexdigest() + '\n').encode('ascii')
+    fd, temporary = tempfile.mkstemp(dir=stamp.parent, prefix='.tiaris-network-stamp-')
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            os.fchown(stream.fileno(), 0, 0)
+            stream.write(digest)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, stamp)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
 def main():
     import grp
     fd = os.open(ACTIVE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -96,7 +130,11 @@ def main():
     prepare_runtime_directory(TARGET.parents[2])
     network_gid = grp.getgrnam('systemd-network').gr_gid
     render_only = os.environ.get('TIARIS_NETWORK_RENDER_ONLY') == '1'
-    if not render_only and target_matches(TARGET, body, network_gid) and profile_selected(name, TARGET):
+    force_reload = os.environ.get('TIARIS_NETWORK_FORCE_RELOAD') == '1'
+    if (not render_only and not force_reload
+            and target_matches(TARGET, body, network_gid)
+            and applied_stamp_matches(APPLIED_STAMP, body)
+            and profile_selected(name, TARGET)):
         return
     fd, temporary = tempfile.mkstemp(dir=TARGET.parent, prefix='.tiaris-network-')
     try:
@@ -107,12 +145,14 @@ def main():
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, TARGET)
+        APPLIED_STAMP.unlink(missing_ok=True)
         if render_only:
             return
         subprocess.run(['networkctl', 'reload'], check=True)
         subprocess.run(['networkctl', 'reconfigure', name], check=True)
         for _ in range(60):
             if profile_selected(name, TARGET):
+                write_applied_stamp(APPLIED_STAMP, body)
                 return
             time.sleep(.5)
         raise RuntimeError('networkd did not select the managed profile')

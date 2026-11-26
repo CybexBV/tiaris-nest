@@ -125,7 +125,12 @@ pub fn validate_config(config: PreclaimNetworkConfig) -> Result<ValidatedPreclai
             .trim()
             .parse()
             .with_context(|| format!("pre-claim DNS server '{}' is not IPv4", entry.trim()))?;
-        if dns == address || dns.is_unspecified() || dns.is_multicast() || dns.is_broadcast() {
+        if dns == address
+            || dns.is_unspecified()
+            || dns.is_link_local()
+            || dns.is_multicast()
+            || dns.is_broadcast()
+        {
             bail!("pre-claim DNS server {dns} is invalid");
         }
         if !seen.insert(dns) {

@@ -126,6 +126,14 @@ struct IpAddressInfo {
     #[serde(default)]
     flags: Vec<String>,
     #[serde(default)]
+    tentative: bool,
+    #[serde(default)]
+    dadfailed: bool,
+    #[serde(default)]
+    deprecated: bool,
+    #[serde(default)]
+    secondary: bool,
+    #[serde(default)]
     preferred_life_time: serde_json::Value,
 }
 
@@ -257,6 +265,28 @@ pub fn network_fallback_active() -> Result<bool> {
     fallback_marker_applies(&NetworkRuntimeOptions::default())
 }
 
+pub(crate) fn fallback_marker_matches_bytes(control_dir: &Path, approved: &[u8]) -> Result<bool> {
+    let marker_path = control_dir.join("network-fallback-active");
+    match fs::symlink_metadata(&marker_path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file()
+                || metadata.len() == 0
+                || metadata.len() > 256
+                || metadata.nlink() != 1
+                || (unsafe { libc::geteuid() } == 0 && metadata.uid() != 0)
+                || metadata.mode() & 0o077 != 0
+            {
+                bail!("Nest network fallback marker is not a trusted root-owned file")
+            }
+            let marker: NetworkFallbackMarker =
+                read_bounded_json(&marker_path, 256, "Nest network fallback marker")?;
+            fallback_marker_matches_approved(&marker, approved)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).context("inspect Nest network fallback marker"),
+    }
+}
+
 fn effective_approved_plan_path(options: &NetworkRuntimeOptions) -> &Path {
     if options.network_plan_path == Path::new(DEFAULT_CONTROL_NETPLAN) {
         let runtime = Path::new(EFFECTIVE_RUNTIME_NETPLAN);
@@ -368,6 +398,10 @@ fn eligible_ipv4_addresses(devices: &[IpAddressDevice]) -> Result<Vec<Ipv4Addr>>
     for info in devices.iter().flat_map(|device| &device.addr_info) {
         if info.family != "inet"
             || info.scope != "global"
+            || info.tentative
+            || info.dadfailed
+            || info.deprecated
+            || info.secondary
             || info.flags.iter().any(|flag| {
                 matches!(
                     flag.as_str(),

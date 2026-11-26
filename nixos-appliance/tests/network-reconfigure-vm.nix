@@ -127,6 +127,13 @@ in import (nixpkgs + "/nixos/tests/make-test-python.nix") ({ pkgs, ... }: {
       system.activationScripts.reconfigure-fixture = {
         deps = [ "users" "tiaris-nest-public-assets" ];
         text = ''
+          # Add the VM fixture's provisioning signing key alongside the release key
+          # so incoming supersessions verify against /usr/share/tiaris-nest/provisioning-public-keys.
+          if ! grep -Fxq "$(cat ${pki}/prov.pub.b64)" /usr/share/tiaris-nest/provisioning-public-keys; then
+            { cat /usr/share/tiaris-nest/provisioning-public-keys; cat ${pki}/prov.pub.b64; echo; } > /usr/share/tiaris-nest/.provisioning-public-keys.tmp
+            chmod 0444 /usr/share/tiaris-nest/.provisioning-public-keys.tmp
+            mv /usr/share/tiaris-nest/.provisioning-public-keys.tmp /usr/share/tiaris-nest/provisioning-public-keys
+          fi
           install -d -m0750 -o root -g tiaris-nest /var/lib/tiaris-nest/control /var/lib/tiaris-nest/state /var/lib/tiaris-nest/status
           install -d -m0700 -o tiaris-nest -g tiaris-nest /var/lib/tiaris-nest/state/agent /var/lib/tiaris-nest/state/inbox
           install -d -m0755 -o tiaris-nest -g tiaris-nest /var/cache/tiaris-nest/www /var/cache/tiaris-nest/www/assets /var/cache/tiaris-nest/www/cache
@@ -366,5 +373,67 @@ PY
         machine.succeed("nft list table inet tiaris_nest | grep -F '10.99.0.0/24'")
         assert machine.succeed("cat /var/lib/tiaris-nest/control/netplan-approved.json") == orig_netplan
         assert machine.succeed("cat /var/lib/tiaris-nest/control/management-cidrs.txt") == orig_cidrs
+
+    with subtest("Case 4: static-to-DHCP reconfiguration acquires live DHCP lease and updates config"):
+        deliver_supersession(
+            4,
+            {
+                "mode": "dhcp",
+                "interface_id": "pci-0000:00:03.0",
+                "address_cidr": None,
+                "gateway": None,
+                "dns_servers": [],
+            },
+            ["10.0.0.0/24"],
+        )
+        machine.wait_until_succeeds(
+            "jq -e '.revision == 4 and .applied_revision == 4 and .status == \"applied\"' /run/tiaris-nest-network/reconfigure-status.json",
+            timeout=120,
+        )
+        dhcp_ip = machine.succeed(
+            "ip -j -4 address show dev eth1 scope global | jq -er 'first(.[].addr_info[] | select(.dynamic == true) | .local)'"
+        ).strip()
+        assert dhcp_ip.startswith("10.0.0.6"), f"unexpected DHCP IP: {dhcp_ip}"
+        machine.succeed(f"grep -Fx 'public_base_url = \"http://{dhcp_ip}\"' /etc/tiaris-nest/config.toml")
+        machine.succeed("test ! -f /run/tiaris-nest-network/retry-pending")
+
+    with subtest("Case 5: retry-pending marker triggers the retry timer and clears after convergence"):
+        machine.succeed("install -m 0600 /dev/null /run/tiaris-nest-network/retry-pending && printf '1\\n' > /run/tiaris-nest-network/retry-pending")
+        machine.wait_until_succeeds("test ! -f /run/tiaris-nest-network/retry-pending", timeout=120)
+        machine.succeed(
+            "jq -e '.revision == 4 and .applied_revision == 4 and .status == \"applied\"' /run/tiaris-nest-network/reconfigure-status.json"
+        )
+
+    with subtest("Case 6: boot convergence preserves active DHCP fallback after static supersession"):
+        deliver_supersession(
+            5,
+            {
+                "mode": "static",
+                "interface_id": "pci-0000:00:03.0",
+                "address_cidr": "10.0.0.25/24",
+                "gateway": "10.0.0.1",
+                "dns_servers": ["10.0.0.1"],
+            },
+            ["10.0.0.0/24"],
+        )
+        machine.wait_until_succeeds(
+            "jq -e '.revision == 5 and .applied_revision == 5 and .status == \"applied\"' /run/tiaris-nest-network/reconfigure-status.json",
+            timeout=90,
+        )
+        machine.succeed("ip -4 address show dev eth1 | grep -F '10.0.0.25/24'")
+        # Simulate tiaris-nest-network-guard selecting DHCP fallback on boot.
+        machine.succeed(
+            "approved_sha=$(sha256sum /run/tiaris-nest-network/netplan-approved.json | awk '{print $1}') && "
+            "jq -n --arg approved_sha256 \"$approved_sha\" '{schema:\"tiaris.nest.network-fallback.v1\",approved_sha256:$approved_sha256}' > /var/lib/tiaris-nest/control/network-fallback-active && "
+            "chmod 0600 /var/lib/tiaris-nest/control/network-fallback-active && "
+            "install -m 0600 /var/lib/tiaris-nest/control/netplan-dhcp-fallback.json /etc/netplan/90-tiaris-nest.yaml && "
+            "TIARIS_NETWORK_FORCE_RELOAD=1 /usr/lib/tiaris-nest/tiaris-nest-netplan-activate"
+        )
+        machine.wait_until_succeeds("ip -4 address show dev eth1 | grep -E '10\\.0\\.0\\.(6[0-9])/24'", timeout=45)
+        # Replaying tiaris-nest-network-reconfigure at boot must NOT overwrite active DHCP fallback.
+        machine.succeed("systemctl start tiaris-nest-network-reconfigure.service")
+        machine.succeed("cmp -s /etc/netplan/90-tiaris-nest.yaml /var/lib/tiaris-nest/control/netplan-dhcp-fallback.json")
+        machine.succeed("ip -4 address show dev eth1 | grep -E '10\\.0\\.0\\.(6[0-9])/24'")
+        machine.succeed("ping -c 1 10.0.0.1")
   '';
 }) { system = "x86_64-linux"; }

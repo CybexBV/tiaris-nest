@@ -41,6 +41,7 @@ pub(crate) fn render_netplan_for_plan(
 ) -> serde_json::Value {
     storage::netplan(network, plan)
 }
+pub(crate) use network_runtime::fallback_marker_matches_bytes;
 pub use network_runtime::{
     NetworkRuntimeOptions, NetworkRuntimeOutcome, network_fallback_active,
     reconcile_network_runtime,
@@ -341,10 +342,17 @@ pub fn validate_installed_state(
                 )?;
                 let raw: serde_json::Value = serde_json::from_slice(&body)
                     .context("parse committed network supersession")?;
-                let trusted_b64s: Vec<String> = keys
+                let mut trusted_b64s: Vec<String> = keys
                     .iter()
                     .map(|key| protocol::standard_base64(key.to_bytes()))
                     .collect();
+                if !durable.management_signing_public_key_b64.is_empty()
+                    && !trusted_b64s
+                        .iter()
+                        .any(|k| k == &durable.management_signing_public_key_b64)
+                {
+                    trusted_b64s.push(durable.management_signing_public_key_b64.clone());
+                }
                 let _ = crate::network_reconfigure::verify_supersession_value_any_key(
                     &raw,
                     &trusted_b64s,
