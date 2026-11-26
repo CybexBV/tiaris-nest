@@ -2,11 +2,16 @@
 import os
 from pathlib import Path
 import subprocess
+import sys
 from appliance_state import CONTROL, read, write
 
 EFFECTIVE = Path('/run/tiaris-nest-network/netplan-approved.json')
 if (CONTROL / 'network-supersession.json').exists():
-    subprocess.run(['/usr/lib/tiaris-nest/tiaris-nest-bootstrap', 'materialize-effective-network'], check=True)
+    try:
+        subprocess.run(['/usr/lib/tiaris-nest/tiaris-nest-bootstrap', 'materialize-effective-network'], check=True)
+    except subprocess.CalledProcessError as exc:
+        print(f'tiaris-nest-network-render: failed to materialize committed network supersession ({exc}); falling back to install-time network', file=sys.stderr)
+        EFFECTIVE.unlink(missing_ok=True)
 source = EFFECTIVE if EFFECTIVE.exists() else CONTROL / 'netplan-approved.json'
 write(Path('/etc/netplan/90-tiaris-nest.yaml'), read(source), mode=0o600, group=0)
 subprocess.run(['/usr/lib/tiaris-nest/tiaris-nest-netplan-activate'], check=True,

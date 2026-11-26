@@ -129,6 +129,14 @@ struct IpAddressInfo {
 }
 
 pub fn reconcile_network_runtime(options: NetworkRuntimeOptions) -> Result<NetworkRuntimeOutcome> {
+    // Pause background reconciliation while post-install network reconfiguration
+    // is actively staging/probing a candidate network so the 60s timer never
+    // writes an unverified candidate IP to config.toml or fails during a switch.
+    if options.network_plan_path == Path::new(DEFAULT_CONTROL_NETPLAN)
+        && fs::symlink_metadata("/run/tiaris-nest-network/pending-revert.yaml").is_ok()
+    {
+        return Ok(NetworkRuntimeOutcome::Unchanged);
+    }
     // netplan-approved.json is written during signed installation and replaced
     // only after Management has acknowledged a verified network change. Unlike
     // the immutable install plan, it therefore remains the durable source of

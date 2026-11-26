@@ -1025,11 +1025,15 @@ fn safe_http_error(status: StatusCode, body: &[u8]) -> anyhow::Error {
         .filter(|value| value.len() <= 64)
         .map(str::to_owned);
     let text = std::str::from_utf8(body).unwrap_or("");
-    let unknown_optional_inventory_field = matches!(
+    let legacy_invalid_json = status == StatusCode::BAD_REQUEST
+        && diagnostic_code.is_none()
+        && value.get("error").and_then(Value::as_str) == Some("invalid json body");
+    let explicit_unknown_field = matches!(
         status,
         StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
     ) && text.contains("unknown field")
         && (text.contains("disk_smart_health") || text.contains("disks_without_serial"));
+    let unknown_optional_inventory_field = legacy_invalid_json || explicit_unknown_field;
     ProvisioningHttpError {
         status,
         code: code.to_owned(),

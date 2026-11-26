@@ -109,7 +109,9 @@ in {
     unitConfig.DefaultDependencies = false;
     serviceConfig = {
       Type = "oneshot";
+      ExecStartPre = "${pkgs.systemd}/bin/udevadm settle --timeout=10";
       ExecStart = "${bootstrap}/bin/tiaris-nest-bootstrap apply-preclaim-usb --no-reload";
+      TimeoutStartSec = "30s";
       UMask = "0077";
     };
   };
