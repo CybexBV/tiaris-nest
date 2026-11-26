@@ -15,6 +15,7 @@ const MAX_NETWORK_PLAN_BYTES: u64 = 1024 * 1024;
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const DEFAULT_CONTROL_NETPLAN: &str = "/var/lib/tiaris-nest/control/netplan-approved.json";
 const EFFECTIVE_RUNTIME_NETPLAN: &str = "/run/tiaris-nest-network/netplan-approved.json";
+const RECONFIGURE_LOCK_PATH: &str = "/run/tiaris-nest-network/reconfigure.lock";
 
 #[derive(Clone, Debug)]
 pub struct NetworkRuntimeOptions {
@@ -128,15 +129,62 @@ struct IpAddressInfo {
     preferred_life_time: serde_json::Value,
 }
 
-pub fn reconcile_network_runtime(options: NetworkRuntimeOptions) -> Result<NetworkRuntimeOutcome> {
-    // Pause background reconciliation while post-install network reconfiguration
-    // is actively staging/probing a candidate network so the 60s timer never
-    // writes an unverified candidate IP to config.toml or fails during a switch.
-    if options.network_plan_path == Path::new(DEFAULT_CONTROL_NETPLAN)
-        && fs::symlink_metadata("/run/tiaris-nest-network/pending-revert.yaml").is_ok()
-    {
-        return Ok(NetworkRuntimeOutcome::Unchanged);
+struct ReconfigureLockGuard(Option<File>);
+
+impl Drop for ReconfigureLockGuard {
+    fn drop(&mut self) {
+        if let Some(file) = &self.0 {
+            use std::os::fd::AsRawFd;
+            unsafe {
+                libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
     }
+}
+
+fn try_acquire_reconfigure_lock(path: &Path) -> Result<Option<ReconfigureLockGuard>> {
+    use std::os::fd::AsRawFd;
+    let file = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Ok(Some(ReconfigureLockGuard(None)));
+        }
+        Err(err) => return Err(err).with_context(|| format!("open {}", path.display())),
+    };
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() || meta.nlink() != 1 || meta.uid() != 0 {
+        bail!("network reconfiguration lock file is unsafe");
+    }
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::WouldBlock {
+            return Ok(None);
+        }
+        return Err(err).with_context(|| format!("lock {}", path.display()));
+    }
+    Ok(Some(ReconfigureLockGuard(Some(file))))
+}
+
+pub fn reconcile_network_runtime(options: NetworkRuntimeOptions) -> Result<NetworkRuntimeOutcome> {
+    // Serialize with post-install network reconfiguration via a shared flock
+    // before checking the rollback marker so the 60s timer never races staging
+    // or publishes an unverified candidate IP to config.toml.
+    let _reconfigure_lock = if options.network_plan_path == Path::new(DEFAULT_CONTROL_NETPLAN) {
+        let Some(guard) = try_acquire_reconfigure_lock(Path::new(RECONFIGURE_LOCK_PATH))? else {
+            return Ok(NetworkRuntimeOutcome::Unchanged);
+        };
+        if fs::symlink_metadata("/run/tiaris-nest-network/pending-revert.yaml").is_ok() {
+            return Ok(NetworkRuntimeOutcome::Unchanged);
+        }
+        Some(guard)
+    } else {
+        None
+    };
     // netplan-approved.json is written during signed installation and replaced
     // only after Management has acknowledged a verified network change. Unlike
     // the immutable install plan, it therefore remains the durable source of

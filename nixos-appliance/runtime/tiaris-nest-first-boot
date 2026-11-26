@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 from appliance_state import CONTROL, STATUS, STATE, INBOX, UID, GID, current, directory, load, read, run, save, write
 from boot_next import start_from_this_disk_next_time
 from mount_policy import require_bind_mount, require_mount
@@ -114,7 +115,16 @@ def main():
     # and tiaris-nest-network-runtime.
     checking('The installed Nest does not pass its own check.')
     run('/usr/lib/tiaris-nest/tiaris-nest-bootstrap', 'validate-installed-state')
-    run('/usr/lib/tiaris-nest/tiaris-nest-bootstrap', 'materialize-effective-network')
+    try:
+        run('/usr/lib/tiaris-nest/tiaris-nest-bootstrap', 'materialize-effective-network')
+    except subprocess.CalledProcessError as exc:
+        print(
+            f'tiaris-nest-first-boot: ignoring unverifiable optional network supersession ({exc}); '
+            'falling back to install-time network',
+            file=sys.stderr,
+        )
+        for name in ('netplan-approved.json', 'management-cidrs.txt'):
+            (Path('/run/tiaris-nest-network') / name).unlink(missing_ok=True)
     checking('The Nest settings are not valid.')
     run('/usr/bin/tiaris-nest', '--config', '/etc/tiaris-nest/config.toml', 'validate-appliance-config')
     checking('The remote support (SSH) settings are not valid.')
