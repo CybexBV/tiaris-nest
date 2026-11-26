@@ -54,13 +54,11 @@ impl ValidatedPreclaimNetwork {
         format!("{}/{}", self.address, self.prefix)
     }
 
-    pub fn render_networkd_unit(&self) -> String {
-        let mut lines = vec!["[Match]".to_string()];
-        if let Some(mac) = &self.interface_mac {
-            lines.push(format!("MACAddress={mac}"));
-        } else {
-            lines.push("Name=en* eth*".to_string());
-        }
+    pub fn render_networkd_unit(&self) -> Result<String> {
+        let mac = self.interface_mac.as_deref().ok_or_else(|| {
+            anyhow!("pre-claim static IPv4 requires a resolved interface MAC address")
+        })?;
+        let mut lines = vec!["[Match]".to_string(), format!("MACAddress={mac}")];
         lines.push(String::new());
         lines.push("[Network]".to_string());
         lines.push("DHCP=no".to_string());
@@ -70,7 +68,7 @@ impl ValidatedPreclaimNetwork {
         for dns in &self.dns_servers {
             lines.push(format!("DNS={dns}"));
         }
-        lines.join("\n") + "\n"
+        Ok(lines.join("\n") + "\n")
     }
 }
 
@@ -252,7 +250,7 @@ fn apply_networkd_config_to(
     }
     ensure_networkd_dir(networkd_dir)?;
     let target = networkd_dir.join(PRECLAIM_NETWORK_FILE);
-    let body = config.render_networkd_unit();
+    let body = config.render_networkd_unit()?;
     if fs::read_to_string(&target).ok().as_deref() == Some(body.as_str()) {
         return Ok(());
     }
@@ -625,7 +623,7 @@ dns_servers = ["192.168.10.53", "1.1.1.1"]
 "#;
         let parsed = parse_and_validate_toml(valid).unwrap();
         assert_eq!(parsed.interface_mac.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
-        let rendered = parsed.render_networkd_unit();
+        let rendered = parsed.render_networkd_unit().unwrap();
         assert!(rendered.contains("MACAddress=aa:bb:cc:dd:ee:ff"));
         assert!(rendered.contains("DHCP=no"));
         assert!(rendered.contains("Address=192.168.10.25/24"));

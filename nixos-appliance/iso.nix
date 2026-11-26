@@ -104,12 +104,12 @@ in {
     description = "Apply pre-claim static IPv4 from USB before networkd starts";
     wantedBy = [ "network-pre.target" ];
     before = [ "systemd-networkd.service" "network-pre.target" ];
-    after = [ "systemd-udevd.service" "local-fs.target" "systemd-tmpfiles-setup.service" ];
+    after = [ "systemd-udevd.service" "systemd-udev-trigger.service" "local-fs.target" "systemd-tmpfiles-setup.service" ];
     path = [ pkgs.util-linux pkgs.systemd pkgs.iproute2 ];
     unitConfig.DefaultDependencies = false;
     serviceConfig = {
       Type = "oneshot";
-      ExecStartPre = "${pkgs.systemd}/bin/udevadm settle --timeout=10";
+      ExecStartPre = "-${pkgs.systemd}/bin/udevadm settle --timeout=10";
       ExecStart = "${bootstrap}/bin/tiaris-nest-bootstrap apply-preclaim-usb --no-reload";
       TimeoutStartSec = "30s";
       UMask = "0077";

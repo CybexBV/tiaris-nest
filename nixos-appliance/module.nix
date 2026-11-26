@@ -166,6 +166,8 @@ in {
       "r! /root/.cache/nix/binary-cache-v*.sqlite*"
       "d /run/lock/tiaris-nest 0750 root tiaris-nest -"
       "f /run/lock/tiaris-nest/maintenance.lock 0660 root tiaris-nest -"
+      "d /run/tiaris-nest-network 0750 root tiaris-nest -"
+      "f /run/tiaris-nest-network/reconfigure.lock 0600 root root -"
       "d /etc/tiaris-nest 0755 root root -"
       "d /etc/netplan 0700 root root -"
     ];
@@ -361,6 +363,18 @@ in {
     systemd.paths.tiaris-nest-network-reconfigure = {
       wantedBy = [ "multi-user.target" ];
       pathConfig.PathChanged = "/var/lib/tiaris-nest/state/agent/network-reconfigure.json";
+    };
+    systemd.services.tiaris-nest-network-reconfigure-retry = {
+      description = "Retry pending Tiaris Nest network reconfiguration";
+      unitConfig.ConditionPathExists = "/run/tiaris-nest-network/retry-pending";
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = "${pkgs.systemd}/bin/systemctl start --no-block tiaris-nest-network-reconfigure.service";
+      };
+    };
+    systemd.timers.tiaris-nest-network-reconfigure-retry = {
+      wantedBy = [ "timers.target" ];
+      timerConfig = { OnBootSec = "1min"; OnUnitInactiveSec = "1min"; AccuracySec = "5s"; };
     };
     systemd.services.tiaris-nest-self-cache-trust = (rootService "self-cache-trust") // {
       wantedBy = [ "multi-user.target" ]; after = [ "tiaris-nest-first-boot.service" "tiaris-nest.service" ];

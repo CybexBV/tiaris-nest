@@ -8,6 +8,7 @@
   firstBoot = import ./first-boot-vm.nix { inherit nixpkgs common; };
   installPermissions = import ./install-permissions-vm.nix { inherit nixpkgs common; };
   networkOrdering = import ./network-ordering-vm.nix { inherit nixpkgs common; };
+  networkReconfigure = import ./network-reconfigure-vm.nix { inherit nixpkgs common; };
   runtime = import (nixpkgs + "/nixos/tests/make-test-python.nix") ({ pkgs, ... }: {
     name = "tiaris-nest-nixos-runtime-policy";
     nodes.machine = { config, lib, ... }: {

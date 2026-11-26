@@ -325,30 +325,47 @@ pub fn validate_installed_state(
         bail!("promoted Nest agent identity is inconsistent")
     }
 
+    // control/network-supersession.json is an optional post-install override.
+    // Keep strict validation on the immutable install-time files below, and if
+    // the optional supersession cannot be verified, warn and fall back to the
+    // install-time network consistently with tiaris-nest-network-render so SSH,
+    // PXE, nginx, and the Nest daemon still start.
     let supersession_path = control.join(crate::network_reconfigure::SUPERSESSION_FILE);
     match fs::symlink_metadata(&supersession_path) {
         Ok(_) => {
-            let body = read_bounded_nofollow(
-                &supersession_path,
-                64 * 1024,
-                "committed network supersession",
-            )?;
-            let raw: serde_json::Value =
-                serde_json::from_slice(&body).context("parse committed network supersession")?;
-            let trusted_b64s: Vec<String> = keys
-                .iter()
-                .map(|key| protocol::standard_base64(key.to_bytes()))
-                .collect();
-            let _ = crate::network_reconfigure::verify_supersession_value_any_key(
-                &raw,
-                &trusted_b64s,
-                &plan,
-                false,
-                Utc::now(),
-            )?;
+            let verify_res = (|| -> Result<()> {
+                let body = read_bounded_nofollow(
+                    &supersession_path,
+                    64 * 1024,
+                    "committed network supersession",
+                )?;
+                let raw: serde_json::Value = serde_json::from_slice(&body)
+                    .context("parse committed network supersession")?;
+                let trusted_b64s: Vec<String> = keys
+                    .iter()
+                    .map(|key| protocol::standard_base64(key.to_bytes()))
+                    .collect();
+                let _ = crate::network_reconfigure::verify_supersession_value_any_key(
+                    &raw,
+                    &trusted_b64s,
+                    &plan,
+                    false,
+                    Utc::now(),
+                )?;
+                Ok(())
+            })();
+            if let Err(error) = verify_res {
+                eprintln!(
+                    "tiaris-nest-bootstrap: ignoring unverifiable optional network supersession ({error}); falling back to install-time network"
+                );
+            }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).context("inspect committed network supersession"),
+        Err(error) => {
+            eprintln!(
+                "tiaris-nest-bootstrap: could not inspect optional network supersession ({error}); falling back to install-time network"
+            );
+        }
     }
 
     // control/netplan-approved.json and control/management-cidrs.txt stay bound
