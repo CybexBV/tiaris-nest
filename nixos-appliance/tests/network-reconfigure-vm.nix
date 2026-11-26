@@ -127,13 +127,11 @@ in import (nixpkgs + "/nixos/tests/make-test-python.nix") ({ pkgs, ... }: {
       system.activationScripts.reconfigure-fixture = {
         deps = [ "users" "tiaris-nest-public-assets" ];
         text = ''
-          # Add the VM fixture's provisioning signing key alongside the release key
-          # so incoming supersessions verify against /usr/share/tiaris-nest/provisioning-public-keys.
-          if ! grep -Fxq "$(cat ${pki}/prov.pub.b64)" /usr/share/tiaris-nest/provisioning-public-keys; then
-            { cat /usr/share/tiaris-nest/provisioning-public-keys; cat ${pki}/prov.pub.b64; echo; } > /usr/share/tiaris-nest/.provisioning-public-keys.tmp
-            chmod 0444 /usr/share/tiaris-nest/.provisioning-public-keys.tmp
-            mv /usr/share/tiaris-nest/.provisioning-public-keys.tmp /usr/share/tiaris-nest/provisioning-public-keys
-          fi
+          # Add the VM fixture's provisioning signing key alongside the release key,
+          # keeping the file sorted and unique as required by protocol.rs.
+          { cat /usr/share/tiaris-nest/provisioning-public-keys; cat ${pki}/prov.pub.b64; echo; } | grep -v '^$' | LC_ALL=C sort -u > /usr/share/tiaris-nest/.provisioning-public-keys.tmp
+          chmod 0444 /usr/share/tiaris-nest/.provisioning-public-keys.tmp
+          mv /usr/share/tiaris-nest/.provisioning-public-keys.tmp /usr/share/tiaris-nest/provisioning-public-keys
           install -d -m0750 -o root -g tiaris-nest /var/lib/tiaris-nest/control /var/lib/tiaris-nest/state /var/lib/tiaris-nest/status
           install -d -m0700 -o tiaris-nest -g tiaris-nest /var/lib/tiaris-nest/state/agent /var/lib/tiaris-nest/state/inbox
           install -d -m0755 -o tiaris-nest -g tiaris-nest /var/cache/tiaris-nest/www /var/cache/tiaris-nest/www/assets /var/cache/tiaris-nest/www/cache
