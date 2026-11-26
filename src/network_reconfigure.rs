@@ -668,6 +668,17 @@ where
         }
         break;
     }
+    // If the loop exited early (e.g. a newer revision returned RetryLater while
+    // a build or generation recovery runs, or drain budget was reached), still
+    // drain any earlier committed revision's pending convergence so firewall,
+    // runtime, and PXE do not stay stale; needs_retry stays true so the retry
+    // timer still picks up the deferred newer revision.
+    if runtime_dir.join(PXE_RESTART_PENDING_FILE).exists() {
+        if let Err(err) = converge_fn() {
+            mark_retry_pending(runtime_dir);
+            return Err(err);
+        }
+    }
     if needs_retry || runtime_dir.join(PXE_RESTART_PENDING_FILE).exists() {
         mark_retry_pending(runtime_dir);
     } else {
@@ -2621,6 +2632,29 @@ mod tests {
         assert!(err.is_err());
         assert!(runtime.join(PXE_RESTART_PENDING_FILE).exists());
         assert!(runtime.join(RETRY_PENDING_FILE).exists());
+
+        // When a newer inbox revision returns RetryLater (e.g. build/maintenance
+        // busy), an earlier committed revision's pending convergence must still
+        // run immediately while retry-pending remains set for the deferred revision.
+        let mut retry_later_converge_calls = 0usize;
+        drain_reconfiguration_with(
+            &runtime,
+            Duration::from_secs(60),
+            || Ok(Some(b"rev-3-deferred".to_vec())),
+            |_| Ok(ApplyOutcome::RetryLater),
+            || {
+                retry_later_converge_calls += 1;
+                clear_pxe_restart_pending(&runtime);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(retry_later_converge_calls, 1);
+        assert!(!runtime.join(PXE_RESTART_PENDING_FILE).exists());
+        assert!(
+            runtime.join(RETRY_PENDING_FILE).exists(),
+            "retry-pending must stay set for the deferred RetryLater revision"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
