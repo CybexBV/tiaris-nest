@@ -118,8 +118,16 @@ pub(crate) struct Report {
 /// Persist the latest signed supersession from Manage in the unprivileged
 /// agent inbox so the root systemd path unit picks it up.
 pub(crate) fn apply(data_dir: &Path, desired: Option<Desired>) -> Result<()> {
+    apply_with_status_dir(data_dir, Path::new(STATUS_DIR), desired).map(|_| ())
+}
+
+fn apply_with_status_dir(
+    data_dir: &Path,
+    status_dir: &Path,
+    desired: Option<Desired>,
+) -> Result<bool> {
     let Some(Desired(raw)) = desired else {
-        return Ok(());
+        return Ok(false);
     };
     let parsed: SignedNetworkSupersession =
         serde_json::from_value(raw.clone()).context("invalid network reconfiguration document")?;
@@ -131,10 +139,15 @@ pub(crate) fn apply(data_dir: &Path, desired: Option<Desired>) -> Result<()> {
         bail!("network reconfiguration document exceeds size bound");
     }
     let current = state_files::read_bytes(data_dir, INBOX_FILE, MAX_BYTES).unwrap_or_default();
-    if current.as_deref() != Some(body.as_slice()) {
+    // Re-trigger PathChanged if root's reported status still lags the desired
+    // revision (for example if systemd dropped a PathChanged edge while the
+    // oneshot or its ExecStopPost recovery handler was finishing an earlier run).
+    let report_lagging = report_from(status_dir).is_none_or(|r| r.revision < parsed.revision);
+    if current.as_deref() != Some(body.as_slice()) || report_lagging {
         state_files::write_bytes(data_dir, INBOX_FILE, &body, MAX_BYTES)?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Read root's latest network reconfiguration report for the Manage telemetry lane.
@@ -579,53 +592,81 @@ pub fn apply_reconfiguration_as_root(
     let runtime_dir = Path::new(EFFECTIVE_NETWORK_DIR);
     // Recover any interrupted candidate left behind by a prior hard crash or kill.
     recover_interrupted_reconfiguration_in(runtime_dir, control_dir, status_path)?;
+    drain_reconfiguration_with(
+        runtime_dir,
+        Duration::from_secs(MAX_DRAIN_START_ELAPSED_SECONDS),
+        || read_inbox_bytes(inbox_path),
+        |raw_bytes| {
+            apply_one_reconfiguration(inbox_path, raw_bytes, control_dir, runtime_dir, status_path)
+        },
+        || converge_committed_network(control_dir),
+    )
+}
+
+fn drain_reconfiguration_with<FR, FA, FC>(
+    runtime_dir: &Path,
+    max_drain_elapsed: Duration,
+    mut read_inbox_fn: FR,
+    mut apply_one_fn: FA,
+    mut converge_fn: FC,
+) -> Result<()>
+where
+    FR: FnMut() -> Result<Option<Vec<u8>>>,
+    FA: FnMut(&[u8]) -> Result<ApplyOutcome>,
+    FC: FnMut() -> Result<()>,
+{
     let started = Instant::now();
+    let mut last_processed_inbox: Option<Vec<u8>> = None;
     let mut needs_retry = false;
     for iteration in 0..MAX_APPLY_ITERATIONS {
-        if iteration > 0
-            && started.elapsed() >= Duration::from_secs(MAX_DRAIN_START_ELAPSED_SECONDS)
-        {
+        if iteration > 0 && started.elapsed() >= max_drain_elapsed {
             needs_retry = true;
             break;
         }
-        let Some(raw_bytes) = read_inbox_bytes(inbox_path)? else {
-            break;
-        };
-        match apply_one_reconfiguration(
-            inbox_path,
-            &raw_bytes,
-            control_dir,
-            runtime_dir,
-            status_path,
-        )? {
-            ApplyOutcome::Complete => {}
-            ApplyOutcome::RetryLater => {
+        if let Some(raw_bytes) = read_inbox_fn()? {
+            if last_processed_inbox.as_deref() != Some(raw_bytes.as_slice()) {
+                match apply_one_fn(&raw_bytes)? {
+                    ApplyOutcome::Complete => {
+                        last_processed_inbox = Some(raw_bytes);
+                    }
+                    ApplyOutcome::RetryLater => {
+                        needs_retry = true;
+                        break;
+                    }
+                }
+            }
+        }
+        // Check if Manage delivered a newer inbox document while we were
+        // applying BEFORE draining unfinished prior convergence, so a valid
+        // repair is never blocked behind a failing prior commit.
+        let inbox_now = read_inbox_fn()?;
+        if inbox_now.is_some() && inbox_now != last_processed_inbox {
+            if iteration + 1 >= MAX_APPLY_ITERATIONS {
                 needs_retry = true;
                 break;
             }
+            continue;
         }
-        // Re-check inbox in case Manage delivered a higher revision while we
-        // were applying (systemd merges PathChanged events on active oneshots).
-        match read_inbox_bytes(inbox_path)? {
-            Some(next_bytes) if next_bytes != raw_bytes => {
+        // Inbox is quiet. Drain any unfinished post-commit convergence from an
+        // earlier commit (e.g. if a newer revision was rejected/reverted or the
+        // inbox was empty), then re-check the inbox in case a repair arrived
+        // while convergence ran (systemd drops PathChanged while this oneshot
+        // is active).
+        if runtime_dir.join(PXE_RESTART_PENDING_FILE).exists() {
+            if let Err(err) = converge_fn() {
+                mark_retry_pending(runtime_dir);
+                return Err(err);
+            }
+            let inbox_after_converge = read_inbox_fn()?;
+            if inbox_after_converge.is_some() && inbox_after_converge != last_processed_inbox {
                 if iteration + 1 >= MAX_APPLY_ITERATIONS {
                     needs_retry = true;
                     break;
                 }
                 continue;
             }
-            _ => break,
         }
-    }
-    // Drain any unfinished post-commit convergence AFTER processing the inbox so
-    // a newer valid signed repair is never blocked by a failing prior commit,
-    // while a rejected/reverted newer revision cannot clear retry-pending and
-    // strand the prior commit's firewall, runtime, or PXE convergence.
-    if runtime_dir.join(PXE_RESTART_PENDING_FILE).exists() {
-        if let Err(err) = converge_committed_network(control_dir) {
-            mark_retry_pending(runtime_dir);
-            return Err(err);
-        }
+        break;
     }
     if needs_retry || runtime_dir.join(PXE_RESTART_PENDING_FILE).exists() {
         mark_retry_pending(runtime_dir);
@@ -770,7 +811,11 @@ where
                     return Err(err);
                 }
                 write_status(status_path, meta.revision, Some(committed), "applied", None)?;
-                clear_retry_pending(runtime_dir);
+                if runtime_dir.join(PXE_RESTART_PENDING_FILE).exists() {
+                    mark_retry_pending(runtime_dir);
+                } else {
+                    clear_retry_pending(runtime_dir);
+                }
                 return Ok(());
             }
         }
@@ -820,7 +865,14 @@ where
     }
     let _ = fs::remove_file(&pending_yaml);
     let _ = fs::remove_file(&pending_meta);
-    clear_retry_pending(runtime_dir);
+    // Never clear retry-pending while an earlier committed revision still has
+    // unfinished post-commit convergence (pxe-restart-pending), so the retry
+    // timer drains that prior commit after this interrupted candidate reverts.
+    if runtime_dir.join(PXE_RESTART_PENDING_FILE).exists() {
+        mark_retry_pending(runtime_dir);
+    } else {
+        clear_retry_pending(runtime_dir);
+    }
     drop(lock);
     refresh_runtime_fn();
     Ok(())
@@ -1236,7 +1288,6 @@ fn apply_one_reconfiguration(
         "applied",
         None,
     )?;
-    clear_retry_pending(runtime_dir);
     Ok(ApplyOutcome::Complete)
 }
 
@@ -2517,6 +2568,165 @@ mod tests {
         let projected = report_from(&runtime).unwrap();
         assert_eq!(projected.revision, 7);
         assert_eq!(projected.status, "rejected");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn drain_rechecks_inbox_after_final_convergence_and_processes_mid_convergence_repair() {
+        let root = std::env::temp_dir().join(format!("tiaris-net-drain-{}", Uuid::new_v4()));
+        let runtime = root.join("run");
+        fs::create_dir_all(&runtime).unwrap();
+        mark_pxe_restart_pending(&runtime);
+        mark_retry_pending(&runtime);
+
+        let inbox = std::cell::RefCell::new(Some(b"rev-1".to_vec()));
+        let mut applied = Vec::new();
+        let mut converge_calls = 0usize;
+
+        drain_reconfiguration_with(
+            &runtime,
+            Duration::from_secs(60),
+            || Ok(inbox.borrow().clone()),
+            |bytes| {
+                applied.push(bytes.to_vec());
+                Ok(ApplyOutcome::Complete)
+            },
+            || {
+                converge_calls += 1;
+                clear_pxe_restart_pending(&runtime);
+                // Simulate a repair arriving while final convergence is running
+                // (when systemd drops PathChanged on the active oneshot).
+                *inbox.borrow_mut() = Some(b"rev-2".to_vec());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(converge_calls, 1);
+        assert_eq!(applied, vec![b"rev-1".to_vec(), b"rev-2".to_vec()]);
+        assert!(!runtime.join(PXE_RESTART_PENDING_FILE).exists());
+        assert!(!runtime.join(RETRY_PENDING_FILE).exists());
+
+        // When final convergence fails, both pxe-restart-pending and retry-pending
+        // must remain present so the retry timer retries convergence.
+        mark_pxe_restart_pending(&runtime);
+        let err = drain_reconfiguration_with(
+            &runtime,
+            Duration::from_secs(60),
+            || Ok(None),
+            |_| Ok(ApplyOutcome::Complete),
+            || bail!("transient firewall reload failure"),
+        );
+        assert!(err.is_err());
+        assert!(runtime.join(PXE_RESTART_PENDING_FILE).exists());
+        assert!(runtime.join(RETRY_PENDING_FILE).exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recovery_revert_preserves_retry_pending_when_prior_pxe_convergence_is_pending() {
+        let root = std::env::temp_dir().join(format!("tiaris-net-rec-pxe-{}", Uuid::new_v4()));
+        let control = root.join("control");
+        let runtime = root.join("run");
+        let active = root.join("active-netplan.yaml");
+        let keys_file = root.join("keys");
+        fs::create_dir_all(&control).unwrap();
+        fs::create_dir_all(&runtime).unwrap();
+        fs::write(&active, b"interrupted-candidate-netplan").unwrap();
+        fs::write(
+            runtime.join(PENDING_REVERT_YAML),
+            b"prior-committed-netplan",
+        )
+        .unwrap();
+        fs::write(
+            runtime.join(PENDING_REVERT_META),
+            serde_json::to_vec(&PendingRevertMeta {
+                revision: 6,
+                applied_revision: Some(5),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        // Earlier committed revision 5 still has unfinished post-commit convergence.
+        mark_pxe_restart_pending(&runtime);
+        let status_path = runtime.join(STATUS_FILE);
+
+        recover_interrupted_reconfiguration_with(
+            &runtime,
+            &control,
+            &keys_file,
+            &active,
+            &status_path,
+            || Ok(()),
+            || Ok(()),
+            || {},
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(&active).unwrap(), b"prior-committed-netplan");
+        assert!(!runtime.join(PENDING_REVERT_YAML).exists());
+        assert!(!runtime.join(PENDING_REVERT_META).exists());
+        assert!(
+            runtime.join(PXE_RESTART_PENDING_FILE).exists(),
+            "prior commit pxe-restart-pending must stay set for the retry timer"
+        );
+        assert!(
+            runtime.join(RETRY_PENDING_FILE).exists(),
+            "retry-pending must stay set after revert when pxe-restart-pending exists"
+        );
+        let status = report_from(&runtime).unwrap();
+        assert_eq!(status.revision, 6);
+        assert_eq!(status.status, "reverted");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn agent_inbox_apply_rewrites_same_bytes_when_report_lags_desired_revision() {
+        let root = std::env::temp_dir().join(format!("tiaris-net-apply-{}", Uuid::new_v4()));
+        let data_dir = root.join("agent");
+        let status_dir = root.join("status");
+        fs::create_dir_all(&status_dir).unwrap();
+
+        let key = SigningKey::from_bytes(&[31u8; 32]);
+        let plan = sample_plan();
+        let now = Utc::now();
+        let rev10 = sign_doc(
+            &key,
+            json!({
+                "schema": SCHEMA,
+                "organization_id": plan.organization_id,
+                "device_id": plan.reserved_device_id,
+                "device_incarnation_id": Uuid::new_v4(),
+                "provisioning_session_id": plan.session_id,
+                "revision": 10,
+                "issued_at": now,
+                "expires_at": now + chrono::Duration::days(7),
+                "network": {
+                    "mode": "dhcp",
+                    "interface_id": plan.network_interface.id,
+                    "address_cidr": null,
+                    "gateway": null,
+                    "dns_servers": []
+                },
+                "management_cidrs": ["10.0.0.0/24"]
+            }),
+        );
+
+        // No status report yet -> writes inbox.
+        assert!(
+            apply_with_status_dir(&data_dir, &status_dir, Some(Desired(rev10.clone()))).unwrap()
+        );
+        // Status report still lags at revision 9 -> re-writes inbox to re-trigger PathChanged.
+        write_status(&status_dir.join(STATUS_FILE), 9, Some(9), "applied", None).unwrap();
+        assert!(
+            apply_with_status_dir(&data_dir, &status_dir, Some(Desired(rev10.clone()))).unwrap()
+        );
+        // Once root reports revision 10 (pending or terminal) -> steady state skips redundant write.
+        write_status(&status_dir.join(STATUS_FILE), 10, Some(9), "pending", None).unwrap();
+        assert!(!apply_with_status_dir(&data_dir, &status_dir, Some(Desired(rev10))).unwrap());
 
         let _ = fs::remove_dir_all(&root);
     }
