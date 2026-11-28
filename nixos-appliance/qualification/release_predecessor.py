@@ -87,7 +87,7 @@ def github(repository, path):
 def fetch(url, target, expected_sha=None, expected_size=None, maximum=4 * 1024**3):
     parsed = urlsplit(url)
     if (parsed.scheme != 'https' or parsed.username or parsed.password or parsed.query or parsed.fragment
-            or not parsed.hostname or not (parsed.hostname in ('github.com', 'downloads.tiaris.com')
+            or not parsed.hostname or not (parsed.hostname == 'github.com'
                                           or parsed.hostname.startswith('dev.')
                                           or parsed.hostname.endswith('.test')) or target.is_symlink()):
         raise ValueError('Unexpected predecessor transport')

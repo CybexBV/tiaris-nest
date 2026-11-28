@@ -1,0 +1,8 @@
+[Unit]
+Description=Renew the Nest qualification fixture certificate over IPv4
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/tiaris-nest-qualification/renew-certificate.sh
