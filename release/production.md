@@ -40,7 +40,7 @@ The isolated builder and recovery procedure are in [beast/README.md](beast/READM
 The disposable production-image qualification instance has its own database,
 private DNS/TLS, sessions, devices and runtime watermarks. No manually retained
 device ID, evidence variable or long-lived qualification token is required.
-The host setup is documented in Tiaris's `deploy/qualification/README.md`.
+The fixture certificate's renewal on the host is in [beast/qualification-host](beast/qualification-host/README.md).
 
 The runner's user service also installs `runner-python.conf` as a drop-in.
 Install `runner-python.sudoers` under `/etc/sudoers.d/` (root, mode 0440), after

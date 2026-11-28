@@ -329,8 +329,8 @@ not updated, across this change.
 Since 19 November 2026 the fixture on the runner serves `https://manage.tiaris.com`
 alone: the template's `manage_origin` names it, without a transition, and its
 certificate is a Let's Encrypt certificate for that one name, issued by DNS-01
-for the fixture only and renewed with the runner's other qualification
-certificate. The Nest and the harness accept only publicly trusted certificates
+for the fixture only and renewed on the runner by
+`release/beast/qualification-host`. The Nest and the harness accept only publicly trusted certificates
 (the Nest's Manage clients use the built-in web PKI roots), so a self-made
 certificate cannot stand in. The qualification predecessor is the candidate's
 published predecessor. Releases built for `https://manage.cybex.net` (v0.2.99 and
